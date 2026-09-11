@@ -5,7 +5,7 @@ Runs once per worker spawn, after host-sync. Both harnesses install:
   * codex  skills → ``<workspace>/.agents/skills/<id>/SKILL.md``
                     (body has ``mcp__puffo__`` prefix stripped)
   * claude MCPs   → ``<agent_home>/.claude.json#mcpServers[<id>]``
-  * codex  MCPs   → cached on the adapter so ``_ensure_codex_session``
+  * codex  MCPs   → returned to the runtime preparer for config.toml
                     folds them into ``[mcp_servers.*]`` config.toml.
 
 Catalog 404 / fetch error logs + continues — never blocks spawn."""
@@ -20,7 +20,11 @@ from typing import Any
 
 from ...crypto.http_client import HttpError, PuffoCoreHttpClient
 from ...skill_ids import SKILL_ID_RE
-from ..shared_content import _strip_puffo_mcp_prefix_for_codex
+from ..harness.support.assets import (
+    HarnessAssetsProfile,
+    McpProjection,
+    get_harness_assets_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +176,7 @@ def write_desired_skill_codex(
     return _write_skill_to_dir(
         workspace_dir / ".agents" / "skills" / template_id,
         template_id,
-        _strip_puffo_mcp_prefix_for_codex(body),
+        get_harness_assets_profile("codex").transform_skill_body(body),
     )
 
 
@@ -288,8 +292,9 @@ async def run_spawn_install(
 ) -> dict[str, dict[str, Any]]:
     """Build the puffo-core client from spawn wiring and run
     ``install_desired``, tolerating fetch / crash errors. Shared by the
-    cli-local and cli-docker adapters. ``containerized`` rejects
-    host-only MCP command paths. Returns ``codex_extra_servers``.
+    cli-local runtime preparer and cli-docker adapter. Container runtimes
+    reject MCP commands that only resolve on the host. Returns
+    ``codex_extra_servers``.
     """
     if not desired_skills and not desired_mcps:
         return {}
@@ -340,21 +345,70 @@ async def install_desired(
 
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
-    Containerized installs skip stdio commands that cannot resolve in
-    the Linux runtime.
+    Containerized installs skip stdio commands that cannot resolve there.
     """
-    # hermes has no skills / MCP surface — bail rather than write into
-    # a ``.claude/`` it never reads.
-    if harness_name == "hermes":
+    profile = get_harness_assets_profile(harness_name)
+    if not profile.supported:
         if desired_skills or desired_mcps:
             logger.info(
-                "agent %s: hermes harness — skipping %d desired_skills + "
-                "%d desired_mcps (no skills/MCP surface in hermes v1)",
-                agent_id, len(desired_skills), len(desired_mcps),
+                "agent %s: %s harness — skipping %d desired_skills + "
+                "%d desired_mcps (%s)",
+                agent_id,
+                harness_name,
+                len(desired_skills),
+                len(desired_mcps),
+                profile.unsupported_reason,
             )
         return {}
 
-    is_codex = harness_name == "codex"
+    if profile.skills_supported:
+        await _install_desired_skills(
+            http=http,
+            agent_home=agent_home,
+            workspace_dir=workspace_dir,
+            agent_id=agent_id,
+            desired_skills=desired_skills,
+            profile=profile,
+        )
+    elif desired_skills:
+        logger.info(
+            "agent %s: %s harness — skipping %d desired_skills (%s)",
+            agent_id,
+            harness_name,
+            len(desired_skills),
+            profile.unsupported_reason,
+        )
+
+    if profile.mcp_supported:
+        return await _install_desired_mcps(
+            http=http,
+            agent_home=agent_home,
+            agent_id=agent_id,
+            desired_mcps=desired_mcps,
+            profile=profile,
+            containerized=containerized,
+        )
+    if desired_mcps:
+        logger.info(
+            "agent %s: %s harness — skipping %d desired_mcps (%s)",
+            agent_id,
+            harness_name,
+            len(desired_mcps),
+            profile.unsupported_reason,
+        )
+    return {}
+
+
+async def _install_desired_skills(
+    *,
+    http: PuffoCoreHttpClient,
+    agent_home: Path,
+    workspace_dir: Path,
+    agent_id: str,
+    desired_skills: list[str],
+    profile: HarnessAssetsProfile,
+) -> None:
+    """Install selected skills and prune stale desired-only entries."""
 
     for sid in desired_skills:
         tpl = await fetch_skill_template(http, sid)
@@ -364,9 +418,10 @@ async def install_desired(
         if not isinstance(body, str):
             logger.warning("desired skill %r: no body in template — skipping", sid)
             continue
-        result = (
-            write_desired_skill_codex(workspace_dir, sid, body) if is_codex
-            else write_desired_skill(agent_home, sid, body)
+        result = _write_skill_to_dir(
+            profile.skills_root(agent_home, workspace_dir) / sid,
+            sid,
+            profile.transform_skill_body(body),
         )
         if result == "installed":
             logger.info("agent %s: installed desired skill %r", agent_id, sid)
@@ -378,10 +433,7 @@ async def install_desired(
 
     # Sweep desired-only leftovers, after the install loop so this
     # pass's own ids aren't candidates.
-    skills_root = (
-        workspace_dir / ".agents" / "skills" if is_codex
-        else agent_home / ".claude" / "skills"
-    )
+    skills_root = profile.skills_root(agent_home, workspace_dir)
     pruned = prune_stale_desired_skills(skills_root, desired_skills)
     if pruned:
         logger.info(
@@ -389,6 +441,17 @@ async def install_desired(
             agent_id, pruned,
         )
 
+
+async def _install_desired_mcps(
+    *,
+    http: PuffoCoreHttpClient,
+    agent_home: Path,
+    agent_id: str,
+    desired_mcps: list[str],
+    profile: HarnessAssetsProfile,
+    containerized: bool,
+) -> dict[str, dict[str, Any]]:
+    """Install selected MCPs or return their Codex config entries."""
     codex_extras: dict[str, dict[str, Any]] = {}
     for mid in desired_mcps:
         tpl = await fetch_mcp_template(http, mid)
@@ -403,23 +466,25 @@ async def install_desired(
             )
             continue
         if containerized:
-            from ...portal.state import filter_container_mcp_servers
+            from ...portal.host_assets import filter_container_mcp_servers
 
             _reachable, unreachable = filter_container_mcp_servers({mid: spec})
             if unreachable:
                 logger.warning(
                     "agent %s: desired mcp %r uses host-local path %r; "
                     "skipping because it cannot resolve inside the container",
-                    agent_id, mid, unreachable[0][1],
+                    agent_id,
+                    mid,
+                    unreachable[0][1],
                 )
                 continue
-        if is_codex:
+        if profile.mcp_projection is McpProjection.RUNTIME_EXTRAS:
             codex_extras[mid] = _codex_extras_entry(spec)
             logger.info(
                 "agent %s: queued desired mcp %r (%s) for codex config.toml",
                 agent_id, mid, spec["type"],
             )
-        else:
+        elif profile.mcp_projection is McpProjection.CLAUDE_JSON:
             result = install_claude_mcp(agent_home, mid, spec)
             if result == "installed":
                 logger.info(
@@ -431,4 +496,8 @@ async def install_desired(
                     "agent %s: desired mcp %r already present — left untouched",
                     agent_id, mid,
                 )
+        else:  # install_desired rejects unsupported profiles before this call.
+            raise RuntimeError(
+                f"harness {profile.harness_name!r} has no desired MCP projection"
+            )
     return codex_extras

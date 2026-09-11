@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from puffo_agent.crypto.canonical import canonicalize_for_signing
@@ -123,6 +125,29 @@ def test_verify_valid_bundle_without_role_short_override():
     assert verify_agent_bundle(payload, operator_public)["role_short"] == "coder"
 
 
+def test_verify_accepts_codex_minimal_inference_level():
+    payload, operator_public = _payload()
+    payload["runtime"] = {
+        "kind": "cli-local",
+        "provider": "openai",
+        "harness": "codex",
+        "inference_level": "minimal",
+    }
+    context = verify_agent_bundle(payload, operator_public)
+    assert context["runtime"].inference_level == "minimal"
+
+
+def test_verify_migrates_legacy_runtime_before_validation():
+    payload, operator_public = _payload()
+    payload["runtime"] = {
+        "kind": "chat-local",
+        "provider": "openai",
+        "harness": "claude-code",
+    }
+    runtime = verify_agent_bundle(payload, operator_public)["runtime"]
+    assert (runtime.kind, runtime.harness) == ("cli-local", "codex")
+
+
 def test_verify_rejects_invalid_agent_id(monkeypatch):
     payload, operator_public = _payload()
     monkeypatch.setattr(provision, "is_valid_agent_id", lambda _slug: False)
@@ -135,7 +160,14 @@ def test_verify_rejects_invalid_agent_id(monkeypatch):
     [
         (lambda value: value.update({"runtime": {"kind": "bogus"}}), "runtime"),
         (
-            lambda value: value["runtime"].update({"inference_level": "turbo"}),
+            lambda value: value.update({
+                "runtime": {
+                    "kind": "cli-local",
+                    "provider": "openai",
+                    "harness": "codex",
+                    "inference_level": "xhigh",
+                }
+            }),
             "inference_level",
         ),
         (lambda value: value.update({"desired_skills": [""]}), "desired_skills"),
@@ -322,7 +354,46 @@ async def test_provision_materializes_then_writes(tmp_path, monkeypatch):
     config = AgentConfig.load("helper-1234")
     assert config.runtime.kind == "ws-local"
     assert config.desired_skills == ["skill-a"]
-    assert (tmp_path / "agents/helper-1234/keys/helper-1234.json").is_file()
+    agent_root = tmp_path / "agents/helper-1234"
+    key_path = agent_root / "keys/helper-1234.json"
+    assert key_path.is_file()
+    if os.name != "nt":
+        assert agent_root.stat().st_mode & 0o777 == 0o700
+        assert key_path.parent.stat().st_mode & 0o777 == 0o700
+    assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_provision_preflight_rejects_before_materialization_or_write(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    payload, operator_public = _payload()
+    events = []
+
+    async def preflight(context):
+        events.append(("preflight", context["agent_id"]))
+        raise ProvisionError(
+            "Pi sign-in required",
+            error_code="harness_not_ready",
+            harness="pi",
+            reason="need_login",
+        )
+
+    async def materialize(context):
+        events.append(("materialize", context["agent_id"]))
+
+    with pytest.raises(ProvisionError, match="Pi sign-in required"):
+        await provision_agent_from_bundle(
+            payload,
+            operator_public,
+            preflight=preflight,
+            materialize=materialize,
+        )
+
+    assert events == [("preflight", "helper-1234")]
+    assert not (tmp_path / "agents" / "helper-1234").exists()
 
 
 @pytest.mark.asyncio

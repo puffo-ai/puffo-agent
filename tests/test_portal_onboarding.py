@@ -121,8 +121,14 @@ async def test_migrate_survives_one_agent_failing(monkeypatch):
 
 # ── F3: link auto-starts the daemon ─────────────────────────────────
 
-def _link_ns(code=None):
-    return argparse.Namespace(name=None, server_url="https://x", not_open=True, code=code)
+def _link_ns(code=None, *, no_autostart=False):
+    return argparse.Namespace(
+        name=None,
+        server_url="https://x",
+        not_open=True,
+        code=code,
+        no_autostart=no_autostart,
+    )
 
 
 def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
@@ -131,8 +137,10 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     from puffo_agent.portal.control import link
 
     spawned = []
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: False)
+    monkeypatch.setattr(
+        bg, "spawn_headless_background", lambda **kw: spawned.append(kw) or 0
+    )
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
@@ -142,14 +150,31 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     assert spawned == [{}]
 
 
+def test_cmd_link_stops_when_daemon_startup_fails(monkeypatch):
+    from puffo_agent.portal import background as bg
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: False)
+    monkeypatch.setattr(bg, "spawn_headless_background", lambda: 1)
+
+    async def _must_not_link(*_args, **_kwargs):
+        raise AssertionError("link must not run without a ready daemon")
+
+    monkeypatch.setattr(link, "run_link", _must_not_link)
+    assert cli.cmd_link(_link_ns()) == 1
+
+
 def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal import background as bg
     from puffo_agent.portal.control import link
 
     spawned = []
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
-    monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    monkeypatch.setattr(
+        bg, "spawn_headless_background", lambda **kw: spawned.append(kw) or 0
+    )
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
@@ -157,6 +182,74 @@ def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
     monkeypatch.setattr(link, "run_link", _fake_run_link)
     cli.cmd_link(_link_ns())
     assert spawned == []
+
+
+def test_cmd_link_enables_login_autostart_after_success(monkeypatch, capsys):
+    from puffo_agent.portal import autostart, cli
+    from puffo_agent.portal.control import link
+
+    enabled = []
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    monkeypatch.setattr(
+        autostart,
+        "enable",
+        lambda: enabled.append(True) or autostart.ActionResult(True),
+    )
+
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        return 0
+
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+
+    assert cli.cmd_link(_link_ns()) == 0
+    assert enabled == [True]
+    assert "autostart enabled" in capsys.readouterr().out
+
+
+def test_cmd_link_no_autostart_flag_skips_registration(monkeypatch):
+    from puffo_agent.portal import autostart, cli
+    from puffo_agent.portal.control import link
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["machine", "link", "--no-autostart", "--not-open"])
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    # Record instead of raise: _enable_autostart_after_link swallows any
+    # exception into a warning, so a raising probe cannot fail this test.
+    called = []
+    monkeypatch.setattr(
+        autostart,
+        "enable",
+        lambda: called.append(True) or autostart.ActionResult(True),
+    )
+
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        return 0
+
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+    assert args.func(args) == 0
+    assert called == []
+
+
+def test_cmd_link_autostart_failure_keeps_link_successful(monkeypatch, capsys):
+    from puffo_agent.portal import autostart, cli
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    monkeypatch.setattr(
+        autostart,
+        "enable",
+        lambda: autostart.ActionResult(False, ["platform refused registration"]),
+    )
+
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        return 0
+
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+
+    assert cli.cmd_link(_link_ns()) == 0
+    captured = capsys.readouterr()
+    assert "platform refused registration" in captured.err
+    assert "puffo-agent autostart enable" in captured.err
 
 
 # ── lifecycle give-up (daemon._report_lifecycle) ────────────────────
@@ -257,7 +350,7 @@ def test_cmd_link_passes_code_through(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal.control import link
 
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
     seen = {}
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
@@ -273,7 +366,7 @@ def test_cmd_link_defaults_code_to_none(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal.control import link
 
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
     seen = {}
 
     async def _fake_run_link(url, name, open_browser=True, code=None):

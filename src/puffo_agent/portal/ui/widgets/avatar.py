@@ -9,7 +9,6 @@ request because the blob endpoint rejects unsigned reads (401).
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 from typing import Dict, Optional
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, Qt, Signal

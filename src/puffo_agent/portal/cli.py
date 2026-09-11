@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import logging
 import os
 import shutil
@@ -17,13 +16,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
-from .daemon import run_daemon
+from .cli_parser import build_parser as build_cli_parser
 from .state import (
     AgentConfig,
     DaemonConfig,
-    ProviderConfig,
     RuntimeConfig,
     RuntimeState,
     TriggerRules,
@@ -35,13 +33,16 @@ from .state import (
     archived_dir,
     clear_daemon_pid,
     clear_stop_request,
-    daemon_yml_path,
-    derive_role_short,
     daemon_pid_path,
+    daemon_yml_path,
     discover_agents,
+    derive_role_short,
     docker_shared_dir,
     home_dir,
     is_daemon_alive,
+    is_daemon_ready,
+    is_daemon_startup_stalled,
+    is_daemon_stop_stalled,
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
@@ -50,37 +51,40 @@ from .state import (
     refresh_model_flag_path,
     refresh_runtime_flag_path,
     refresh_session_flag_path,
+    shared_fs_dir,
+    stop_requested_for,
     write_refresh_token_request,
     write_stop_request,
 )
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
+)
+
 
 DEFAULT_PROFILE = """# Agent Profile
-
-## Conversation Format
-Every incoming user message is wrapped in a structured markdown block:
-
-    - channel: <channel name>
-    - sender: <username> (<email>)
-    - message: <actual message text>
-
-The first two fields are context metadata — use them to understand where
-the message was posted and who sent it. Only the `message:` field
-contains the actual text you are replying to.
-
-IMPORTANT: Your reply must contain ONLY your response text. Do NOT
-include the markdown block, field labels like `message:`, bracketed
-prefixes like `[#channel]`, or self-identifiers. If you need to address
-the sender, use `@username` inline.
 
 ## Identity
 You are a helpful assistant.
 
-## When to Reply
-Use your judgement. Reply when someone directly addresses you or asks a
-question that invites a response. Stay silent when the conversation is
-between other people and you have nothing useful to add — output
-exactly `[SILENT]` to stay silent.
+## Soul
+Be thoughtful, capable, and clear.
 """
+
+
+def _prepare_cli_shared_workspace(cfg: AgentConfig) -> str:
+    status = prepare_workspace_shared_access(
+        cfg.resolve_workspace_dir(),
+        shared_fs_dir(),
+        mounted=(cfg.runtime.kind or "cli-local") == "cli-docker",
+    )
+    if status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+        print(
+            f"warning: shared workspace is {status}; cross-Agent file "
+            "handoffs through workspace/shared are unavailable",
+            file=sys.stderr,
+        )
+    return status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,7 +102,7 @@ def get_local_version() -> str:
     """Installed puffo-agent version, or "unknown" if metadata is
     missing (e.g. raw checkout)."""
     try:
-        from importlib.metadata import PackageNotFoundError, version
+        from importlib.metadata import version
 
         return version("puffo-agent")
     except (ImportError, Exception):
@@ -140,8 +144,13 @@ def fetch_latest_release_tag(timeout: float = 5.0) -> str | None:
             data = _json.loads(resp.read().decode("utf-8"))
         tag = (data.get("tag_name") or "").strip()
         return tag.lstrip("v") or None
-    except (urllib.error.URLError, urllib.error.HTTPError,
-            TimeoutError, ValueError, OSError):
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ):
         return None
 
 
@@ -149,6 +158,7 @@ def is_outdated(local: str, remote: str) -> bool:
     """``remote > local`` for dotted versions, tolerating pre-release
     suffixes (``0.4.0rc1`` → ``0.4.0``). Falls back to False on
     parse errors — better to under-warn than to warn on noise."""
+
     def parse(v: str) -> tuple[int, ...]:
         out: list[int] = []
         for part in v.split("."):
@@ -198,14 +208,17 @@ def upgrade_command_for_install_mode() -> str:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    """Set daemon-wide defaults (provider, models, API keys).
-    Optional — agents can carry their own keys or read them from env."""
+    """Set the daemon-owned Claude API-key policy.
+
+    Claude Code and Codex authenticate through their CLI login or a
+    per-agent gateway configuration by default.
+    """
     home_dir().mkdir(parents=True, exist_ok=True)
     cfg = DaemonConfig.load()
 
     anthropic_api_key = getattr(args, "anthropic_api_key", None)
     anthropic_cli_use_api_key = getattr(
-        args, "anthropic_cli_use_api_key", None,
+        args, "anthropic_cli_use_api_key", None
     )
     if anthropic_api_key is not None or anthropic_cli_use_api_key is not None:
         if anthropic_api_key is not None:
@@ -223,13 +236,6 @@ def cmd_config(args: argparse.Namespace) -> int:
     else:
         print("creating daemon.yml (optional — defaults only)")
 
-    env_openai = os.environ.get("OPENAI_API_KEY", "")
-    env_google = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or ""
-    )
-
     def prompt(label: str, default: str = "") -> str:
         hint = f" [{default}]" if default else ""
         try:
@@ -238,13 +244,15 @@ def cmd_config(args: argparse.Namespace) -> int:
             val = ""
         return val or default
 
-    cfg.default_provider = prompt("Default AI provider (anthropic|openai|google)", cfg.default_provider or "anthropic")
-
-    anth_key = cfg.anthropic.api_key
-    anth_key = prompt("Default Anthropic API key (blank to skip)", anth_key)
+    anth_key = prompt(
+        "Default Anthropic API key (blank to skip)",
+        cfg.anthropic.api_key,
+    )
     if anth_key:
         cfg.anthropic.api_key = anth_key
-        cfg.anthropic.model = cfg.anthropic.model or "claude-sonnet-4-6"
+        cfg.anthropic.model = (
+            cfg.anthropic.model or "claude-sonnet-4-6"
+        )
     cli_use_api_key = prompt(
         "Use the Anthropic API key for Claude Code (true|false)",
         "true" if cfg.anthropic.cli_use_api_key else "false",
@@ -254,45 +262,71 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 2
     cfg.anthropic.cli_use_api_key = cli_use_api_key == "true"
 
-    oai_key = cfg.openai.api_key or env_openai
-    oai_key = prompt("Default OpenAI API key (blank to skip)", oai_key)
-    if oai_key:
-        cfg.openai = ProviderConfig(api_key=oai_key, model=cfg.openai.model or "gpt-4o")
-
-    goog_key = cfg.google.api_key or env_google
-    goog_key = prompt("Default Google API key (blank to skip; used by Google chat runtimes)", goog_key)
-    if goog_key:
-        cfg.google = ProviderConfig(api_key=goog_key, model=cfg.google.model or "gemini-2.5-pro")
-
     cfg.save()
     print(f"wrote {daemon_yml_path()}")
     print(f"agents dir: {agents_dir()}")
     print()
     print("agent runtime choices (per agent, set at create time):")
-    print("  chat-local   conversational LLM, no tools (default, uses the keys above)")
-    print("  sdk-local    in-process agent SDK w/ tools  [pip install puffo-agent[sdk]]")
-    print("  cli-local    claude CLI on the host, permission-proxy DMs operator [run `claude login` first]")
-    print("  cli-docker   Claude Code or Codex in a per-agent container  [Docker + host CLI login]")
+    print(
+        "  cli-local    Claude/Codex CLI on the host (default; log in to the CLI first)"
+    )
+    print(
+        "  cli-docker   claude CLI inside a per-agent container  [Docker + `claude login` on host]"
+    )
     print()
-    print("defaults saved — `puffo-agent agent create` will use these unless overridden.")
+    print("daemon settings saved.")
     return 0
 
 
+# Shown when a GUI entry point (``start --ui`` / ``start --background``) is
+# invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
+# The base ``pip install puffo-agent`` is deliberately Qt-free so headless
+# / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
+_GUI_EXTRA_HINT = (
+    "the desktop UI requires the [gui] extra (PySide6), which is not "
+    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n"
+    "or, for a uv tool install:\n"
+    "    uv tool install --force 'puffo-agent[gui]'\n\n"
+    "(the headless daemon — `puffo-agent start` with no UI flag — runs "
+    "without it.)"
+)
+
 
 def cmd_start(args: argparse.Namespace) -> int:
+    # The PySide6 import inside run_tray/launch is deferred to call time,
+    # so the ImportError surfaces from the call, not the ``from .ui...``
+    # line — wrap both so a missing [gui] extra yields the actionable hint
+    # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
-        from .ui.tray import run_tray
-        return run_tray()
+        try:
+            from .ui.tray import run_tray
+
+            return run_tray()
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     if getattr(args, "background", False):
         from .background import spawn_background
+
         return spawn_background()
+    if getattr(args, "detach", False):
+        from .background import spawn_headless_background
+
+        return spawn_headless_background()
     if getattr(args, "ui", False):
-        from .ui.launcher import launch
-        return launch()
+        try:
+            from .ui.launcher import launch
+
+            return launch()
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    from .daemon import run_daemon
+
     return asyncio.run(run_daemon())
 
 
@@ -313,15 +347,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return 0
     if not is_pid_alive(pid):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
-        clear_daemon_pid()
+        clear_daemon_pid(expected_pid=pid)
+        clear_stop_request(expected_pid=pid)
         return 0
 
-    write_stop_request()
+    write_stop_request(pid)
     print(f"requested daemon shutdown (pid={pid}); waiting up to {args.timeout}s...")
     deadline = time.time() + max(1, args.timeout)
     while time.time() < deadline:
         if not is_pid_alive(pid):
-            clear_stop_request()
+            clear_stop_request(expected_pid=pid)
             # A new daemon may have taken the pid file mid-poll — say so,
             # rather than a bare "stopped".
             new_pid = read_daemon_pid()
@@ -347,6 +382,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Register / unregister / inspect after-login daemon autostart."""
+    from . import autostart
+
+    if args.autostart_cmd == "enable":
+        result = autostart.enable(linger=getattr(args, "linger", False))
+    elif args.autostart_cmd == "disable":
+        result = autostart.disable()
+    else:
+        state = autostart.status()
+        for line in state.lines:
+            print(line)
+        return 0
+    stream = sys.stdout if result.ok else sys.stderr
+    for line in result.lines:
+        print(line, file=stream)
+    return 0 if result.ok else 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print installed version + install mode."""
     local = get_local_version()
@@ -359,15 +413,18 @@ def cmd_attach(args: argparse.Namespace) -> int:
     """Run the reference ws-local attach client."""
     import asyncio
     from pathlib import Path
+
     from .ws_local.ws_local_client import run_attach
 
     session_dir = Path(args.session_dir) if args.session_dir else None
-    return asyncio.run(run_attach(
-        Path(args.bundle),
-        args.passcode,
-        daemon_url=args.daemon_url,
-        session_dir=session_dir,
-    ))
+    return asyncio.run(
+        run_attach(
+            Path(args.bundle),
+            args.passcode,
+            daemon_url=args.daemon_url,
+            session_dir=session_dir,
+        )
+    )
 
 
 def cmd_check_update(args: argparse.Namespace) -> int:
@@ -384,13 +441,12 @@ def cmd_check_update(args: argparse.Namespace) -> int:
     print(f"latest:    {remote}")
     if is_outdated(local, remote):
         print()
-        print("an update is available. to upgrade:")
+        print("an update is available. to upgrade without leaving an old daemon:")
+        print("  puffo-agent stop")
         print(f"  {upgrade_command_for_install_mode()}")
+        print("  puffo-agent start --detach")
         if is_source_install():
             print("  (or re-run pip install against your local clone)")
-        print()
-        print("note: if the daemon is currently running, stop it first —")
-        print("on windows the puffo-agent.exe file is locked while in use.")
         return 0
     print()
     print("you're up to date.")
@@ -400,8 +456,19 @@ def cmd_check_update(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     pid = read_daemon_pid()
     alive = is_daemon_alive()
-    if alive and pid is not None:
+    ready = alive and pid is not None and is_daemon_ready(pid)
+    if alive and pid is not None and stop_requested_for(pid):
+        state = "stop stalled" if is_daemon_stop_stalled(pid) else "stopping"
+        print(f"daemon: {state} (pid={pid})")
+    elif ready:
         print(f"daemon: running (pid={pid})")
+    elif alive and pid is not None:
+        state = (
+            "stalled during startup"
+            if is_daemon_startup_stalled(pid)
+            else "starting"
+        )
+        print(f"daemon: {state} (pid={pid})")
     elif pid is not None:
         print(f"daemon: not running (stale pid file at {daemon_pid_path()}; pid={pid})")
     else:
@@ -416,7 +483,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             status = rs.status if rs else "unknown"
             health = rs.health if rs else "unknown"
             # Only surface non-ok health to keep the listing tight.
-            health_suffix = f"  health={health}" if health not in ("ok", "unknown") else ""
+            health_suffix = (
+                f"  health={health}" if health not in ("ok", "unknown") else ""
+            )
             print(f"  - {aid}  state={ac.state}  runtime={status}{health_suffix}")
         except Exception as exc:
             print(f"  - {aid}  (error: {exc})")
@@ -428,78 +497,42 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_api_key_for_create(
-    provider: str,
-    flag_value: str,
-    runtime_kind: str,
-) -> str:
-    """Pick an API key for ``agent create``. Resolution order:
-    --api-key, env var, daemon.yml default, interactive prompt. CLI
-    runtimes return early — they auth via ~/.claude/.credentials."""
-    if runtime_kind in ("cli-local", "cli-docker"):
-        return flag_value
-    if flag_value:
-        return flag_value
-    env_var = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "google": "GEMINI_API_KEY",
-    }.get(provider)
-    env_val = os.environ.get(env_var, "") if env_var else ""
-    # Daemon defaults cover the operator who ran ``puffo-agent config``.
-    daemon = DaemonConfig.load()
-    daemon_default = {
-        "anthropic": daemon.anthropic.api_key,
-        "openai": daemon.openai.api_key,
-        "google": daemon.google.api_key,
-    }.get(provider, "")
-    if daemon_default:
-        return ""  # empty runtime.api_key inherits from daemon.yml
-    if env_val:
-        return env_val
-    label = {
-        "anthropic": "Anthropic API key",
-        "openai": "OpenAI API key",
-        "google": "Google API key",
-    }.get(provider, f"{provider} API key")
-    try:
-        val = input(f"{label} (paste from your provider dashboard): ").strip()
-    except EOFError:
-        val = ""
-    return val
-
-
 def _derive_role_short_cli(role: str) -> str:
-    """Thin wrapper over the canonical :func:`state.derive_role_short`."""
+    """Compatibility wrapper around the shared server contract."""
     return derive_role_short(role)
 
 
 def cmd_agent_create(args: argparse.Namespace) -> int:
     agent_id = args.id
     if not is_valid_agent_id(agent_id):
-        print(f"error: invalid agent id {agent_id!r} (alphanumerics, _ and -)", file=sys.stderr)
+        print(
+            f"error: invalid agent id {agent_id!r} (alphanumerics, _ and -)",
+            file=sys.stderr,
+        )
         return 2
     target = agent_dir(agent_id)
     if target.exists():
         print(f"error: agent {agent_id!r} already exists at {target}", file=sys.stderr)
         return 2
 
-    runtime_kind = args.runtime or "chat-local"
-    provider = args.provider or "anthropic"
+    runtime_kind = args.runtime or "cli-local"
+    provider = args.provider or ""
     from .runtime_matrix import resolve_effective_harness, validate_triple
-    harness = resolve_effective_harness(
-        runtime_kind, provider, getattr(args, "harness", None) or "",
-    ) or "claude-code"
-    result = validate_triple(runtime_kind, provider, harness)
-    if not result.ok:
-        print(f"error: {result.error}", file=sys.stderr)
-        return 2
-    api_key = _resolve_api_key_for_create(
-        provider=provider,
-        flag_value=args.api_key or "",
-        runtime_kind=runtime_kind,
-    )
 
+    harness = getattr(args, "harness", None) or resolve_effective_harness(
+        runtime_kind, provider, ""
+    )
+    validation = validate_triple(runtime_kind, provider, harness)
+    if not validation.ok:
+        print(f"error: {validation.error}", file=sys.stderr)
+        return 2
+    harness_command = list(getattr(args, "harness_command", None) or [])
+    if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
+        print(
+            "error: --harness acp requires --harness-command EXECUTABLE [ARG ...]",
+            file=sys.stderr,
+        )
+        return 2
     role = (args.role or "").strip()
     role_short_raw = getattr(args, "role_short", None)
     role_short_raw = role_short_raw.strip() if role_short_raw else ""
@@ -533,10 +566,11 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         role_short=role_short,
         runtime=RuntimeConfig(
             kind=runtime_kind,
-            provider=args.provider or "",
-            api_key=api_key,
+            provider=provider,
+            api_key=args.api_key or "",
             model=args.model or "",
             harness=harness,
+            harness_command=harness_command,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -548,8 +582,9 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         created_at=int(time.time()),
     )
     cfg.save()
+    _prepare_cli_shared_workspace(cfg)
 
-    (target / "memory").mkdir(exist_ok=True)
+    (target / "memory").mkdir()
 
     profile_path = target / "profile.md"
     if args.profile and Path(args.profile).exists():
@@ -557,6 +592,11 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     else:
         profile_path.write_text(DEFAULT_PROFILE, encoding="utf-8")
 
+    _print_agent_create_result(agent_id, target)
+    return 0
+
+
+def _print_agent_create_result(agent_id: str, target: Path) -> None:
     print(f"created agent {agent_id!r} at {target}")
     print(
         "next: register a puffo-core identity for this agent with "
@@ -568,7 +608,6 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         print("daemon is not running — run `puffo-agent start` to activate.")
     else:
         print("daemon will pick it up on the next reconcile tick (a few seconds).")
-    return 0
 
 
 def cmd_agent_list(args: argparse.Namespace) -> int:
@@ -578,10 +617,16 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
         return 0
     daemon_alive = is_daemon_alive()
     fmt = "{id:<24}  {name:<18}  {state:<8}  {runtime:<18}  {msgs:>6}  {uptime}"
-    print(fmt.format(
-        id="ID", name="DISPLAY", state="STATE",
-        runtime="RUNTIME", msgs="MSGS", uptime="UPTIME",
-    ))
+    print(
+        fmt.format(
+            id="ID",
+            name="DISPLAY",
+            state="STATE",
+            runtime="RUNTIME",
+            msgs="MSGS",
+            uptime="UPTIME",
+        )
+    )
     print("-" * 100)
     for aid in agents:
         try:
@@ -609,20 +654,26 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
                 uptime = "—"
         # Surface non-ok health alongside lifecycle status so the
         # operator can see at a glance which agents need attention.
-        if rs is not None and rs.health in (
-            "in_progress",
-            "auth_failed", "api_error_abandoned", "refresh_broken",
-            "unhandled_error", "codex_thread_wedged",
-        ):
+        # Stated as an exclusion, not a roster of the interesting values: a
+        # hand-maintained roster makes every health value added later
+        # invisible here by default, which is the one surface an operator
+        # reads first. Only "ok" and "unknown" carry no call to action.
+        if rs is not None and rs.health and rs.health not in ("ok", "unknown"):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.
-        display = (ac.display_name or aid)
+        display = ac.display_name or aid
         if len(display) > 18:
             display = display[:17] + "…"
-        print(fmt.format(
-            id=aid, name=display, state=ac.state,
-            runtime=runtime, msgs=msgs, uptime=uptime,
-        ))
+        print(
+            fmt.format(
+                id=aid,
+                name=display,
+                state=ac.state,
+                runtime=runtime,
+                msgs=msgs,
+                uptime=uptime,
+            )
+        )
     return 0
 
 
@@ -651,7 +702,9 @@ def cmd_agent_show(args: argparse.Namespace) -> int:
     print(f"  provider:      {ac.runtime.provider or '(default)'}")
     print(f"  model:         {ac.runtime.model or '(default)'}")
     print(f"  api_key:       {'(set)' if ac.runtime.api_key else '(inherit)'}")
-    print(f"triggers:        on_mention={ac.triggers.on_mention} on_dm={ac.triggers.on_dm}")
+    print(
+        f"triggers:        on_mention={ac.triggers.on_mention} on_dm={ac.triggers.on_dm}"
+    )
     if rs is not None:
         print("status:")
         print(f"  status:        {rs.status}")
@@ -673,36 +726,14 @@ def cmd_agent_resume(args: argparse.Namespace) -> int:
 
 
 def _summarise_credentials(path: Path) -> str:
-    """One-line description of a ``.credentials.json`` file (mtime,
-    expiry, token presence, scopes) for the refresh-ping diagnostic."""
-    import json as _json
+    """Describe the credential file without reading secret-bearing content."""
     if not path.exists():
         return "not present"
     try:
         st = path.stat()
     except OSError as exc:
         return f"stat failed: {exc}"
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))} parse-error: {exc}"
-    oauth = data.get("claudeAiOauth") or {}
-    expires_ms = oauth.get("expiresAt")
-    if isinstance(expires_ms, (int, float)):
-        expires_in = int(expires_ms / 1000 - time.time())
-        expires_at = _format_ts(int(expires_ms / 1000))
-        expiry_info = f"expiresAt={expires_at} ({expires_in:+d}s from now)"
-    else:
-        expiry_info = "expiresAt=(missing)"
-    has_access = bool(oauth.get("accessToken"))
-    has_refresh = bool(oauth.get("refreshToken"))
-    scopes = oauth.get("scopes") or []
-    return (
-        f"mtime={_format_ts(int(st.st_mtime))} {expiry_info} "
-        f"accessToken={'yes' if has_access else 'no'} "
-        f"refreshToken={'yes' if has_refresh else 'no'} "
-        f"scopes={scopes!r}"
-    )
+    return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))}"
 
 
 def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
@@ -729,11 +760,13 @@ def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
     print(f"  {_summarise_credentials(host_creds)}")
     print()
     write_refresh_token_request()
-    print("refresh request written; daemon will pick it up on its "
-          "next reconcile tick (typically <1s).")
     print(
-        f"after a few seconds, re-check {host_creds} mtime + "
-        "expiresAt to confirm the refresh landed."
+        "refresh request written; daemon will pick it up on its "
+        "next reconcile tick (typically <1s)."
+    )
+    print(
+        f"after a few seconds, re-check {host_creds} mtime "
+        "to confirm the refresh landed."
     )
     return 0
 
@@ -758,6 +791,7 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
     """Change display_name on disk, in profile.md heading, on the
     server identity, and drop refresh_agent.flag (mirrors bridge edit)."""
     import asyncio
+
     from ..agent.shared_content import rewrite_profile_name
     from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
@@ -858,12 +892,14 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     role_short) and best-effort sync them to puffo-server signed by
     the agent's own keystore.
 
-    Uses the same server profile shape as remote management. No flags
-    show current values; update flags write agent.yml and then sync to
-    the server."""
+    Mirrors the bridge ``PATCH /v1/agents/{id}/profile`` endpoint
+    one-for-one — same validation, same wire shape, same server
+    update — so anything the operator can do from the local-bridge
+    UI is reachable from the CLI too. No flags ⇒ show current
+    values. With flags ⇒ update agent.yml, then sync to server."""
     import asyncio
 
-    from .profile_sync import sync_agent_profile
+    from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
     agent_id = args.id
     if not agent_yml_path(agent_id).exists():
@@ -875,9 +911,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     role_short_arg = getattr(args, "role_short", None)
     display_name_arg = getattr(args, "display_name", None)
 
-    no_edits = all(
-        x is None for x in (display_name_arg, role_arg, role_short_arg)
-    )
+    no_edits = all(x is None for x in (display_name_arg, role_arg, role_short_arg))
     if no_edits:
         print(f"id:            {cfg.id}")
         print(f"slug:          {cfg.puffo_core.slug}")
@@ -888,7 +922,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         print(f"server_url:    {cfg.puffo_core.server_url}")
         return 0
 
-    # Validation mirrors handlers.update_profile so the CLI fails
+    # Validation mirrors the control provision contract so the CLI fails
     # locally before bothering the server.
     if role_short_arg is not None and role_arg is None and not cfg.role:
         print(
@@ -903,16 +937,6 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if role_short_arg is not None and len(role_short_arg) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
-    if role_short_arg is not None and role_short_arg.strip():
-        _authoritative = _derive_role_short_cli(
-            role_arg if isinstance(role_arg, str) else cfg.role
-        )
-        if role_short_arg.strip() != _authoritative:
-            print(
-                f"warning: --role-short is deprecated (PUF-401); ignoring "
-                f"{role_short_arg!r}, using role-derived {_authoritative!r}",
-                file=sys.stderr,
-            )
 
     # Build the wire patch + apply locally in lock-step. agent.yml
     # writes happen first so a server-side hiccup doesn't lose what
@@ -927,8 +951,19 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         patch["role"] = role_arg
         cfg.role_short = _derive_role_short_cli(role_arg)
         patch["role_short"] = cfg.role_short
+    if isinstance(role_short_arg, str):
+        derived = _derive_role_short_cli(cfg.role)
+        if role_short_arg.strip() and role_short_arg.strip() != derived:
+            print(
+                f"warning: --role-short is deprecated (PUF-401); ignoring "
+                f"{role_short_arg!r}, using role-derived {derived!r}",
+                file=sys.stderr,
+            )
+        cfg.role_short = derived
+        patch["role_short"] = derived
 
     cfg.save()
+    write_refresh_agent_flag(cfg, reason="cli agent profile")
 
     try:
         asyncio.run(sync_agent_profile(cfg, patch))
@@ -947,8 +982,79 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if "role" in patch:
         print(f"  role:         {cfg.role!r}")
     if "role_short" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (derived from role)")
+        print(f"  role_short:   {cfg.role_short!r}  (server-derived)")
     return 0
+
+
+def _apply_cli_inference_level(
+    cfg: AgentConfig, args: argparse.Namespace,
+) -> tuple[int, bool, bool]:
+    """Resolve ``--inference-level`` against the (possibly new) harness.
+
+    Returns ``(exit_code, touched, cleared)``. A non-zero exit code means an
+    explicitly supplied level is unusable and the caller must abort; a level
+    left over from a harness swap is cleared silently, matching every other
+    runtime writer.
+    """
+    if args.inference_level is None and args.harness is None:
+        return 0, False, False
+    from ..mcp.config import supported_inference_levels
+    from .runtime_matrix import normalize_inference_level
+
+    def _normalize(level: str) -> str:
+        return normalize_inference_level(
+            cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness, level,
+        )
+
+    if args.inference_level is not None:
+        if args.inference_level and not _normalize(args.inference_level):
+            levels = supported_inference_levels(cfg.runtime.harness)
+            print(
+                f"error: inference level {args.inference_level!r} is not "
+                f"supported by {cfg.runtime.harness!r}; expected one of "
+                f"{', '.join(levels)}",
+                file=sys.stderr,
+            )
+            return 2, False, False
+        cfg.runtime.inference_level = args.inference_level
+        return 0, True, False
+
+    normalized = _normalize(cfg.runtime.inference_level)
+    if normalized == cfg.runtime.inference_level:
+        return 0, False, False
+    cfg.runtime.inference_level = normalized
+    return 0, False, True
+
+
+def _load_runtime_command_config(
+    agent_id: str,
+    args: argparse.Namespace,
+) -> AgentConfig | None:
+    update_requested = any(
+        getattr(args, field) is not None
+        for field in (
+            "kind",
+            "provider",
+            "model",
+            "inference_level",
+            "api_key",
+            "docker_image",
+            "permission_mode",
+            "sandbox",
+            "harness",
+        )
+    )
+    try:
+        # An explicit edit must be able to repair a runtime combination that
+        # a newer release stopped supporting. The final combination is still
+        # validated by cmd_agent_runtime before any bytes are written.
+        return AgentConfig.load(
+            agent_id,
+            allow_invalid_runtime=update_requested,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
 
 
 def cmd_agent_runtime(args: argparse.Namespace) -> int:
@@ -958,7 +1064,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not agent_yml_path(agent_id).exists():
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
-    cfg = AgentConfig.load(agent_id)
+    cfg = _load_runtime_command_config(agent_id, args)
+    if cfg is None:
+        return 2
 
     touched = False
     if args.kind is not None:
@@ -976,12 +1084,6 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.docker_image is not None:
         cfg.runtime.docker_image = args.docker_image
         touched = True
-    if args.allowed_tools is not None:
-        raw = args.allowed_tools.strip()
-        cfg.runtime.allowed_tools = (
-            [] if not raw else [t.strip() for t in raw.split(",") if t.strip()]
-        )
-        touched = True
     if args.permission_mode is not None:
         cfg.runtime.permission_mode = args.permission_mode
         touched = True
@@ -991,47 +1093,60 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
-    if args.max_turns is not None:
-        if args.max_turns < 1:
-            print("error: --max-turns must be >= 1", file=sys.stderr)
-            return 2
-        cfg.runtime.max_turns = args.max_turns
+    if args.harness_command is not None:
+        cfg.runtime.harness_command = list(args.harness_command)
         touched = True
-
+    status, level_touched, inference_level_cleared = _apply_cli_inference_level(
+        cfg, args
+    )
+    if status:
+        return status
+    touched = touched or level_touched
     if not touched:
         # No flags → print only. Matches ``agent show``'s runtime lines.
         print(f"id:              {cfg.id}")
         print("runtime:")
         print(f"  kind:             {cfg.runtime.kind}")
         print(f"  provider:         {cfg.runtime.provider or '(default)'}")
-        print(f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)")
+        print(
+            f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)"
+        )
+        print(
+            "  harness_command:  "
+            + (" ".join(cfg.runtime.harness_command) or "(default)")
+        )
         print(f"  model:            {cfg.runtime.model or '(default)'}")
+        print(
+            f"  inference_level:  {cfg.runtime.inference_level or '(harness default)'}"
+        )
         print(f"  api_key:          {'(set)' if cfg.runtime.api_key else '(inherit)'}")
-        print(f"  allowed_tools:    {cfg.runtime.allowed_tools or '[]'}")
         print(f"  docker_image:     {cfg.runtime.docker_image or '(bundled default)'}")
         print(f"  permission_mode:  {cfg.runtime.permission_mode}  (cli-local only)")
-        sandbox = (
-            "Docker container"
-            if cfg.runtime.kind == "cli-docker" and cfg.runtime.harness == "codex"
-            else cfg.runtime.sandbox
-        )
-        print(f"  sandbox:          {sandbox}  (codex only)")
-        print(f"  max_turns:        {cfg.runtime.max_turns}  (sdk-local only)")
+        print(f"  sandbox:          {cfg.runtime.sandbox}  (codex only)")
         return 0
 
     # Validate the triple before writing — same check the daemon
     # runs at AgentConfig.load.
     from .runtime_matrix import validate_triple
-    result = validate_triple(cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness)
+
+    result = validate_triple(
+        cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness
+    )
     if not result.ok:
         print(f"error: {result.error}", file=sys.stderr)
+        return 2
+    command_error = _harness_command_error(cfg.runtime)
+    if command_error:
+        print(f"error: {command_error}", file=sys.stderr)
         return 2
 
     cfg.save()
     print(f"agent {agent_id!r} runtime updated:")
     print(f"  kind={cfg.runtime.kind} model={cfg.runtime.model or '(default)'}")
-    if cfg.runtime.allowed_tools:
-        print(f"  allowed_tools={cfg.runtime.allowed_tools}")
+    if cfg.runtime.inference_level:
+        print(f"  inference_level={cfg.runtime.inference_level}")
+    elif inference_level_cleared:
+        print("  inference_level=(harness default; incompatible prior value cleared)")
     if cfg.runtime.docker_image:
         print(f"  docker_image={cfg.runtime.docker_image}")
     if is_daemon_alive():
@@ -1039,11 +1154,25 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def _harness_command_error(runtime: RuntimeConfig) -> str:
+    if (
+        runtime.kind == "cli-local"
+        and runtime.harness == "acp"
+        and not runtime.harness_command
+    ):
+        return (
+            "harness='acp' requires --harness-command "
+            "EXECUTABLE [ARG ...]"
+        )
+    return ""
+
+
 def cmd_agent_archive(args: argparse.Namespace) -> int:
     agent_id = args.id
     src = agent_dir(agent_id)
     if not src.exists():
         from .control.client import _is_already_archived
+
         if _is_already_archived(agent_id):
             print(f"{agent_id!r} is already archived")
             return 0
@@ -1093,6 +1222,7 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
                 )
                 try:
                     from ..crypto.keystore import KeyStore
+
                     identity = KeyStore(dest / "keys").load_identity(
                         cfg.puffo_core.slug
                     )
@@ -1126,8 +1256,14 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
     try:
         subprocess.call([editor, str(profile)])
     except FileNotFoundError:
-        print(f"error: editor {editor!r} not found. Set $EDITOR and retry.", file=sys.stderr)
+        print(
+            f"error: editor {editor!r} not found. Set $EDITOR and retry.",
+            file=sys.stderr,
+        )
         return 2
+    from .profile_sync import write_refresh_agent_flag
+
+    write_refresh_agent_flag(cfg, reason="cli profile editor")
     return 0
 
 
@@ -1136,21 +1272,53 @@ def cmd_link(args: argparse.Namespace) -> int:
     from .control.link import DEFAULT_SERVER_URL, friendly_device_name, run_link
 
     # The daemon holds the control WS that serves the operator's commands
-    # once approved — auto-start it if it isn't
-    # running, so `link` is a one-step onboard.
-    if not is_daemon_alive():
-        from .background import spawn_background
-        spawn_background()
+    # once approved — auto-start a detached headless daemon if it isn't
+    # running, so `link` stays a one-step onboard without requiring Qt.
+    if not is_daemon_ready():
+        from .background import spawn_headless_background
+
+        startup_rc = spawn_headless_background()
+        if startup_rc != 0:
+            return startup_rc
 
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(
-            run_link(server_url, name, open_browser=not args.not_open, code=args.code)
+        link_rc = asyncio.run(
+            run_link(
+                server_url,
+                name,
+                open_browser=not args.not_open,
+                code=args.code,
+            )
         )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
+    if link_rc == 0 and not args.no_autostart:
+        _enable_autostart_after_link()
+    return link_rc
+
+
+def _enable_autostart_after_link() -> None:
+    from . import autostart
+
+    try:
+        result = autostart.enable()
+    except Exception as exc:  # noqa: BLE001
+        result = autostart.ActionResult(False, [str(exc)])
+    if result.ok:
+        print("link: autostart enabled.")
+        for line in result.lines:
+            print(line)
+        return
+    print("warning: link succeeded, but autostart could not be enabled.", file=sys.stderr)
+    for line in result.lines:
+        print(line, file=sys.stderr)
+    print(
+        "Run `puffo-agent autostart enable` manually to retry.",
+        file=sys.stderr,
+    )
 
 
 def cmd_unlink(args: argparse.Namespace) -> int:
@@ -1172,7 +1340,9 @@ def cmd_agent_export(args: argparse.Namespace) -> int:
     if dest.suffix.lower() != ".puffoagent":
         dest = dest.with_suffix(".puffoagent")
     if dest.exists() and not args.force:
-        print(f"error: {dest} already exists (pass --force to overwrite)", file=sys.stderr)
+        print(
+            f"error: {dest} already exists (pass --force to overwrite)", file=sys.stderr
+        )
         return 2
 
     password = _prompt_password_twice("Set export password: ")
@@ -1297,29 +1467,13 @@ def cmd_agent_refresh(args: argparse.Namespace) -> int:
     ``--kind`` axis."""
     import json
 
-    agent_id = args.id
-    if not agent_yml_path(agent_id).exists():
-        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
-        return 2
-    try:
-        cfg = AgentConfig.load(agent_id)
-    except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    agent_id, cfg = _load_refresh_config(args.id)
+    if cfg is None:
         return 2
 
-    model_swap: tuple[str, str] | None = None
-    if args.model is not None:
-        raw = args.model.strip()
-        if ":" not in raw:
-            print("error: --model must be harness:model (e.g. codex:gpt-5)", file=sys.stderr)
-            return 2
-        harness, model_id = raw.split(":", 1)
-        harness = harness.strip()
-        model_id = model_id.strip()
-        if not harness or not model_id:
-            print("error: --model must be non-empty harness:model", file=sys.stderr)
-            return 2
-        model_swap = (harness, model_id)
+    model_swap = _parse_refresh_model(args.model)
+    if args.model is not None and model_swap is None:
+        return 2
 
     kind = args.kind.strip() if args.kind is not None else None
     swap_requested = bool(model_swap or kind)
@@ -1354,57 +1508,89 @@ def cmd_agent_refresh(args: argparse.Namespace) -> int:
         if model_swap is not None:
             payload["harness"], payload["model"] = model_swap
         refresh_runtime_flag_path(workspace).write_text(
-            json.dumps(payload), encoding="utf-8",
+            json.dumps(payload),
+            encoding="utf-8",
         )
         touched.append(
             f"refresh_runtime.flag (kind={kind!r}"
             + (
                 f" harness={model_swap[0]!r} model={model_swap[1]!r}"
-                if model_swap else ""
+                if model_swap
+                else ""
             )
             + ")"
         )
     elif model_swap is not None:
         refresh_model_flag_path(workspace).write_text(
-            json.dumps({
-                "harness": model_swap[0],
-                "model": model_swap[1],
-                "requested_at": now,
-            }),
+            json.dumps(
+                {
+                    "harness": model_swap[0],
+                    "model": model_swap[1],
+                    "requested_at": now,
+                }
+            ),
             encoding="utf-8",
         )
         touched.append(
-            f"refresh_model.flag (harness={model_swap[0]!r} "
-            f"model={model_swap[1]!r})"
+            f"refresh_model.flag (harness={model_swap[0]!r} model={model_swap[1]!r})"
         )
     else:
         refresh_agent_flag_path(workspace).write_text(
-            json.dumps({"requested_at": now}), encoding="utf-8",
+            json.dumps({"requested_at": now}),
+            encoding="utf-8",
         )
         touched.append("refresh_agent.flag")
         if args.host_sync:
             refresh_host_sync_flag_path(workspace).write_text(
-                json.dumps({"requested_at": now}), encoding="utf-8",
+                json.dumps({"requested_at": now}),
+                encoding="utf-8",
             )
             touched.append("refresh_host_sync.flag")
         if args.session:
             refresh_session_flag_path(workspace).write_text(
-                json.dumps({"requested_at": now}), encoding="utf-8",
+                json.dumps({"requested_at": now}),
+                encoding="utf-8",
             )
             touched.append("refresh_session.flag")
 
     print(f"agent {agent_id!r}: dropped " + ", ".join(touched))
     if is_daemon_alive():
-        print(
-            "daemon + worker will pick up the flags on the next tick / turn."
-        )
+        print("daemon + worker will pick up the flags on the next tick / turn.")
     return 0
+
+
+def _load_refresh_config(agent_id: str) -> tuple[str, AgentConfig | None]:
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return agent_id, None
+    try:
+        return agent_id, AgentConfig.load(agent_id)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return agent_id, None
+
+
+def _parse_refresh_model(value: str | None) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if ":" not in raw:
+        print(
+            "error: --model must be harness:model (e.g. codex:gpt-5)", file=sys.stderr
+        )
+        return None
+    harness, model_id = (item.strip() for item in raw.split(":", 1))
+    if not harness or not model_id:
+        print("error: --model must be non-empty harness:model", file=sys.stderr)
+        return None
+    return harness, model_id
 
 
 def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
     """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
     ensure_shared_primer runs on every worker startup, so this is only
     needed to force a rebuild without waiting for a message."""
+    from ..agent.memory_errors import BriefingCompileError
     from ..agent.shared_content import (
         ensure_shared_primer,
         rebuild_agent_claude_md,
@@ -1429,14 +1615,26 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
             rc = 2
             continue
-        rebuild_agent_claude_md(
-            shared_dir=shared_dir,
-            profile_path=cfg.resolve_profile_path(),
-            memory_dir=cfg.resolve_memory_dir(),
-            workspace_dir=cfg.resolve_workspace_dir(),
-            claude_user_dir=agent_claude_user_dir(agent_id),
-            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
-        )
+        try:
+            workspace_shared_status = _prepare_cli_shared_workspace(cfg)
+            rebuild_agent_claude_md(
+                shared_dir=shared_dir,
+                profile_path=cfg.resolve_profile_path(),
+                memory_dir=cfg.resolve_memory_dir(),
+                workspace_dir=cfg.resolve_workspace_dir(),
+                claude_user_dir=agent_claude_user_dir(agent_id),
+                gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+                agent_id=agent_id,
+                display_name=cfg.display_name,
+                role=cfg.role,
+                role_short=cfg.role_short,
+                puffo_handle=cfg.puffo_core.slug,
+                workspace_shared_status=workspace_shared_status,
+            )
+        except BriefingCompileError as exc:
+            print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
         rebuilt.append(agent_id)
         print(f"rebuilt CLAUDE.md for {agent_id!r}")
 
@@ -1481,479 +1679,13 @@ def _format_ts(ts: int) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="puffo-agent",
-        description="Multi-agent portal for Puffo.ai",
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    config = sub.add_parser(
-        "config",
-        help=(
-            "Optional: set daemon-wide defaults (provider, models, API keys). "
-            "The daemon runs fine without this — agents can carry their own keys."
-        ),
-    )
-    config.add_argument(
-        "--anthropic-api-key",
-        metavar="KEY",
-        help=(
-            "Set daemon.yml anthropic.api_key without reading "
-            "ANTHROPIC_API_KEY from the environment; pass an empty value "
-            "to clear it"
-        ),
-    )
-    config.add_argument(
-        "--anthropic-cli-use-api-key",
-        choices=("true", "false"),
-        help=(
-            "Enable or disable passing daemon.yml anthropic.api_key to "
-            "Claude Code"
-        ),
-    )
-    config.set_defaults(func=cmd_config)
-    start = sub.add_parser(
-        "start",
-        help=(
-            "Run the daemon (foreground by default; --background detaches "
-            "with a status-bar icon, --ui opens the desktop window)"
-        ),
-    )
-    start_mode = start.add_mutually_exclusive_group()
-    start_mode.add_argument(
-        "--ui",
-        action="store_true",
-        help="Launch the PySide6 desktop window alongside the daemon.",
-    )
-    start_mode.add_argument(
-        "--background",
-        action="store_true",
-        help=(
-            "Detach the daemon into the background with a status-bar (tray) "
-            "icon; it survives the terminal closing. Quit from the icon or "
-            "run `puffo-agent stop`."
-        ),
-    )
-    # Internal: the detached child that --background spawns to host the
-    # tray. Hidden from --help.
-    start.add_argument("--tray-runner", action="store_true", help=argparse.SUPPRESS)
-    start.set_defaults(func=cmd_start)
-    stop = sub.add_parser(
-        "stop",
-        help=(
-            "Signal the running daemon to shut down gracefully — "
-            "stops cli-docker containers but keeps them around for "
-            "next start (claude sessions resume from where they left "
-            "off)."
-        ),
-    )
-    stop.add_argument(
-        "--timeout",
-        type=int,
-        default=60,
-        help="Seconds to wait for the daemon to exit before giving up (default: 60)",
-    )
-    stop.set_defaults(func=cmd_stop)
-    sub.add_parser("status", help="Show daemon + agent status").set_defaults(func=cmd_status)
-    sub.add_parser("version", help="Print installed puffo-agent version").set_defaults(func=cmd_version)
-    sub.add_parser(
-        "check-update",
-        help="Compare installed version against latest GitHub release",
-    ).set_defaults(func=cmd_check_update)
-
-    agent = sub.add_parser("agent", help="Manage individual agents")
-    agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
-
-    create = agent_sub.add_parser(
-        "create",
-        help=(
-            "Register a new agent locally. Prompts for an LLM API key "
-            "if --api-key isn't given and no env var / daemon default "
-            "is set. The puffo_core slug/device_id/space_id still need "
-            "to be populated (via puffo-cli or by hand) before the "
-            "daemon will start the agent's worker."
-        ),
-    )
-    create.add_argument("--id", required=True)
-    create.add_argument("--display-name", help="Friendly name for the agent")
-    create.add_argument(
-        "--role",
-        help=(
-            "Short 'what does this agent do' string (<=140 chars). "
-            "Recommended shape '<short>: <description>'; the server "
-            "derives a chip label from the prefix (so "
-            "'coder: main puffo-core coder' surfaces 'coder' in "
-            "member lists)."
-        ),
-    )
-    create.add_argument(
-        "--role-short",
-        help=(
-            "Optional explicit override for the chip label "
-            "(<=32 chars). When omitted and --role is set, the "
-            "server derives it. Cannot be passed without --role."
-        ),
-    )
-    create.add_argument("--profile", help="Path to a profile.md to copy (default: built-in template)")
-    create.add_argument(
-        "--runtime",
-        choices=["chat-local", "sdk-local", "cli-local", "cli-docker"],
-        default="chat-local",
-        help="Runtime adapter kind (default: chat-local)",
-    )
-    create.add_argument(
-        "--provider",
-        choices=["anthropic", "openai", "google"],
-        help="Model provider (default: anthropic)",
-    )
-    create.add_argument(
-        "--harness",
-        choices=["claude-code", "hermes", "codex"],
-        help=(
-            "CLI harness. Defaults by provider/runtime; cli-docker supports "
-            "claude-code and codex"
-        ),
-    )
-    create.add_argument(
-        "--api-key",
-        help=(
-            "Provider API key. If omitted, falls back to "
-            "ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY env "
-            "var, then daemon.yml default, then an interactive prompt."
-        ),
-    )
-    create.add_argument("--model", help="Model override")
-    create.add_argument("--no-mention", action="store_true", help="Don't reply on @mention")
-    create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
-    create.set_defaults(func=cmd_agent_create)
-
-    lst = agent_sub.add_parser("list", help="List registered agents")
-    lst.set_defaults(func=cmd_agent_list)
-
-    show = agent_sub.add_parser("show", help="Show details for one agent")
-    show.add_argument("id")
-    show.set_defaults(func=cmd_agent_show)
-
-    pause = agent_sub.add_parser("pause", help="Pause a running agent (daemon will stop its worker)")
-    pause.add_argument("id")
-    pause.set_defaults(func=cmd_agent_pause)
-
-    resume = agent_sub.add_parser("resume", help="Resume a paused agent")
-    resume.add_argument("id")
-    resume.set_defaults(func=cmd_agent_resume)
-
-    refresh_token = agent_sub.add_parser(
-        "refresh-token",
-        help=(
-            "Ask the daemon to refresh Claude's OAuth token and "
-            "distribute the new credentials to every agent. Single "
-            "writer (daemon) — no per-agent race on the on-disk "
-            "refresh token."
-        ),
-    )
-    refresh_token.set_defaults(func=cmd_agent_refresh_token)
-
-    runtime = agent_sub.add_parser(
-        "runtime",
-        help="Show or edit the runtime: block in an agent's agent.yml",
-    )
-    runtime.add_argument("id")
-    runtime.add_argument(
-        "--kind",
-        choices=["chat-local", "sdk-local", "cli-local", "cli-docker"],
-        help="Runtime adapter kind",
-    )
-    runtime.add_argument(
-        "--provider",
-        choices=["anthropic", "openai", "google"],
-        help=(
-            "Model provider. anthropic pairs with claude-code; openai "
-            "pairs with codex, or hermes on cli-local."
-        ),
-    )
-    runtime.add_argument("--model", help="Model override (empty string clears)")
-    runtime.add_argument("--api-key", help="Runtime API key (sdk-local / chat-local)")
-    runtime.add_argument(
-        "--allowed-tools",
-        help="SDK: comma-separated tool allowlist patterns, e.g. Read,Edit,\"Bash(git *)\" — empty clears",
-    )
-    runtime.add_argument("--docker-image", help="cli-docker: override image tag")
-    runtime.add_argument(
-        "--permission-mode",
-        choices=["bypassPermissions"],
-        help=(
-            "cli-local: Claude Code permission mode. Only "
-            "'bypassPermissions' is supported today — the proxy "
-            "modes (default / acceptEdits / auto / dontAsk) need "
-            "more work on the permission DM flow."
-        ),
-    )
-    runtime.add_argument(
-        "--sandbox",
-        choices=["read-only", "workspace-write", "danger-full-access"],
-        help=(
-            "cli-local codex: file-system policy. cli-docker always uses "
-            "its container as the sandbox. Note "
-            "``workspace-write`` is silently downgraded to read-only "
-            "on Windows; use ``danger-full-access`` there."
-        ),
-    )
-    runtime.add_argument(
-        "--max-turns",
-        type=int,
-        help=(
-            "sdk only: max agentic-loop iterations per conversation "
-            "turn (tool calls + final reply). Default 10; raise for "
-            "complex multi-step tasks."
-        ),
-    )
-    runtime.add_argument(
-        "--harness",
-        choices=["claude-code", "hermes", "codex"],
-        help=(
-            "cli-local / cli-docker: which agent engine runs inside the "
-            "runtime. 'claude-code' (default, anthropic only) spawns the "
-            "claude CLI with our stream-json session protocol. 'codex' "
-            "(openai, cli-local or cli-docker) spawns `codex app-server` "
-            "as a long-lived JSON-RPC subprocess using operator-side "
-            "`codex login`. 'hermes' is cli-local only and routes OAuth to "
-            "Anthropic's extra_usage pool, NOT your Claude subscription — "
-            "see NousResearch/hermes-agent#12905."
-        ),
-    )
-    runtime.set_defaults(func=cmd_agent_runtime)
-
-    profile = agent_sub.add_parser(
-        "profile",
-        help=(
-            "Show or edit identity-profile fields (display_name, role, "
-            "role_short). No flags ⇒ show. With flags ⇒ update "
-            "agent.yml AND sync to puffo-server, signed by the agent's "
-            "own keystore."
-        ),
-    )
-    profile.add_argument("id")
-    profile.add_argument(
-        "--display-name",
-        help="New friendly name for the agent (≤60 chars per server validation)",
-    )
-    profile.add_argument(
-        "--role",
-        help=(
-            "Long-form 'what does this agent do' string (≤140 chars). "
-            "Recommended shape '<short>: <description>' — the server "
-            "auto-derives the chip label from the prefix."
-        ),
-    )
-    profile.add_argument(
-        "--role-short",
-        help=(
-            "Explicit chip-label override (≤32 chars). When omitted, "
-            "the server derives this from --role. Cannot be passed "
-            "alone unless agent.yml already has a role."
-        ),
-    )
-    profile.set_defaults(func=cmd_agent_profile)
-
-    autoaccept = agent_sub.add_parser(
-        "autoaccept",
-        help=(
-            "Toggle this agent's auto-accept-channel-invite preference "
-            "in a given space. With --owner on, the agent silently "
-            "joins any channel its space-owner invites it to; with off, "
-            "the agent goes through the normal DM-operator confirmation "
-            "path. The member-invite flag is locked off for agents in "
-            "this build (server returns 403)."
-        ),
-    )
-    autoaccept.add_argument("id")
-    autoaccept.add_argument("--space", required=True, help="space_id (sp_<uuid>) to scope the toggle to")
-    autoaccept.add_argument(
-        "--owner",
-        choices=["on", "off"],
-        required=True,
-        help="Auto-accept channel invites from the space owner",
-    )
-    autoaccept.set_defaults(func=cmd_agent_autoaccept)
-
-    archive = agent_sub.add_parser("archive", help="Stop and archive an agent to ~/.puffo-agent/archived/")
-    archive.add_argument("id")
-    archive.set_defaults(func=cmd_agent_archive)
-
-    edit = agent_sub.add_parser("edit", help="Open the agent's profile.md in $EDITOR")
-    edit.add_argument("id")
-    edit.set_defaults(func=cmd_agent_edit)
-
-    rename = agent_sub.add_parser(
-        "rename",
-        help="Change the agent's display name (server-side + local)",
-    )
-    rename.add_argument("id")
-    rename.add_argument(
-        "display_name",
-        help="New display name. UTF-8 / CJK / emoji are fine.",
-    )
-    rename.set_defaults(func=cmd_agent_rename)
-
-    export = agent_sub.add_parser(
-        "export",
-        help="Encrypted export of N agents into a .puffoagent bundle",
-    )
-    export.add_argument("ids", nargs="+", metavar="agent_id", help="agent id(s) to export")
-    export.add_argument("--dest", required=True, help="Destination .puffoagent file")
-    export.add_argument("--force", action="store_true", help="Overwrite dest if it exists")
-    export.set_defaults(func=cmd_agent_export)
-
-    imp = agent_sub.add_parser(
-        "import",
-        help="Restore agents from a .puffoagent bundle on this daemon",
-    )
-    imp.add_argument("src", help="Path to the .puffoagent file")
-    imp.set_defaults(func=cmd_agent_import)
-
-    revoke_pending = agent_sub.add_parser(
-        "revoke-pending",
-        help="Retry the post-import revocation of an old device",
-    )
-    revoke_pending.add_argument(
-        "id",
-        nargs="?",
-        default=None,
-        help="agent id to retry (omit to retry all pending)",
-    )
-    revoke_pending.set_defaults(func=cmd_agent_revoke_pending)
-
-    reset_primer = agent_sub.add_parser(
-        "reset-primer",
-        help=(
-            "Re-seed the shared platform primer to this install's version "
-            "and rebuild the listed agents' CLAUDE.md from it"
-        ),
-    )
-    reset_primer.add_argument(
-        "ids",
-        nargs="+",
-        metavar="agent_id",
-        help="agent id(s) whose CLAUDE.md to rebuild",
-    )
-    reset_primer.set_defaults(func=cmd_agent_reset_primer)
-
-    refresh = agent_sub.add_parser(
-        "refresh",
-        help=(
-            "Drop one or more refresh flags. No flags = rebuild CLAUDE.md "
-            "+ re-sync shared skills."
-        ),
-    )
-    refresh.add_argument("id", help="agent id")
-    refresh.add_argument(
-        "--host-sync",
-        action="store_true",
-        help=(
-            "also re-sync host skills, MCP registrations, and portable "
-            "credentials"
-        ),
-    )
-    refresh.add_argument(
-        "--session",
-        action="store_true",
-        help="also drop the CLI session token (fresh conversation on next spawn)",
-    )
-    refresh.add_argument(
-        "--model",
-        default=None,
-        metavar="HARNESS:MODEL",
-        help="swap (harness, model); e.g. codex:gpt-5, claude-code:sonnet-4-5",
-    )
-    refresh.add_argument(
-        "--kind",
-        default=None,
-        help="swap runtime kind; CLI-only (MCP + web app cannot change this)",
-    )
-    refresh.set_defaults(func=cmd_agent_refresh)
-
-    machine = sub.add_parser(
-        "machine",
-        help="Link / unlink this machine to puffo operators via the agent portal",
-    )
-    machine_sub = machine.add_subparsers(dest="machine_cmd", required=True)
-
-    machine_link = machine_sub.add_parser(
-        "link",
-        help="Link this machine to a puffo operator via the online agent portal",
-    )
-    machine_link.add_argument(
-        "--server-url",
-        default=None,
-        help="puffo-server base URL (default: the production relay).",
-    )
-    machine_link.add_argument(
-        "--name",
-        default=None,
-        help="Name for this machine in the portal (default: hostname).",
-    )
-    machine_link.add_argument(
-        "--not-open",
-        action="store_true",
-        help="Don't auto-open the link page in your browser.",
-    )
-    machine_link.add_argument(
-        "--code",
-        default=None,
-        help="Link code generated in the puffo web app (e.g. ABCD-1234); "
-        "this machine claims it instead of minting its own.",
-    )
-    machine_link.set_defaults(func=cmd_link)
-
-    machine_unlink = machine_sub.add_parser(
-        "unlink",
-        help="Remove an operator pairing and pause that operator's agents",
-    )
-    machine_unlink.add_argument(
-        "--operator", required=True, help="Operator slug to unlink",
-    )
-    machine_unlink.add_argument(
-        "--server-url",
-        default=None,
-        help="Only unlink the pairing on this server URL (default: match by operator).",
-    )
-    machine_unlink.set_defaults(func=cmd_unlink)
-
-    attach = sub.add_parser(
-        "ws-local",
-        help=(
-            "Reference ws-local client: hold a WebSocket session to the "
-            "daemon on behalf of a .puffoagent bundle so an external AI "
-            "tool can drive the agent through files on disk."
-        ),
-    )
-    attach.add_argument("bundle", help="Path to the .puffoagent export blob")
-    attach.add_argument(
-        "--passcode",
-        required=True,
-        help="Passcode that decrypts the bundle (matches the create-agent UI).",
-    )
-    attach.add_argument(
-        "--daemon-url",
-        dest="daemon_url",
-        default="http://127.0.0.1:63387",
-        help="Daemon ws-local base URL (default: %(default)s).",
-    )
-    attach.add_argument(
-        "--session-dir",
-        default="",
-        help=(
-            "Pre-create the session work-dir at this path. "
-            "Default: a random ``puffo-attach-XXXX`` under the system temp dir."
-        ),
-    )
-    attach.set_defaults(func=cmd_attach)
-
-    # macOS Keychain integration probes (no-op on Linux/Windows).
-    from .diagnostic import register_test_subcommands
-    register_test_subcommands(sub)
-
-    return parser
+    """Build the public CLI while keeping command behavior in this module."""
+    handlers = {
+        name: value
+        for name, value in globals().items()
+        if name.startswith("cmd_") and callable(value)
+    }
+    return build_cli_parser(handlers)
 
 
 def main(argv: list[str] | None = None) -> int:

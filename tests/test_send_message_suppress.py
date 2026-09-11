@@ -228,7 +228,7 @@ def test_fallback_when_no_send_message_called_and_no_silent_marker(tmp_path):
 
 
 def test_does_not_suppress_when_metadata_missing(tmp_path):
-    """Legacy adapters (e.g. ChatOnlyAdapter) don't populate metadata
+    """Compatibility adapters may not populate metadata
     — fall through to the post-it path."""
     agent = _agent("Hello!", tmp_path)  # no metadata kwargs
     result = _run(_dispatch(agent))

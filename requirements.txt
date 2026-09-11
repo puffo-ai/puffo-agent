@@ -1,9 +1,13 @@
 aiohttp>=3.9
 aiohttp-socks>=0.10
-anthropic>=0.25
+aiosqlite>=0.20
 certifi>=2024.2.2
-mcp>=1.0
-openai>=1.30
+cryptography>=43.0
+mcp>=1.0,<2
+pillow>=10.0
 psutil>=5.9
+pyhpke>=0.6
 python-socks>=2.4
 pyyaml>=6.0
+tzdata>=2024.1
+websockets>=12.0

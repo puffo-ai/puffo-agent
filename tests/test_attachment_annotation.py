@@ -41,3 +41,12 @@ def test_plain_attachment_has_no_annotation():
     assert "/inbox/env/thumb.png" in block
     assert "origin" not in block
     assert "crop a region" not in block
+
+
+def test_host_inbox_path_is_projected_into_the_workspace():
+    block = _block([
+        "/home/hanchen/.puffo-agent/agents/linus/workspace/"
+        ".puffo/inbox/msg_1/ballerz.jpeg"
+    ])
+    assert "  - .puffo/inbox/msg_1/ballerz.jpeg" in block
+    assert "/home/hanchen" not in block

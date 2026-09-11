@@ -1,8 +1,6 @@
 """Round-trip + edge cases for ``puffo_agent.agent.disk_cache``."""
 from __future__ import annotations
 
-import json
-import os
 
 import pytest
 

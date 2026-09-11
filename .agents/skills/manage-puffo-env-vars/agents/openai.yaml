@@ -1,0 +1,4 @@
+interface:
+  display_name: "Puffo Environment Variables"
+  short_description: "Add and migrate Puffo-owned environment variables safely"
+  default_prompt: "Use $manage-puffo-env-vars to add or migrate this Puffo environment variable consistently."

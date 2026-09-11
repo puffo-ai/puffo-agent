@@ -50,7 +50,7 @@ def test_mcp_probe_sample_attributes_to_agent(monkeypatch):
     class _Mem:
         rss = 2 * 1024 * 1024
 
-    tree: dict[int, "_FakeProc"] = {}
+    tree: dict[int, _FakeProc] = {}
 
     class _FakeProc:
         def __init__(self, pid, ppid, name, cmd, cwd=""):

@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -35,20 +36,69 @@ _resolve_memcache: dict[str, str] = {}
 _real_path_cache: str | None = None
 
 
-def cli_tool_status(
-    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
-) -> str:
-    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI."""
+@dataclass(frozen=True)
+class HarnessReadiness:
+    """Explicit three-state readiness for one harness.
+
+    ``state`` is one of:
+
+    * ``ready`` — resolved and verified usable.
+    * ``degraded`` — startable, but with a caveat the caller should surface
+      (typically: this harness has no checkable local credential store, so
+      usability is unknown until a turn runs).
+    * ``unavailable`` — cannot run (no binary, or credentials known absent).
+
+    ``reason`` is empty for ``ready`` and machine-readable otherwise.
+    ``legacy`` reproduces exactly the string the portal's frozen
+    ``cli_tools`` field carried before this model existed — including its
+    lie of reporting an unknown credential state as ``ready``. That wire
+    contract stays byte-stable for old consumers; new consumers read
+    ``state``/``reason`` and must not re-derive them from ``legacy``.
+    """
+
+    state: str
+    reason: str
+    legacy: str
+
+
+def harness_readiness(
+    resolver: Callable[[], str | None],
+    credential_check: Callable[[], bool] | None,
+) -> HarnessReadiness:
+    """Compute three-state readiness for a host CLI harness.
+
+    Pass ``credential_check=None`` when the harness has no local
+    credential store this daemon can inspect — the honest answer is
+    ``degraded``/``credentials_unknown``, never ``ready``.
+    """
     try:
         path = resolver()
     except Exception:
         path = None
     if not path:
-        return "not_installed"
+        return HarnessReadiness("unavailable", "not_installed", "not_installed")
+    if credential_check is None:
+        return HarnessReadiness("degraded", "credentials_unknown", "ready")
     try:
-        return "ready" if credential_check() else "need_login"
+        has_credentials = credential_check()
     except Exception:
-        return "need_login"
+        # The check itself failed; that is not evidence of missing
+        # credentials. Legacy reported need_login here — preserved.
+        return HarnessReadiness("degraded", "credential_check_error", "need_login")
+    if has_credentials:
+        return HarnessReadiness("ready", "", "ready")
+    return HarnessReadiness("unavailable", "need_login", "need_login")
+
+
+def cli_tool_status(
+    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
+) -> str:
+    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI.
+
+    Legacy string view of ``harness_readiness``; kept for callers bound to
+    the frozen portal vocabulary.
+    """
+    return harness_readiness(resolver, credential_check).legacy
 
 
 def resolve_codex_bin() -> str | None:
@@ -77,6 +127,44 @@ def resolve_hermes_bin() -> str | None:
     that bit Codex.app the same way.
     """
     return _resolve("hermes", "PUFFO_HERMES_BIN", _hermes_bundle_paths())
+
+
+def resolve_opencode_bin() -> str | None:
+    """Return the absolute path of the ``opencode`` binary, or ``None``.
+
+    ``PUFFO_OPENCODE_BIN`` is an expert deployment override for daemons whose
+    inherited PATH predates the OpenCode installation.  The bundle fallback
+    covers OpenCode's standard per-user installer location for launchd and
+    other services with a narrow PATH.
+    """
+    return _resolve(
+        "opencode", "PUFFO_OPENCODE_BIN", _opencode_bundle_paths(),
+    )
+
+
+def resolve_pi_bin() -> str | None:
+    """Return the absolute path of the Pi coding-agent binary, or ``None``."""
+    return _resolve("pi", "PUFFO_PI_BIN", [])
+
+
+def pi_has_credentials() -> bool:
+    """Ask the resolved Pi binary whether any host credential is ready."""
+    executable = resolve_pi_bin()
+    if not executable:
+        return False
+    from .pi_auth import pi_has_credentials as native_pi_has_credentials
+
+    return native_pi_has_credentials(executable)
+
+
+def opencode_has_accessible_models() -> bool:
+    """Whether native OpenCode exposes at least one currently usable model."""
+    executable = resolve_opencode_bin()
+    if not executable:
+        return False
+    from .opencode_auth import list_opencode_models
+
+    return bool(list_opencode_models(executable))
 
 
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
@@ -118,6 +206,54 @@ def _first_executable(paths: list[Path]) -> str | None:
         if _is_executable_file(cand):
             return str(cand)
     return None
+
+
+# ── Windows shim launch normalization ────────────────────────────────
+
+
+def normalize_launch_argv(executable: str) -> list[str]:
+    """Return the argv prefix that launches ``executable`` on this host.
+
+    POSIX passes the executable through unchanged. Windows maps an
+    extensionless path to an existing ``.exe`` / ``.cmd`` / ``.bat`` /
+    ``.ps1`` sibling and wraps the interpreter-backed shims so a direct
+    ``asyncio.create_subprocess_exec`` can run them: ``.cmd`` / ``.bat``
+    through ``cmd.exe /c``, ``.ps1`` through ``powershell.exe``. Every
+    returned element is a single argv entry, so paths containing spaces
+    survive intact.
+    """
+    if sys.platform != "win32":
+        return [executable]
+    resolved = _windows_launch_path(executable)
+    lower = resolved.lower()
+    if lower.endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", resolved]
+    if lower.endswith(".ps1"):
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            resolved,
+        ]
+    return [resolved]
+
+
+def _windows_launch_path(executable: str) -> str:
+    """Prefer an existing sibling for an extensionless Windows executable.
+
+    Order: ``.exe``, ``.cmd``, ``.bat``, ``.ps1``. A path that already
+    carries an extension — or whose sibling set has no match — is used
+    as-is (the resolver-miss fallback launches the bare name directly).
+    """
+    path = Path(executable).expanduser()
+    if path.suffix:
+        return str(path)
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        candidate = path.with_suffix(suffix)
+        if candidate.is_file():
+            return str(candidate)
+    return str(path)
 
 
 # ── Real-PATH reconstruction (broader than the daemon's process PATH) ──
@@ -244,9 +380,10 @@ def _codex_bundle_paths() -> list[Path]:
 
 
 def _claude_bundle_paths() -> list[Path]:
-    # Anthropic doesn't currently ship a desktop app that bundles the
-    # ``claude`` CLI the way Codex.app does; defensive paths cover
-    # the case where they start to.
+    # The standard Windows install is the npm-global shim set under
+    # ``%APPDATA%\npm``; Anthropic doesn't currently ship a desktop app
+    # that bundles the ``claude`` CLI the way Codex.app does, so the
+    # app-root paths are defensive coverage.
     if sys.platform == "darwin":
         return _expand(
             "/Applications/Claude.app/Contents/Resources/claude",
@@ -254,6 +391,9 @@ def _claude_bundle_paths() -> list[Path]:
         )
     if sys.platform == "win32":
         return _expand(
+            r"%APPDATA%\npm\claude.exe",
+            r"%APPDATA%\npm\claude.cmd",
+            r"%APPDATA%\npm\claude.ps1",
             r"%LOCALAPPDATA%\Programs\claude\claude.exe",
             r"%LOCALAPPDATA%\Programs\Claude\claude.exe",
             r"%PROGRAMFILES%\Claude\claude.exe",
@@ -309,6 +449,12 @@ def _hermes_bundle_paths() -> list[Path]:
         "/usr/local/bin/hermes",
         "/opt/homebrew/bin/hermes",
     )
+
+
+def _opencode_bundle_paths() -> list[Path]:
+    """OpenCode's documented per-user installer location."""
+    executable = "opencode.exe" if sys.platform == "win32" else "opencode"
+    return [Path.home() / ".opencode" / "bin" / executable]
 
 
 def _expand(*paths: str) -> list[Path]:

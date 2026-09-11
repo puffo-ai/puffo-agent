@@ -92,32 +92,9 @@ def test_threshold_control_applies_to_cli_docker_claude(qapp, agent_home):
     assert view._autocompact.isEnabled()
 
 
-def test_cli_docker_codex_reports_container_as_sandbox(qapp, agent_home):
+def test_runtime_cli_reports_effective_local_codex_sandbox(agent_home, capsys):
     cfg = AgentConfig.load("threshold-ui")
-    cfg.runtime.kind = "cli-docker"
-    cfg.runtime.provider = "openai"
-    cfg.runtime.harness = "codex"
-    cfg.runtime.sandbox = "workspace-write"
-    cfg.save()
-
-    view = agent_detail.AgentDetail()
-    view.bind("threshold-ui")
-
-    assert view._access.text() == "sandbox: Docker container · approve: never"
-
-
-@pytest.mark.parametrize(
-    ("runtime_kind", "expected"),
-    [
-        ("cli-docker", "Docker container"),
-        ("cli-local", "workspace-write"),
-    ],
-)
-def test_runtime_cli_reports_effective_codex_sandbox(
-    agent_home, capsys, runtime_kind, expected,
-):
-    cfg = AgentConfig.load("threshold-ui")
-    cfg.runtime.kind = runtime_kind
+    cfg.runtime.kind = "cli-local"
     cfg.runtime.provider = "openai"
     cfg.runtime.harness = "codex"
     cfg.runtime.sandbox = "workspace-write"
@@ -125,7 +102,7 @@ def test_runtime_cli_reports_effective_codex_sandbox(
 
     assert cli.main(["agent", "runtime", "threshold-ui"]) == 0
 
-    assert f"sandbox:          {expected}" in capsys.readouterr().out
+    assert "sandbox:          workspace-write" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

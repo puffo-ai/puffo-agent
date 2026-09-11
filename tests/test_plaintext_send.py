@@ -1,5 +1,5 @@
-"""Plaintext (non-E2EE) send: producer round-trip + the daemon-level
-encryption decision + the client DM send branch."""
+"""Plaintext envelope format (inbound compatibility) + the always-E2EE
+outbound DM invariant that replaced the per-turn send-mode decision."""
 
 import logging
 import os
@@ -9,7 +9,6 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent import send_mode
 from puffo_agent.crypto.message import (
     EncryptInput,
     build_plaintext_message,
@@ -33,14 +32,7 @@ def _inp(**over):
     return EncryptInput(**base)
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    send_mode._turn_bundle_encrypted.clear()
-    yield
-    send_mode._turn_bundle_encrypted.clear()
-
-
-# ── producer ─────────────────────────────────────────────────────────
+# ── wire format (inbound plaintext envelopes are still readable) ─────
 
 
 def test_plaintext_round_trips_through_reader():
@@ -72,70 +64,15 @@ def test_wrong_key_fails_verification():
         read_plaintext_message(env, Ed25519KeyPair.generate().public_key_bytes())
 
 
-# ── decision ─────────────────────────────────────────────────────────
+# ── outbound DMs always encrypt (no turn/lifecycle input) ────────────
 
 
-class _Row:
-    def __init__(self, is_encrypted):
-        self.is_encrypted = is_encrypted
-
-
-class _Store:
-    def __init__(self, row=None, raise_=False):
-        self.row = row
-        self.raise_ = raise_
-
-    async def get_message_by_envelope(self, _eid):
-        if self.raise_:
-            raise RuntimeError("db down")
-        return self.row
-
-
-@pytest.mark.asyncio
-async def test_default_is_plaintext():
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-
-
-@pytest.mark.asyncio
-async def test_encrypted_bundle_forces_encryption():
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is True
-    # A later all-plaintext bundle releases it.
-    send_mode.note_turn_bundle(["a-1"], False)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-
-
-@pytest.mark.asyncio
-async def test_encrypted_thread_root_forces_encryption():
-    assert (
-        await send_mode.encryption_required("a-1", _Store(_Row(True)), "msg_r")
-        is True
-    )
-    assert (
-        await send_mode.encryption_required("a-1", _Store(_Row(False)), "msg_r")
-        is False
-    )
-
-
-@pytest.mark.asyncio
-async def test_unknown_root_and_store_failure_fail_safe_to_encrypted():
-    assert await send_mode.encryption_required("a-1", _Store(None), "msg_r") is True
-    assert (
-        await send_mode.encryption_required("a-1", _Store(raise_=True), "msg_r")
-        is True
-    )
-
-
-# ── client DM send branch ────────────────────────────────────────────
-
-
-def _make_client(flag: bool):
+def _make_client(device_slugs=None):
     from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "agent-1"
     client._log = logging.getLogger("plaintext-send-test")
-    client.store = _Store(row=None)
 
     kp = Ed25519KeyPair.generate()
 
@@ -165,49 +102,33 @@ def _make_client(flag: bool):
         from puffo_agent.crypto.message import RecipientDevice
         import os as _os
 
-        return [RecipientDevice(device_id="dev_1", kem_public_key=_os.urandom(32))]
+        return [
+            RecipientDevice(device_id=f"dev_{slug}", kem_public_key=_os.urandom(32))
+            for slug in slugs
+            if device_slugs is None or slug in device_slugs
+        ]
 
     client._fetch_device_keys = _fetch
-    send_mode.note_turn_bundle(["agent-1"], flag)
     return client, posts, fetched
 
 
 @pytest.mark.asyncio
-async def test_send_dm_goes_plaintext_by_default():
-    client, posts, fetched = _make_client(flag=False)
-    env = await client._send_dm("op-1", "hi", "")
-    assert env["type"] == "plaintext_message_envelope"
-    assert posts[0][0] == "/v2/messages/plaintext"
-    assert fetched == []  # no device resolution on the plaintext path
-
-
-@pytest.mark.asyncio
-async def test_send_dm_encrypts_when_turn_bundle_was_encrypted():
-    client, posts, fetched = _make_client(flag=True)
+async def test_send_dm_always_encrypts():
+    client, posts, fetched = _make_client()
     env = await client._send_dm("op-1", "hi", "")
     assert env["type"] == "message_envelope"
     assert posts[0][0] == "/messages"
-    assert fetched  # devices resolved for sealing
+    # The recipient's reachability is checked on its own devices first.
+    assert fetched[0] == ["op-1"]
 
 
 @pytest.mark.asyncio
-async def test_in_process_data_client_delegates_to_send_mode():
-    from puffo_agent.portal.ws_local.in_process_data_client import (
-        InProcessDataClient,
-    )
-
-    c = InProcessDataClient.__new__(InProcessDataClient)
-    c._store = _Store(_Row(False))
-    assert await c.get_send_encryption("a-1", "msg_r") is False
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await c.get_send_encryption("a-1", None) is True
-
-
-@pytest.mark.asyncio
-async def test_clear_turn_bundle_restores_the_plaintext_default():
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is True
-    send_mode.clear_turn_bundle(["a-1"])
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-    # Clearing an unset key is a no-op.
-    send_mode.clear_turn_bundle(["never-set"])
+async def test_send_dm_fails_when_recipient_has_no_devices():
+    # The sender's own devices must not mask an unreachable recipient:
+    # only agent-1 resolves devices here, so the send raises instead of
+    # posting an envelope sealed to the sender alone.
+    client, posts, fetched = _make_client(device_slugs={"agent-1"})
+    with pytest.raises(RuntimeError, match="op-1 has no encryption devices"):
+        await client._send_dm("op-1", "hi", "")
+    assert posts == []  # nothing left the process
+    assert fetched == [["op-1"]]  # failed before the sender fetch

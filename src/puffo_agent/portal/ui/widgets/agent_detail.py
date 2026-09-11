@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Optional
 
 import asyncio
+import shlex
 import threading
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -43,6 +43,7 @@ from ...profile_sync import (
     profile_summary,
     update_profile_summary,
     upload_avatar,
+    write_refresh_agent_flag,
 )
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
@@ -158,6 +159,7 @@ class AgentDetail(QWidget):
             (self._soul,         "textChanged"),
             (self._runtime_kind, "currentTextChanged"),
             (self._harness,      "currentTextChanged"),
+            (self._harness_command, "textChanged"),
             (self._model,        "currentTextChanged"),
             (self._effort,       "currentTextChanged"),
             (self._autocompact,  "currentTextChanged"),
@@ -215,7 +217,13 @@ class AgentDetail(QWidget):
         body = QWidget()
         layout = QFormLayout(body)
         layout.setLabelAlignment(Qt.AlignRight)
+        self._add_identity_fields(layout)
+        self._add_runtime_fields(layout)
+        self._add_info_actions(layout)
+        scroll.setWidget(body)
+        return scroll
 
+    def _add_identity_fields(self, layout: QFormLayout) -> None:
         avatar_row = QHBoxLayout()
         self._avatar_preview = QLabel()
         self._avatar_preview.setFixedSize(64, 64)
@@ -258,6 +266,7 @@ class AgentDetail(QWidget):
         self._soul.setMinimumHeight(160)
         layout.addRow("Soul", self._soul)
 
+    def _add_runtime_fields(self, layout: QFormLayout) -> None:
         # CLI runtimes + ws-local are surfaced. provider is derived from
         # harness for the CLI kinds; ws-local has no harness/model on the
         # daemon side so the dropdowns get locked in ``set_agent`` for
@@ -269,10 +278,16 @@ class AgentDetail(QWidget):
         layout.addRow("Runtime", self._runtime_kind)
 
         self._harness = QComboBox()
-        for h in ("claude-code", "codex"):
+        for h in ("claude-code", "codex", "pi", "opencode", "acp"):
             self._harness.addItem(h)
         self._harness.currentTextChanged.connect(self._on_harness_changed)
         layout.addRow("Harness", self._harness)
+
+        self._harness_command = QLineEdit()
+        self._harness_command.setPlaceholderText(
+            "Required for ACP, e.g. opencode acp"
+        )
+        layout.addRow("Harness command", self._harness_command)
 
         self._model = QComboBox()
         layout.addRow("Model", self._model)
@@ -309,6 +324,7 @@ class AgentDetail(QWidget):
             self._update_autocompact_enabled
         )
 
+    def _add_info_actions(self, layout: QFormLayout) -> None:
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -318,9 +334,6 @@ class AgentDetail(QWidget):
         actions.addWidget(self._revert_btn)
         actions.addWidget(self._save_btn)
         layout.addRow("", self._wrap(actions))
-
-        scroll.setWidget(body)
-        return scroll
 
     def _build_skills_tab(self) -> QWidget:
         wrap = QWidget()
@@ -419,6 +432,7 @@ class AgentDetail(QWidget):
         self._soul.setPlainText(profile_summary(cfg))
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
+        self._harness_command.setText(shlex.join(cfg.runtime.harness_command))
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
         self._populate_effort_combo(cfg.runtime.harness, cfg.runtime.inference_level)
         self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
@@ -467,6 +481,7 @@ class AgentDetail(QWidget):
             self._soul.toPlainText(),
             self._runtime_kind.currentText(),
             self._harness.currentText(),
+            self._harness_command.text(),
             self._model.currentData() or "",
             self._effort.currentData() or "",
             self._autocompact.currentData() or "",
@@ -883,6 +898,18 @@ class AgentDetail(QWidget):
         harness = self._harness.currentText() if harness_applies(runtime_kind) else cfg.runtime.harness
         provider = _provider_for_harness(harness) or cfg.runtime.provider
         model = (self._model.currentData() or "").strip()
+        try:
+            harness_command = shlex.split(self._harness_command.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Save", f"invalid harness command: {exc}")
+            return
+        if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
+            QMessageBox.warning(
+                self,
+                "Save",
+                "ACP requires a harness command, for example: opencode acp",
+            )
+            return
 
         result = validate_triple(runtime_kind, provider, harness)
         if not result.ok:
@@ -912,6 +939,7 @@ class AgentDetail(QWidget):
         cfg.runtime.kind = runtime_kind
         cfg.runtime.provider = provider
         cfg.runtime.harness = harness
+        cfg.runtime.harness_command = harness_command
         cfg.runtime.model = model
         cfg.runtime.inference_level = self._effort.currentData() or ""
         pct = self._autocompact.currentData() or ""
@@ -928,6 +956,7 @@ class AgentDetail(QWidget):
         try:
             cfg.save()
             update_profile_summary(cfg, soul)
+            write_refresh_agent_flag(cfg, reason="desktop agent profile")
         except Exception as exc:
             QMessageBox.warning(self, "Save", f"failed to persist: {exc}")
             return

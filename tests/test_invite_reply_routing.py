@@ -80,7 +80,7 @@ def test_threaded_match_wins_and_is_not_direct():
 def test_direct_y_single_pending_targets_it():
     client = _make_client()
     _seed_pending(client, "env_invite_solo")
-    roots, is_direct = client._resolve_invite_targets("env_top_level_msg", "y")
+    roots, is_direct = client._resolve_invite_targets(None, "y")
     assert roots == ["env_invite_solo"]
     assert is_direct is True
 
@@ -89,14 +89,14 @@ def test_direct_y_multi_pending_targets_all():
     client = _make_client()
     _seed_pending(client, "env_invite_a")
     _seed_pending(client, "env_invite_b")
-    roots, is_direct = client._resolve_invite_targets("env_top_level_msg", "y")
+    roots, is_direct = client._resolve_invite_targets(None, "y")
     assert set(roots) == {"env_invite_a", "env_invite_b"}
     assert is_direct is True
 
 
 def test_direct_y_zero_pending_is_empty():
     client = _make_client()
-    roots, is_direct = client._resolve_invite_targets("env_top_level_msg", "y")
+    roots, is_direct = client._resolve_invite_targets(None, "y")
     assert roots == []
     assert is_direct is True
 
@@ -116,7 +116,7 @@ def test_conversational_yes_does_not_route():
     a pending invite."""
     client = _make_client()
     _seed_pending(client, "env_invite_solo")
-    roots, is_direct = client._resolve_invite_targets("env_top_msg", "Yes, sure")
+    roots, is_direct = client._resolve_invite_targets(None, "Yes, sure")
     assert roots == []
     assert is_direct is False
 
@@ -125,7 +125,7 @@ def test_conversational_yes_does_not_route():
 def test_strict_yn_variants_route(text):
     client = _make_client()
     _seed_pending(client, "env_invite_solo")
-    roots, is_direct = client._resolve_invite_targets("env_top_msg", text)
+    roots, is_direct = client._resolve_invite_targets(None, text)
     assert roots == ["env_invite_solo"]
     assert is_direct is True
 
@@ -137,7 +137,7 @@ def test_strict_yn_variants_route(text):
 async def test_direct_y_single_accepts_and_clears():
     client = _make_client()
     _seed_pending(client, "env_invite_solo", invitation_event_id="ev_xyz")
-    roots, _ = client._resolve_invite_targets("env_top_msg", "y")
+    roots, _ = client._resolve_invite_targets(None, "y")
     labels = await client._apply_invite_replies(roots, "y")
     assert labels == ["space **Team**"]
     assert client._accept_calls == [("invite_to_space", "ev_xyz", "sp_1", "")]
@@ -163,7 +163,7 @@ async def test_direct_y_multi_accepts_all():
     client = _make_client()
     _seed_pending(client, "env_a", invitation_event_id="ev_a", space_name="Alpha")
     _seed_pending(client, "env_b", invitation_event_id="ev_b", space_name="Beta")
-    roots, _ = client._resolve_invite_targets("env_top_msg", "y")
+    roots, _ = client._resolve_invite_targets(None, "y")
     labels = await client._apply_invite_replies(roots, "y")
     assert {c[1] for c in client._accept_calls} == {"ev_a", "ev_b"}
     assert set(labels) == {"space **Alpha**", "space **Beta**"}
@@ -175,7 +175,7 @@ async def test_direct_n_multi_rejects_all():
     client = _make_client()
     _seed_pending(client, "env_a", invitation_event_id="ev_a")
     _seed_pending(client, "env_b", invitation_event_id="ev_b")
-    roots, _ = client._resolve_invite_targets("env_top_msg", "n")
+    roots, _ = client._resolve_invite_targets(None, "n")
     await client._apply_invite_replies(roots, "n")
     assert {c[1] for c in client._reject_calls} == {"ev_a", "ev_b"}
     assert client._accept_calls == []
@@ -184,7 +184,7 @@ async def test_direct_n_multi_rejects_all():
 @pytest.mark.asyncio
 async def test_direct_y_zero_pending_no_op():
     client = _make_client()
-    roots, _ = client._resolve_invite_targets("env_top_msg", "y")
+    roots, _ = client._resolve_invite_targets(None, "y")
     labels = await client._apply_invite_replies(roots, "y")
     assert roots == [] and labels == []
     assert client._accept_calls == []
@@ -202,7 +202,7 @@ async def test_targets_snapshot_excludes_mid_accept_seed():
         client._accept_calls.append((kind, eid, space_id, channel_id))
 
     client._accept_invite = _accept_late_seed  # type: ignore[assignment]
-    roots, _ = client._resolve_invite_targets("env_top_msg", "y")
+    roots, _ = client._resolve_invite_targets(None, "y")
     await client._apply_invite_replies(roots, "y")
     assert client._accept_calls == [("invite_to_space", "ev_first", "sp_1", "")]
     assert "env_late" in client._pending_invite_dms
@@ -250,7 +250,7 @@ async def test_gate_flow_direct_multi_accepts_all_then_summarizes():
     client = _make_client()
     _seed_pending(client, "env_a", invitation_event_id="ev_a", space_name="Alpha")
     _seed_pending(client, "env_b", invitation_event_id="ev_b", space_name="Beta")
-    roots, is_direct = client._resolve_invite_targets("env_y_msg", "y")
+    roots, is_direct = client._resolve_invite_targets(None, "y")
     labels = await client._apply_invite_replies(roots, "y")
     if is_direct:
         await client._send_invite_bulk_summary(labels, "y", "env_y_msg")
@@ -258,6 +258,16 @@ async def test_gate_flow_direct_multi_accepts_all_then_summarizes():
     summaries = [d for d in client._sent_dms if d["root_id"] == "env_y_msg"]
     assert len(summaries) == 1
     assert "2 invites" in summaries[0]["text"]
+
+
+def test_unrelated_threaded_y_does_not_bulk_accept_pending_invites():
+    """A Y/N under another control thread cannot sweep invite state."""
+    client = _make_client()
+    _seed_pending(client, "env_invite_a")
+    _seed_pending(client, "env_invite_b")
+    roots, is_direct = client._resolve_invite_targets("permission_thread", "y")
+    assert roots == []
+    assert is_direct is False
 
 
 # ─── (β) UX copy ───────────────────────────────────────────────────
@@ -272,6 +282,5 @@ def test_invite_prompt_copy_mentions_direct_all_pending():
     )
     with open(src_path, "r", encoding="utf-8") as fh:
         body = fh.read()
-    # Space + channel branches share one format_permission_prompt call,
-    # so the bulk-reply note appears once and covers both.
-    assert "pending invites at once" in body
+    # The shared space/channel prompt carries the direct-reply guidance.
+    assert "for all your pending invites" in body

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Puffo Python Tests"
+  short_description: "Write focused Puffo tests with real regression value"
+  default_prompt: "Use $write-puffo-python-tests to add the smallest valuable tests for this Puffo change."

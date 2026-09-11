@@ -15,7 +15,7 @@
 #
 # Verify after a run with:
 #   pip install -i https://test.pypi.org/simple/ \
-#     --extra-index-url https://pypi.org/simple/ puffo-agent
+#     --extra-index-url https://pypi.org/simple/ puffo-agent==2.0.4a1
 # (the extra index lets test-pypi resolve real deps from real PyPI).
 
 name: Publish to TestPyPI

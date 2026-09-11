@@ -61,7 +61,7 @@ def _is_mcp_node(name: str, cmdline_lc: str) -> bool:
 
 class McpProbe:
     def __init__(self) -> None:
-        self._cache: dict[int, "psutil.Process"] = {}
+        self._cache: dict[int, psutil.Process] = {}
         self._name_cache: dict[str, str] = {}
 
     def _display_name(self, agent_id: str) -> str:
@@ -132,7 +132,7 @@ class McpProbe:
         return rows
 
     @staticmethod
-    def _owner(proc: "psutil.Process", sessions: dict[int, str]) -> str:
+    def _owner(proc: psutil.Process, sessions: dict[int, str]) -> str:
         cur = proc
         for _ in range(12):
             try:

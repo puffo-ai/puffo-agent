@@ -42,11 +42,15 @@ def test_message_from_own_operator_is_flagged():
     assert "- sender_type: human" in block
 
 
-def test_human_non_operator_gets_neither_field():
+def test_unclassified_non_operator_stays_unknown():
     block = _block(sender="random-human-0001")
     assert "- sender_owner_slug:" not in block
     assert "- is_from_operator:" not in block
-    assert "- sender_type: human" in block
+    assert "- sender_type: unknown" in block
+
+
+def test_system_sender_stays_system():
+    assert "- sender_type: system" in _block(sender="system")
 
 
 def test_agent_owned_by_current_operator_gets_both():
@@ -110,6 +114,6 @@ def test_metadata_block_field_order():
         return next(i for i, ln in enumerate(lines) if ln.startswith(prefix))
 
     assert (
-        idx("- post_id:") < idx("- space_id:") < idx("- channel_id:")
+        idx("- message_id:") < idx("- space_id:") < idx("- channel_id:")
         < idx("- thread_root_id:") < idx("- is_encrypted:") < idx("- sender:")
     )

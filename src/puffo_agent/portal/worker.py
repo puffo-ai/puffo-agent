@@ -10,49 +10,52 @@ import asyncio
 import json
 import logging
 import os
-import random
-import re
 import shutil
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
-from ..agent.core import AgentAPIError, PuffoAgent
+from ..agent.core import AgentAPIError as AgentAPIError
+from ..agent.core import PuffoAgent as PuffoAgent
+from ..agent.provider_failures import provider_failure_message
 from ..limits import (
     DEFAULT_CATCHUP_STALE_HOURS,
     MAX_INLINE_MESSAGE_CHARS,
     MESSAGE_SEGMENT_CHARS,
 )
 from ..agent.status_reporter import StatusReporter
+from ..crypto.keystore import decode_secret
+from ..crypto.primitives import Ed25519KeyPair
 from .runtime_matrix import (
+    HARNESS_PROVIDERS,
     RUNTIME_CLI_DOCKER,
     RUNTIME_CLI_LOCAL,
     RUNTIME_WS_LOCAL,
+    resolve_effective_harness,
+    resolve_effective_provider,
 )
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
-    looks_like_managed_claude_md,
-    rebuild_agent_claude_md,
-    rebuild_agent_codex_md,
+    looks_like_managed_claude_md as looks_like_managed_claude_md,
 )
+from ..agent.shared_content import rebuild_agent_claude_md, rebuild_agent_codex_md
 from .state import (
     AgentConfig,
     DaemonConfig,
-    PuffoCoreConfig,
-    RuntimeConfig,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     RuntimeState,
     agent_claude_user_dir,
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
     claude_cli_api_key,
-    cli_session_json_path,
-    docker_shared_dir,
-    shared_fs_dir,
+    docker_shared_dir as docker_shared_dir,
+    clear_runtime_health_listener,
+    set_runtime_health_listener,
 )
+from ..tasks import spawn
 
 
 def _rebuild_managed_system_prompt(
@@ -63,12 +66,20 @@ def _rebuild_managed_system_prompt(
     profile_path: str,
     memory_path: str,
     workspace_path: str,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
+    puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
-    agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; every
-    other harness goes through the legacy claude-code path (which also
-    writes GEMINI.md for the gemini-cli harness sharing the same body).
-    Returns the assembled prompt body either way.
+    agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; other
+    harnesses use the shared Claude/Gemini prompt-file builder.
+    Returns the assembled prompt body either way. The identity fields form
+    immutable addressing context next to the editable root ``profile.md``;
+    prompt rebuilds never rewrite memory. ``puffo_handle`` is the authenticated
+    ``puffo_core.slug`` the model should call itself on the network;
+    ``agent_id`` continues to name local storage and RPC namespaces.
     """
     if harness_name == "codex":
         return rebuild_agent_codex_md(
@@ -77,6 +88,12 @@ def _rebuild_managed_system_prompt(
             memory_dir=Path(memory_path),
             workspace_dir=Path(workspace_path),
             codex_user_dir=agent_codex_user_dir(agent_id),
+            agent_id=agent_id,
+            display_name=display_name,
+            role=role,
+            role_short=role_short,
+            puffo_handle=puffo_handle,
+            workspace_shared_status=workspace_shared_status,
         )
     return rebuild_agent_claude_md(
         shared_dir=shared_path,
@@ -85,11 +102,91 @@ def _rebuild_managed_system_prompt(
         workspace_dir=Path(workspace_path),
         claude_user_dir=agent_claude_user_dir(agent_id),
         gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+        agent_id=agent_id,
+        display_name=display_name,
+        role=role,
+        role_short=role_short,
+        puffo_handle=puffo_handle,
+        workspace_shared_status=workspace_shared_status,
     )
+
 
 logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
+
+# Consecutive WS reconnect failures before runtime.json health flips to
+# "server_unreachable". With the WS client's 1s→30s doubling backoff the
+# fifth failure lands ~15s into an outage (~40s when each attempt burns a
+# connect timeout): a blip surviving one or two reconnects never flips,
+# while an operator checking `agent list` sees the truth within the
+# minute instead of "ok" for hours. One successful reconnect clears it.
+_WS_DEGRADE_THRESHOLD = 5
+
+# How long after a runtime open the MCP subprocess gets to say hello
+# before the probe treats the transport as wedged. Covers a slow spawn
+# plus the subprocess's own 3×2s hello retry budget.
+_MCP_PROBE_GRACE_SECONDS = 30.0
+
+# A beacon-capable subprocess may miss this many of its own declared
+# re-hello intervals before its last hello stops counting as evidence
+# of a live transport.
+_MCP_BEACON_STALE_FACTOR = 3.0
+
+# Consecutive failed adapter reloads tolerated before the pending
+# refresh flags are abandoned and the failure becomes a health state.
+_REFRESH_RELOAD_FAILURE_CAP = 3
+
+
+def _refresh_flag_delay_seconds(flag: Path) -> float:
+    """Return a bounded remaining delay encoded in a refresh flag."""
+    try:
+        request = json.loads(flag.read_text(encoding="utf-8"))
+        if not isinstance(request, dict):
+            return 0.0
+        not_before_ms = request.get("not_before_unix_ms")
+        if not isinstance(not_before_ms, (int, float)):
+            return 0.0
+        remaining = (float(not_before_ms) / 1000.0) - time.time()
+        return min(max(remaining, 0.0), PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _refresh_flag_is_pending(flag: Path) -> bool:
+    """A future-dated durable request exists but is not pending yet."""
+    return flag.exists() and _refresh_flag_delay_seconds(flag) <= 0.0
+
+# Consecutive turns that woke on an announced batch and consumed none of it
+# before the agent stops being reported healthy. One such turn is a normal
+# deferral; a run of them means the provider is not reaching the Inbox at all.
+_NO_PROGRESS_TURN_THRESHOLD = 3
+
+# Health values the MCP transport probe may replace with ``mcp_unreachable``.
+# "ok"/"unknown" mean nothing is known to be wrong. The other two are the
+# states a wedged transport actually produces, and both are *symptoms* this
+# probe can name the cause of:
+#   in_progress  — a turn was admitted and never settled;
+#   no_progress  — turns keep waking and consuming none of their batch,
+#                  whose remediation text points at provider credentials.
+# Excluding them meant the diagnosis was skipped in exactly the states a real
+# MCP failure leaves behind. Every more specific red (auth_failed,
+# provider_error, refresh_broken, drained, ...) stays authoritative: the probe
+# knows the transport is down, not that it is the only thing wrong.
+# Returned by ``_mcp_probe_subject`` when the probe covers this harness but
+# there is no open runtime at this instant. Distinct from ``None`` (not
+# covered at all): coverage is a standing property and retracts a stale red,
+# readiness is momentary and must not reset the strike count — a probe that
+# lands mid-reload would otherwise zero the strikes on every recycle and the
+# escalation to ``mcp_unreachable`` could never be reached.
+_MCP_PROBE_NOT_READY = object()
+
+_MCP_PROBE_OVERWRITABLE_HEALTH = (
+    "ok",
+    "unknown",
+    "in_progress",
+    "no_progress",
+)
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -98,205 +195,17 @@ def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     return claude_cli_api_key(daemon_cfg)
 
 
-def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
-    """Construct the adapter for ``runtime.kind``. Raises on unknown
-    or misconfigured kinds."""
-    kind = agent_cfg.runtime.kind or "chat-local"
+def build_docker_runtime(
+    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig,
+):
+    """Construct the Docker runtime owner for a ratified Driver.
 
-    if kind == "chat-local":
-        from ..agent.adapters.chat_only import ChatOnlyAdapter
-        provider = _build_legacy_provider(daemon_cfg, agent_cfg.runtime)
-        return ChatOnlyAdapter(provider)
+    The returned preparer owns only container placement and host assets;
+    Claude Code and Codex protocol behavior stays in the normal Drivers.
+    """
+    from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
-    if kind == "sdk-local":
-        from ..agent.adapters.sdk import SDKAdapter
-        api_key = agent_cfg.runtime.api_key or daemon_cfg.anthropic.api_key
-        model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or "claude-sonnet-4-6"
-        if not api_key:
-            raise RuntimeError(
-                f"agent {agent_cfg.id!r}: runtime kind 'sdk-local' requires an anthropic "
-                "api_key in daemon.yml or agent.yml"
-            )
-        adapter = SDKAdapter(
-            api_key=api_key,
-            model=model,
-            allowed_tools=agent_cfg.runtime.allowed_tools,
-            agent_id=agent_cfg.id,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            max_turns=agent_cfg.runtime.max_turns,
-        )
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
-            pc = agent_cfg.puffo_core
-            adapter.mcp_servers_override = puffo_core_stdio_sdk_config(
-                python=default_python_executable(),
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-            )
-        return adapter
-
-    if kind == "cli-docker":
-        from ..agent.adapters.docker_cli import DockerCLIAdapter
-        from ..agent.harness import build_harness
-        from .control.context_telemetry import configured_compact_pct
-        harness = build_harness(agent_cfg.runtime.harness)
-        if harness.name() == "codex":
-            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
-        else:
-            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
-        # Per-agent overrides win; empty falls through to daemon
-        # defaults, then to "no cap".
-        memory_limit = (
-            agent_cfg.runtime.docker_memory_limit
-            or daemon_cfg.docker_memory_limit
-        )
-        memory_reservation = (
-            agent_cfg.runtime.docker_memory_reservation
-            or daemon_cfg.docker_memory_reservation
-        )
-        adapter = DockerCLIAdapter(
-            agent_id=agent_cfg.id,
-            model=model,
-            image=agent_cfg.runtime.docker_image,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            claude_dir=str(agent_cfg.resolve_claude_dir()),
-            session_file=str(cli_session_json_path(agent_cfg.id)),
-            agent_home_dir=str(agent_home_dir(agent_cfg.id)),
-            shared_fs_dir=str(shared_fs_dir()),
-            permission_mode=agent_cfg.runtime.permission_mode,
-            inference_level=agent_cfg.runtime.inference_level,
-            auto_compact_threshold_pct=configured_compact_pct(
-                harness.name(), agent_cfg.env_overrides,
-            ),
-            task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
-            harness=harness,
-            memory_limit=memory_limit,
-            memory_reservation=memory_reservation,
-            desired_skills=agent_cfg.desired_skills,
-            env_overrides=agent_cfg.env_overrides,
-            desired_mcps=agent_cfg.desired_mcps,
-            puffo_core_server_url=agent_cfg.puffo_core.server_url,
-            puffo_core_slug=agent_cfg.puffo_core.slug,
-            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
-            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
-        )
-        # Env for spawning the puffo_core MCP server; path-typed values are
-        # rewritten to container bind-mount paths at config-write time.
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_mcp_env
-            pc = agent_cfg.puffo_core
-            adapter.puffo_core_mcp_env = puffo_core_mcp_env(
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                # Host paths; rewritten to container paths by
-                # docker_cli's _write_cli_mcp_config.
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-                # MCP runs inside the container; reach the host's
-                # 127.0.0.1 data + rpc services via Docker's host alias.
-                data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
-                rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
-                runtime_kind="cli-docker",
-                harness=agent_cfg.runtime.harness,
-            )
-        return adapter
-
-    if kind == "cli-local":
-        from ..agent.adapters.local_cli import LocalCLIAdapter
-        from .control.context_telemetry import configured_compact_pct
-        # The legacy permission-proxy DM flow has not been ported to
-        # puffo-core; the hook fail-opens when PUFFO_OPERATOR_USERNAME
-        # is unset, so cli-local works without supervised approvals.
-        operator = ""
-        from ..agent.harness import build_harness
-        harness = build_harness(agent_cfg.runtime.harness)
-        if harness.name() == "codex":
-            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
-        else:
-            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
-        adapter = LocalCLIAdapter(
-            agent_id=agent_cfg.id,
-            model=model,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            claude_dir=str(agent_cfg.resolve_claude_dir()),
-            session_file=str(cli_session_json_path(agent_cfg.id)),
-            mcp_config_file=str(agent_dir(agent_cfg.id) / "mcp-config.json"),
-            agent_home_dir=str(agent_home_dir(agent_cfg.id)),
-            owner_username=operator,
-            permission_mode=agent_cfg.runtime.permission_mode,
-            sandbox=agent_cfg.runtime.sandbox,
-            inference_level=agent_cfg.runtime.inference_level,
-            auto_compact_threshold_pct=configured_compact_pct(
-                harness.name(), agent_cfg.env_overrides,
-            ),
-            task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
-            harness=harness,
-            desired_skills=agent_cfg.desired_skills,
-            env_overrides=agent_cfg.env_overrides,
-            desired_mcps=agent_cfg.desired_mcps,
-            puffo_core_server_url=agent_cfg.puffo_core.server_url,
-            puffo_core_slug=agent_cfg.puffo_core.slug,
-            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
-            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
-        )
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_mcp_env
-            pc = agent_cfg.puffo_core
-            adapter.puffo_core_mcp_env = puffo_core_mcp_env(
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-                data_service_url=f"http://127.0.0.1:{daemon_cfg.data_service.port}",
-                rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
-                runtime_kind="cli-local",
-                harness=agent_cfg.runtime.harness,
-            )
-        return adapter
-
-    raise RuntimeError(
-        f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
-        "(valid: chat-local, sdk-local, cli-docker, cli-local)"
-    )
-
-
-def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
-    """Anthropic/OpenAI message-completion provider for the
-    chat-local adapter. Per-agent fields override daemon defaults."""
-    provider_name = runtime.provider or daemon_cfg.default_provider
-
-    if provider_name == "anthropic":
-        from ..agent.providers.anthropic_provider import AnthropicProvider
-        api_key = runtime.api_key or daemon_cfg.anthropic.api_key
-        model = runtime.model or daemon_cfg.anthropic.model or "claude-sonnet-4-6"
-        if not api_key:
-            raise RuntimeError(
-                "anthropic api_key is not set in daemon.yml or agent.yml"
-            )
-        return AnthropicProvider(api_key=api_key, model=model)
-
-    if provider_name == "openai":
-        from ..agent.providers.openai_provider import OpenAIProvider
-        api_key = runtime.api_key or daemon_cfg.openai.api_key
-        model = runtime.model or daemon_cfg.openai.model or "gpt-4o"
-        if not api_key:
-            raise RuntimeError(
-                "openai api_key is not set in daemon.yml or agent.yml"
-            )
-        return OpenAIProvider(api_key=api_key, model=model)
-
-    raise RuntimeError(f"unknown provider {provider_name!r}")
+    return DockerRuntimePreparer(daemon_cfg, agent_cfg)
 
 
 def _puffo_cli_keystore_dir() -> Path:
@@ -312,11 +221,22 @@ def _puffo_cli_keystore_dir() -> Path:
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "puffo" / "puffo-cli" / "data" / "keys"
-        return Path.home() / "AppData" / "Roaming" / "puffo" / "puffo-cli" / "data" / "keys"
+        return (
+            Path.home()
+            / "AppData"
+            / "Roaming"
+            / "puffo"
+            / "puffo-cli"
+            / "data"
+            / "keys"
+        )
     if sys.platform == "darwin":
         return (
-            Path.home() / "Library" / "Application Support"
-            / "ai.puffo.puffo-cli" / "keys"
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "ai.puffo.puffo-cli"
+            / "keys"
         )
     xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(xdg) / "puffo" / "puffo-cli" / "keys"
@@ -340,19 +260,23 @@ def _ensure_agent_identity_imported(agent_id: str, slug: str) -> None:
         shutil.copy2(src, dest)
         logger.info(
             "agent %s: imported identity from puffo-cli keystore (%s → %s)",
-            agent_id, src, dest,
+            agent_id,
+            src,
+            dest,
         )
     except OSError as exc:
         logger.warning(
             "agent %s: failed to import identity from %s: %s",
-            agent_id, src, exc,
+            agent_id,
+            src,
+            exc,
         )
 
 
 def _build_puffo_core_client(
     agent_cfg: AgentConfig,
     agent_id: str,
-    daemon_cfg: "DaemonConfig | None" = None,
+    daemon_cfg: DaemonConfig | None = None,
 ):
     """Construct a PuffoCoreMessageClient from the agent's config.
     ``daemon_cfg`` carries the host-wide tunables (currently the
@@ -361,23 +285,40 @@ def _build_puffo_core_client(
     the dataclass defaults.
     """
     from ..agent.message_store import MessageStore
-    from ..agent.puffo_core_client import (
-        DEFAULT_MAX_INPUT_BYTES,
-        PuffoCoreMessageClient,
-        max_image_edge_px,
-    )
+    from ..agent.puffo_core_client import PuffoCoreMessageClient, max_image_edge_px
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
     pc = agent_cfg.puffo_core
-    _ensure_agent_identity_imported(agent_id, pc.slug)
+    bridge = None
+    if pc.transport == "bridge":
+        # T23 keyless transport: no identity file exists to import;
+        # the bridge authenticates with the sandbox token instead.
+        # Keystore/http below are still constructed (both lazy — they
+        # never touch disk/network in __init__); phase 2 replaces
+        # their call sites.
+        from ..agent.bridge_client import CloudBridgeClient
+
+        bridge = CloudBridgeClient(pc.server_url, pc.sandbox_token, pc.slug)
+    else:
+        _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
     ks = KeyStore(ks_dir)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
+    # Bridge agents dispatch outbound tool work keyless over the unsigned
+    # ``/v2/cloud-agents/*`` routes; ``route.py`` reuses ``client.http``, so
+    # the in-process ws-local cfg's ``keyless`` accessor reads True here.
+    http = PuffoCoreHttpClient(
+        pc.server_url,
+        ks,
+        pc.slug,
+        keyless=(pc.transport == "bridge"),
+    )
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
-        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else MAX_INLINE_MESSAGE_CHARS
+        daemon_cfg.max_inline_message_chars
+        if daemon_cfg is not None
+        else MAX_INLINE_MESSAGE_CHARS
     )
     segment_chars = (
         daemon_cfg.segment_chars if daemon_cfg is not None else MESSAGE_SEGMENT_CHARS
@@ -390,14 +331,22 @@ def _build_puffo_core_client(
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
-    is_codex = (agent_cfg.runtime.harness or "claude-code") == "codex"
+    runtime_kind = agent_cfg.runtime.kind or "cli-local"
+    effective_provider = resolve_effective_provider(
+        runtime_kind, agent_cfg.runtime.provider
+    )
+    effective_harness = resolve_effective_harness(
+        runtime_kind, effective_provider, agent_cfg.runtime.harness
+    )
+    is_codex = effective_harness == "codex"
     if is_codex:
-        model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
+        model = agent_cfg.runtime.model or (
+            daemon_cfg.openai.model if daemon_cfg else ""
+        )
     else:
-        model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
-
-    # Codex has no adapter input cap; its ceiling is a runaway safety net.
-    max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
+        model = agent_cfg.runtime.model or (
+            daemon_cfg.anthropic.model if daemon_cfg else ""
+        )
 
     return PuffoCoreMessageClient(
         slug=pc.slug,
@@ -405,7 +354,7 @@ def _build_puffo_core_client(
         space_id=pc.space_id,
         operator_slug=pc.operator_slug,
         auto_accept_space_invitations=pc.auto_accept_space_invitations,
-        auto_accept_dm=pc.auto_accept_dm,
+        auto_accept_dm=getattr(pc, "auto_accept_dm", False),
         keystore=ks,
         http_client=http,
         message_store=ms,
@@ -414,215 +363,23 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
-        max_input_bytes=max_input_bytes,
         catchup_stale_hours=catchup_stale_hours,
+        agent_id=agent_id,
+        bridge_client=bridge,
     )
-
-
-# Auth-class patterns: definitive OAuth/API-key failure only. Shared by
-# the leak filter and the auth_failed health flip. High-FP markers
-# (401, unauthorized, api_error) stay out; they collide with agent prose.
-_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*Not logged in[\s\S]*Please run /login", re.IGNORECASE),
-    re.compile(r"^\s*OAuth token (?:revoked|has expired)\b", re.IGNORECASE),
-    re.compile(r"^\s*Invalid API key\b", re.IGNORECASE),
-    re.compile(r"\bThis organization has been disabled\b", re.IGNORECASE),
-    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
-)
-
-# Worker-layer leak patterns NOT in the auth-class set. Sources:
-# Claude Code error reference (CLI message-to-recovery table) +
-# Claude API platform docs (canonical <type>_error identifiers).
-_NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Internal kick message echoed back as a reply.
-    re.compile(
-        r"^\s*\[puffo-agent system message\]\s+session errored on rate",
-        re.IGNORECASE,
-    ),
-    # Subscription-plan quotas (the prod miss the reviewer surfaced).
-    re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
-    # Model-usage-cap fallback ("reached your <Model> limit …"); model-agnostic + apostrophe-robust (`.?`).
-    re.compile(r"^\s*You.?ve reached your\b.*?\blimit\b", re.IGNORECASE),
-    re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
-    # CLI-emitted server 429 / 5xx.
-    re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
-    re.compile(r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE),
-    re.compile(r"\bAPI Error: Repeated 529 Overloaded errors\b", re.IGNORECASE),
-    re.compile(r"\bAPI Error: 500\b[\s\S]*Internal server error\b", re.IGNORECASE),
-    # API-canonical <type>_error identifiers, minus high-FP entries
-    # (invalid_request_error / not_found_error / api_error) per audit.
-    re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
-    re.compile(r"\boverloaded_error\b", re.IGNORECASE),
-    re.compile(r"\bbilling_error\b", re.IGNORECASE),
-    re.compile(r"\bpermission_error\b", re.IGNORECASE),
-    re.compile(r"\btimeout_error\b", re.IGNORECASE),
-)
-
-_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    *_AUTH_ERROR_PATTERNS,
-    *_NON_AUTH_LEAK_PATTERNS,
-)
-
-# Post-leak backoff: random 15-60s samples sustained limits instead of
-# hammering; single-batch leaks self-clear during the sleep.
-_SUPPRESSION_BACKOFF_MIN_SECONDS = 15.0
-_SUPPRESSION_BACKOFF_MAX_SECONDS = 60.0
-
-
-def _looks_like_auth_error(reply: str) -> bool:
-    """True iff ``reply`` is one of the definitive auth-class
-    failure strings (Claude CLI re-login prompt, OAuth-token
-    revoked/expired, invalid API key, disabled org, or the
-    ``authentication_error`` API identifier). Drives the
-    ``runtime.health=auth_failed`` flip alongside PUF-207's
-    startup-paused signal."""
-    if not reply:
-        return False
-    for pattern in _AUTH_ERROR_PATTERNS:
-        if pattern.search(reply):
-            return True
-    return False
-
-
-def _suppress_worker_error_leak(reply: str) -> str | None:
-    """Return ``None`` when ``reply`` matches a worker-error
-    pattern, signalling the caller to suppress the channel post and
-    surface to the operator instead. Returns the reply unchanged
-    otherwise. Mirrors ``_coerce_root_visibility``'s shape."""
-    if not reply:
-        return reply
-    for pattern in _WORKER_ERROR_LEAK_PATTERNS:
-        if pattern.search(reply):
-            return None
-    return reply
-
-
-def _handle_suppressed_reply(
-    reply: str,
-    runtime: "RuntimeState",
-    agent_id: str,
-    *,
-    scope: str,
-    on_auth_failure: Optional[Callable[[], None]] = None,
-    on_auth_failed_enter: Optional[Callable[[], None]] = None,
-    auth_error_message: str | None = None,
-) -> tuple[bool, float]:
-    """Shared landing for a suppressed worker-error leak. Returns
-    ``(suppressed, backoff_seconds)``:
-
-    - Clean prose: ``(False, 0.0)``; caller proceeds normally.
-    - Leak detected: ``(True, uniform(15, 60))``; caller skips
-      ``send_fallback_message`` and ``asyncio.sleep(backoff)`` so
-      the next batch doesn't immediately re-leak in tight loops.
-
-    On suppression: log the truncated payload, populate
-    ``runtime.error`` with a scope-tagged + leak-class-tagged
-    message, and (if auth-class) flip ``runtime.health="auth_failed"``
-    — that signal is definitive regardless of which scope surfaced
-    it. ``on_auth_failure`` fires on the auth-class branch only;
-    PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
-    here so a 401-leak short-circuits the 2-min poll instead of
-    waiting for the next tick. ``on_auth_failed_enter`` fires ONLY on
-    the was-ok→auth_failed transition (not re-entries), giving the
-    per-session DM dedup a natural firing edge."""
-    safe_reply = _suppress_worker_error_leak(reply)
-    if safe_reply is not None:
-        return False, 0.0
-    is_auth = _looks_like_auth_error(reply)
-    backoff = random.uniform(
-        _SUPPRESSION_BACKOFF_MIN_SECONDS,
-        _SUPPRESSION_BACKOFF_MAX_SECONDS,
-    )
-    logger.warning(
-        "agent %s: suppressed worker-error leak in %s reply (backoff %.1fs): %s",
-        agent_id, scope, backoff, reply[:200],
-    )
-    if is_auth:
-        was_ok = runtime.health != "auth_failed"
-        runtime.health = "auth_failed"
-        if on_auth_failure is not None:
-            try:
-                on_auth_failure()
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: on_auth_failure callback raised: %s",
-                    agent_id, exc,
-                )
-        if was_ok and on_auth_failed_enter is not None:
-            try:
-                on_auth_failed_enter()
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: on_auth_failed_enter callback raised: %s",
-                    agent_id, exc,
-                )
-    if is_auth and auth_error_message:
-        runtime.error = auth_error_message
-    elif scope == "api-error-retry":
-        if is_auth:
-            runtime.error = (
-                "Claude Code sign-in expired. On the computer running "
-                "puffo-agent, open a terminal and run `claude auth "
-                "login`, then send this agent a message."
-            )
-        else:
-            runtime.error = (
-                "Rate-limit / quota / server error — usually self-"
-                "recovers. Check the puffo-agent daemon log if it "
-                "persists."
-            )
-    else:
-        runtime.error = (
-            "Worker emitted an auth / rate-limit / quota error string "
-            "instead of a real reply. Check the puffo-agent daemon log."
-        )
-    runtime.save(agent_id)
-    return True, backoff
-
 
 
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
     @staticmethod
-    def _clear_api_error_abandoned_if_recoverable(
-        runtime: "RuntimeState",
-        agent_id: str,
-        root_id: str,
-        log: logging.Logger,
-    ) -> None:
-        """Clear ``runtime.health = "api_error_abandoned"`` back to
-        ``"ok"`` on the next successful turn. ``auth_failed`` is
-        deliberately left alone — PUF-221's CredentialRefresher
-        owns that lifecycle and a single lucky turn shouldn't
-        substitute for the refresh-success-ping.
-
-        Known granularity mismatch (PUF-253 design input):
-        ``api_error_abandoned`` is a thread-level event but
-        ``runtime.health`` is an agent-global flag, so a success
-        on thread B clears it even if thread A is still stuck.
-        Last-write-wins until ``runtime.error`` becomes a list.
-        """
-        if runtime.health != "api_error_abandoned":
-            return
-        runtime.health = "ok"
-        runtime.error = ""
-        runtime.save(agent_id)
-        log.info(
-            "agent %s: api-error-recovery on thread %s; "
-            "runtime.health cleared back to ok",
-            agent_id, root_id,
-        )
-
-    @staticmethod
     def _clear_auth_failed_if_recoverable(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        # Symmetric to _clear_api_error_abandoned_if_recoverable but
-        # fired on refresh-success (not turn-success). Optimistic: if
-        # the next request still 401s, _handle_suppressed_reply re-sets.
+        # Fired on refresh-success, before the next provider turn. Optimistic:
+        # if the next request still 401s, the adapter auth path re-sets it.
         if runtime.health != "auth_failed":
             return
         runtime.health = "ok"
@@ -645,7 +402,9 @@ class Worker:
             self._notify_refresh_needed()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                "agent %s: notify_refresh_needed raised: %s",
+                agent_id,
+                exc,
             )
 
     async def _run_post_warm_gate(self, agent_id: str) -> None:
@@ -657,8 +416,9 @@ class Worker:
             probe_ok = await self._adapter.health_probe()
         except Exception as exc:
             logger.warning(
-                "agent %s: health_probe raised; treating as "
-                "probe-fail: %s", agent_id, exc,
+                "agent %s: health_probe raised; treating as probe-fail: %s",
+                agent_id,
+                exc,
             )
             probe_ok = False
         if not probe_ok:
@@ -668,11 +428,247 @@ class Worker:
                 logger,
                 api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
+        self.runtime.status = "running"
+        self.runtime.save(agent_id)
         self._warm_done.set()
+
+    def _withdraw_unsubstantiated_wedge(self, agent_id: str) -> None:
+        """Retract a red this probe can no longer stand behind.
+
+        This probe is the only writer of ``mcp_unreachable``, and the
+        batch-top override deliberately refuses to overwrite it (its evidence
+        is independent of any turn). So nothing else in the daemon can ever
+        clear it: an agent the probe has stopped applying to would stay red
+        for the life of the process. Upgrading past the release that flagged
+        idle per-turn harnesses has to release them, not freeze them.
+
+        Retracted to ``unknown`` rather than ``ok``: the claim is being
+        withdrawn for want of evidence, which is not the same as observing a
+        healthy transport.
+        """
+        self._mcp_probe_strikes = 0
+        if self.runtime.health != "mcp_unreachable":
+            return
+        self.runtime.health = "unknown"
+        self.runtime.error = ""
+        self.runtime.save(agent_id)
+        logger.info(
+            "agent %s: withdrew an MCP wedge this probe no longer covers",
+            agent_id,
+        )
+
+    def _mcp_probe_subject(self, agent_id: str):
+        """The runtime this probe can speak about.
+
+        Three outcomes, and the difference between the last two is what keeps
+        a recycle from looping forever:
+
+        - a ``(adapter, mgr, spec_gen, opened_at)`` tuple — probe it;
+        - ``_MCP_PROBE_NOT_READY`` — the probe covers this harness but there
+          is no open runtime *right now* (starting, torn down, or mid-reload).
+          Momentary: say nothing, keep the strike count, keep any red;
+        - ``None`` — the probe does not cover this agent at all. A standing
+          property, so a red it can no longer substantiate is withdrawn.
+
+        Not covered means either no puffo MCP to hello back (empty
+        generation), or a non-persistent harness lifecycle: a
+        ``PER_TURN_CHILD`` driver takes ``open`` as a logical session and
+        spawns on ``start_turn`` (see ``RuntimeLifecycle``), so between turns
+        nothing exists to hello with — and this probe stands down *during*
+        turns, so for such a driver it would run exclusively when its premise
+        is false. Every idle opencode agent went ``mcp_unreachable`` within a
+        minute of start, with no fault injected.
+
+        ``mgr.opened`` is the open fact, not ``current_capabilities()``:
+        every shipped driver returns a capability object unconditionally
+        (constants on pi/codex, a constructor-time value on acp, a freshly
+        built one on claude), so capabilities are non-None even when the open
+        failed. ``last_open_monotonic`` is no better — it is stamped *before*
+        ``driver.open`` is awaited. Only ``opened`` is set after a successful
+        open and cleared by every close/reload path.
+
+        Attribute access on the contract fields is direct on purpose:
+        producer/consumer drift must raise here rather than silently disable
+        recovery. Only value-level absence is legitimate and returns quietly.
+        """
+        from ..agent.harness.driver import RuntimeLifecycle
+        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+
+        adapter = self._adapter
+        mgr = get_runtime_manager(agent_id)
+        if adapter is None or mgr is None:
+            return _MCP_PROBE_NOT_READY
+        capabilities = mgr.current_capabilities()
+        if capabilities is not None and (
+            capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD
+        ):
+            return None
+        if not mgr.spec.mcp_generation:
+            return None
+        if capabilities is None or mgr.opened is None:
+            return _MCP_PROBE_NOT_READY
+        opened_at = mgr.last_open_monotonic
+        if opened_at is None:
+            return _MCP_PROBE_NOT_READY
+        return adapter, mgr, mgr.spec.mcp_generation, opened_at
+
+    async def probe_mcp_transport(self, agent_id: str) -> None:
+        """Heartbeat-cadence transport probe: the current runtime's puffo
+        MCP subprocess must have reached the loopback RPC service
+        (``mcp-hello`` with this spec's generation, after this runtime's
+        open) — and, when the subprocess declared a beacon cadence,
+        recently enough that the hello still stands for a live transport.
+        One miss past the grace window recycles the runtime through the
+        adapter (the rebuilt spec mints a fresh generation, so a
+        surviving pre-recycle subprocess can never impersonate the new
+        runtime's health); a second miss flips ``mcp_unreachable`` so
+        the wedge is visible instead of an agent that wakes turns but
+        can never read them (8/30-class incident: alive worker, dead
+        MCP, health ok for 51 min).
+
+        Covers persistent-child harnesses only. A per-turn harness holds no
+        subprocess between turns, so it has nothing to hello with at exactly
+        the moments this probe runs; naming its wedge needs an in-turn
+        signal that does not exist yet."""
+        from . import rpc_service
+
+        subject = self._mcp_probe_subject(agent_id)
+        if subject is _MCP_PROBE_NOT_READY:
+            return
+        if subject is None:
+            self._withdraw_unsubstantiated_wedge(agent_id)
+            return
+        adapter, mgr, spec_gen, opened_at = subject
+        now = time.monotonic()
+        # Query exactly this spec's generation: hello state is keyed per
+        # (agent, generation), so a surviving pre-recycle subprocess's
+        # beacon can neither impersonate this runtime nor overwrite its
+        # healthy evidence.
+        seen_at, beacon_interval = rpc_service.mcp_hello_state(
+            agent_id, spec_gen
+        )
+        current = seen_at > 0.0 and seen_at >= opened_at
+        # Freshness is only enforced against a subprocess that declared
+        # its own re-hello cadence; a startup-only predecessor (older
+        # package in a lagging Docker image) keeps handshake semantics
+        # and is never recycle-looped for going quiet.
+        stale = (
+            beacon_interval is not None
+            and now - seen_at > beacon_interval * _MCP_BEACON_STALE_FACTOR
+        )
+        if current and not stale:
+            if self._mcp_probe_strikes:
+                logger.info(
+                    "agent %s: puffo MCP transport recovered "
+                    "(generation=%s)", agent_id, spec_gen,
+                )
+            self._mcp_probe_strikes = 0
+            if self.runtime.health == "mcp_unreachable":
+                self.runtime.health = "ok"
+                self.runtime.error = ""
+                self.runtime.save(agent_id)
+            return
+        if now - opened_at < _MCP_PROBE_GRACE_SECONDS:
+            return
+        if self._turn_active:
+            # A reload would raise mid-turn; check again next beat.
+            return
+        self._mcp_probe_strikes += 1
+        if self._mcp_probe_strikes == 1:
+            if current:
+                cause = (
+                    f"hello beacon silent for {now - seen_at:.0f}s "
+                    f"(declared interval {beacon_interval:.0f}s)"
+                )
+            else:
+                cause = (
+                    "no hello from this spec's subprocess since runtime "
+                    f"open ({now - opened_at:.0f}s ago)"
+                )
+            await self._recycle_wedged_mcp(
+                agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
+            )
+            return
+        if self.runtime.health in _MCP_PROBE_OVERWRITABLE_HEALTH:
+            self.runtime.health = "mcp_unreachable"
+            self.runtime.error = (
+                "puffo MCP subprocess never reached the daemon RPC "
+                "service after a runtime recycle; tool calls are likely "
+                "timing out. Restart this worker."
+            )
+            self.runtime.save(agent_id)
+            logger.error(
+                "agent %s: MCP transport still unreachable after recycle; "
+                "runtime.health = mcp_unreachable", agent_id,
+            )
+
+    async def _recycle_wedged_mcp(
+        self, agent_id: str, adapter, mgr, *, cause: str, spec_gen: str,
+    ) -> None:
+        """First-strike response: recycle through the adapter-level
+        reload so the rebuilt spec mints a fresh mcp generation."""
+        logger.error(
+            "agent %s: puffo MCP transport unhealthy — %s "
+            "(generation=%s); recycling the provider runtime with a "
+            "fresh mcp generation",
+            agent_id, cause, spec_gen,
+        )
+        try:
+            await adapter.reload(
+                mgr.spec.system_prompt, with_session=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Includes a turn racing us; keep the strike for next beat.
+            self._mcp_probe_strikes -= 1
+            logger.warning(
+                "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
+            )
+            return
+        from . import rpc_service
+
+        # Pin the freshly minted generation at the switch, not at the
+        # next probe: zombie beacon pressure inside that window could
+        # trim its hello and fake never-seen (a recycle loop on a
+        # healthy runtime).
+        new_gen = mgr.spec.mcp_generation
+        if new_gen:
+            rpc_service.pin_mcp_generation(agent_id, new_gen)
+
+    def _note_refresh_reload(
+        self, ok: bool, flags: tuple[Path, ...], agent_id: str
+    ) -> None:
+        """Give-up policy for ``_process_refresh_flags`` failures: the
+        flags survive ``_REFRESH_RELOAD_FAILURE_CAP`` consecutive failed
+        reloads (each turn-start / watcher tick retries), then they are
+        abandoned into an explicit health state — a worker must not spin
+        on a reload that will never succeed, and it must not pretend the
+        refresh was applied either."""
+        if ok:
+            self._refresh_reload_failures = 0
+            return
+        self._refresh_reload_failures += 1
+        if self._refresh_reload_failures < _REFRESH_RELOAD_FAILURE_CAP:
+            return
+        self._refresh_reload_failures = 0
+        _unlink_refresh_flags(*flags)
+        logger.error(
+            "agent %s: adapter reload failed %d consecutive times; "
+            "abandoning pending refresh flags — the provider runtime is "
+            "still on its pre-refresh state",
+            agent_id, _REFRESH_RELOAD_FAILURE_CAP,
+        )
+        if self.runtime.health in ("ok", "unknown"):
+            self.runtime.health = "provider_error"
+            self.runtime.error = (
+                "provider runtime reload kept failing after a refresh "
+                "(credentials/profile may not be applied). Restart this "
+                "worker."
+            )
+            self.runtime.save(agent_id)
 
     @staticmethod
     def _reassert_auth_failed_after_failed_probe(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
         *,
@@ -694,6 +690,62 @@ class Worker:
             agent_id,
         )
 
+    def _build_wired_client(self):
+        """Construct the core client with the worker's observers attached.
+
+        Every runtime path must obtain its client here: one built straight
+        from ``_build_puffo_core_client`` carries no transport-state
+        listener, so WS reconnect streaks reach nobody and runtime.json
+        keeps saying "ok" while the agent is offline — the 8/30 incident's
+        health symptom.
+        """
+        agent_id = self.agent_cfg.id
+        client = _build_puffo_core_client(
+            self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg
+        )
+        client.transport_state_listener = self._transport_state_listener(agent_id)
+        return client
+
+    def _transport_state_listener(self, agent_id: str):
+        """Feed WS reconnect streaks into runtime.json health.
+
+        Before this, a dead transport kept reporting health="ok" with a
+        fresh local heartbeat for hours (the 8/30 App Nap incident):
+        "process alive" was standing in for "server reachable". Only the
+        ok state is overwritten — auth_failed and the other specific
+        signals stay authoritative — and only the transport-set state is
+        cleared on recovery.
+        """
+
+        def note(healthy: bool, streak: int) -> None:
+            rt = self.runtime
+            if healthy:
+                if rt.health == "server_unreachable":
+                    rt.health = "ok"
+                    rt.error = ""
+                    rt.save(agent_id)
+                    logger.info(
+                        "agent %s: transport recovered; runtime.health "
+                        "server_unreachable → ok",
+                        agent_id,
+                    )
+                return
+            if streak < _WS_DEGRADE_THRESHOLD or rt.health != "ok":
+                return
+            rt.health = "server_unreachable"
+            rt.error = (
+                f"server unreachable: {streak} consecutive WS reconnect "
+                "failures"
+            )
+            rt.save(agent_id)
+            logger.warning(
+                "agent %s: %s; runtime.health ok → server_unreachable",
+                agent_id,
+                rt.error,
+            )
+
+        return note
+
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` + fire recovery (refresher kick + operator
         DM). Used on a confirmed adapter auth error so we skip the
@@ -702,7 +754,7 @@ class Worker:
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
         rt.error = Worker._auth_failed_error(
-            getattr(self, "_claude_api_key_mode", False),
+            getattr(self, "_claude_api_key_mode", False)
         )
         rt.save(agent_id)
         if self._notify_refresh_needed is not None:
@@ -710,32 +762,38 @@ class Worker:
                 self._notify_refresh_needed()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                    "agent %s: notify_refresh_needed raised: %s",
+                    agent_id,
+                    exc,
                 )
         if was_ok:
             self._on_auth_failed_enter()
 
     def _on_auth_failed_enter(self) -> None:
         """Fire the operator DM once per auth_failed episode. The flag
-        re-arms on OAuth refresh, successful API-key recovery, or a failed
-        send, so a later genuine failure re-notifies."""
+        re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
+        on a failed send, so a later genuine failure re-notifies."""
         if self._auth_failed_notification_sent:
             return
         if getattr(self, "_claude_api_key_mode", False):
             self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
         try:
-            asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
+            spawn(
+                self._notify_operator_of_auth_failed_oauth(),
+                name="notify_operator_of_auth_failed_oauth",
+            )
         except Exception as exc:  # noqa: BLE001
             # Re-arm so a schedule failure retries on the next ENTER.
             self._auth_failed_notification_sent = False
             logger.warning(
                 "agent %s: couldn't schedule auth-failed DM: %s",
-                self.agent_cfg.id, exc,
+                self.agent_cfg.id,
+                exc,
             )
 
     async def _notify_operator_of_auth_failed_oauth(self) -> None:
-        """DM the operator the matching bilingual auth recovery copy.
+        """DM the operator the bilingual OAuth-expired recovery copy.
         Re-arms the dedup flag on a transient failure (client not warm,
         or send raised) so the next ENTER retries instead of staying
         silently gated."""
@@ -760,24 +818,31 @@ class Worker:
         from ..agent._invite_strings import (
             format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
+            format_generic_oauth_expired,
             format_oauth_expired,
         )
-        display_name = (
-            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
-        )
-        # Codex agents need the Codex recovery command, not the Claude
-        # one; otherwise the operator runs the wrong CLI and assumes
-        # the alert is broken. Harness is the cheapest signal we have.
+
+        display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        # Each provider needs its own recovery command; running the wrong
+        # CLI's login leaves the agent broken and makes the alert look
+        # false. Harness is the cheapest signal we have. Anything we have
+        # not verified a command for gets the generic copy rather than
+        # inheriting Claude's — a Pi agent told to run `claude auth login`
+        # is worse than one told to re-authenticate Pi.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
         if getattr(self, "_claude_api_key_mode", False):
             text = format_anthropic_api_key_rejected(
-                self.agent_cfg.id, display_name,
+                self.agent_cfg.id, display_name
             )
         elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
-        else:
+        elif harness in ("", "claude-code"):
             text = format_oauth_expired(self.agent_cfg.id, display_name)
+        else:
+            text = format_generic_oauth_expired(
+                self.agent_cfg.id, display_name, harness
+            )
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
@@ -785,12 +850,15 @@ class Worker:
             self._auth_failed_notification_sent = False
             logger.exception(
                 "agent %s: auth-failed DM to %s raised: %s",
-                self.agent_cfg.id, operator_slug, exc,
+                self.agent_cfg.id,
+                operator_slug,
+                exc,
             )
             return
         logger.info(
             "agent %s: notified operator @%s of auth failure",
-            self.agent_cfg.id, operator_slug,
+            self.agent_cfg.id,
+            operator_slug,
         )
 
     @staticmethod
@@ -801,20 +869,177 @@ class Worker:
                 "in daemon.yml, keep anthropic.cli_use_api_key enabled, "
                 "restart puffo-agent, then send this agent a message."
             )
-        return (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
+        return provider_failure_message("authentication")
+
+    def _enter_extra_usage_required(self, agent_id: str) -> None:
+        """Extra usage needs operator action; subscription refresh cannot clear it."""
+        self.runtime.health = "extra_usage_required"
+        self.runtime.error = provider_failure_message("extra_usage_required")
+        self.runtime.save(agent_id)
+        if self._extra_usage_notification_sent:
+            return
+        self._extra_usage_notification_sent = True
+        coro = self._notify_operator_of_extra_usage()
+        try:
+            spawn(coro, name="notify_operator_of_extra_usage")
+        except Exception:
+            coro.close()
+            self._extra_usage_notification_sent = False
+            logger.exception("could not schedule extra-usage notification")
+
+    async def _notify_operator_of_extra_usage(self) -> None:
+        client = self._client
+        if client is None:
+            self._extra_usage_notification_sent = False
+            return
+        operator_slug = client.operator_slug or ""
+        if not operator_slug:
+            return
+        name = self.agent_cfg.display_name or self.agent_cfg.id
+        text = (
+            f"{name}: 额度不可用（额外用量）。请检查 Claude 的额外用量设置、"
+            "余额或花费上限：https://claude.ai/settings/usage 。"
+            "处理后重启此 Agent，以重试待处理消息。\n\n"
+            f"{name}: Quota unavailable (extra usage). "
+            + provider_failure_message("extra_usage_required")
+        )
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception:
+            self._extra_usage_notification_sent = False
+            logger.exception("could not send extra-usage notification")
+
+    def _enter_drained(
+        self,
+        agent_id: str,
+        resets_at: int | None = None,
+        *,
+        budget_cap: bool = False,
+    ) -> None:
+        """``drained`` + one operator DM per episode. No refresher kick.
+
+        ``budget_cap``: a gateway spend cap, not a plan window — no reset time
+        exists and the usage snapshot must not clear it (unrelated signal).
+        The runtime holds on a timer and probes; see ``_park_drained``.
+        """
+        from ..agent._usage_markers import (
+            BUDGET_EXCEEDED_RUNTIME_ERROR,
+            DRAINED_RUNTIME_ERROR,
+        )
+
+        rt = self.runtime
+        was_ok = rt.health != "drained"
+        rt.health = "drained"
+        rt.error = (
+            BUDGET_EXCEEDED_RUNTIME_ERROR if budget_cap else DRAINED_RUNTIME_ERROR
+        )
+        rt.save(agent_id)
+        self._drained_budget_cap = budget_cap
+        if resets_at is not None:
+            self._drained_resets_at = resets_at
+        if was_ok:
+            self._on_drained_enter()
+
+    def _on_drained_enter(self) -> None:
+        """One DM per episode; re-arms on successful turn / failed send."""
+        if self._drained_notification_sent:
+            return
+        self._drained_notification_sent = True
+        try:
+            spawn(self._notify_operator_of_drained(), name="notify_operator_of_drained")
+        except Exception as exc:  # noqa: BLE001
+            self._drained_notification_sent = False  # re-arm
+            logger.warning(
+                "agent %s: couldn't schedule drained DM: %s",
+                self.agent_cfg.id,
+                exc,
+            )
+
+    async def _notify_operator_of_drained(self) -> None:
+        """Bilingual quota DM; re-arm semantics of the auth-failed sibling."""
+        client = self._client
+        if client is None:
+            self._drained_notification_sent = False  # still warming: re-arm
+            logger.warning(
+                "agent %s: drained DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            # stay gated: re-arming would respin every drained turn
+            logger.warning(
+                "agent %s: drained but no operator_slug — not DMing",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_codex_drained, format_drained
+
+        display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        runtime = getattr(self.agent_cfg, "runtime", None)
+        harness = getattr(runtime, "harness", "") if runtime is not None else ""
+        if getattr(self, "_drained_budget_cap", False):
+            # a gateway cap: no window, no /usage prediction — say what it is
+            from ..agent._invite_strings import format_budget_exceeded
+
+            text = format_budget_exceeded(self.agent_cfg.id, display_name)
+        else:
+            resets_at = getattr(self, "_drained_resets_at", None)
+            if resets_at is None:
+                # error bodies rarely carry a time — predict from /usage, best-effort
+                from .control.usage_snapshot import predicted_reset_epoch
+
+                try:
+                    resets_at = await predicted_reset_epoch(harness or "claude-code")
+                except Exception:  # noqa: BLE001
+                    resets_at = None
+                if resets_at is not None:
+                    self._drained_resets_at = resets_at
+            formatter = format_codex_drained if harness == "codex" else format_drained
+            text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:
+            self._drained_notification_sent = False  # re-arm
+            logger.exception(
+                "agent %s: drained DM to %s raised: %s",
+                self.agent_cfg.id,
+                operator_slug,
+                exc,
+            )
+            return
+        logger.info(
+            "agent %s: notified operator @%s of quota exhaustion",
+            self.agent_cfg.id,
+            operator_slug,
         )
 
     @staticmethod
-    def _flip_health_in_progress(
-        runtime: "RuntimeState",
+    def _clear_drained(
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """Override any sticky red with ``in_progress`` at batch-top."""
-        if runtime.health == "in_progress":
+        """``drained`` → ``ok``; leaves every other health alone."""
+        if runtime.health != "drained":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info("agent %s: runtime.health drained → ok", agent_id)
+
+    @staticmethod
+    def _flip_health_in_progress(
+        runtime: RuntimeState,
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """Override a stale red with ``in_progress`` at batch-top — except
+        causes whose evidence is independent of this turn: an independently
+        probed MCP wedge (#312) and a parked extra-usage red (#326)."""
+        if runtime.health in {
+            "in_progress", "mcp_unreachable", "extra_usage_required",
+        }:
             return
         runtime.health = "in_progress"
         runtime.error = ""
@@ -823,32 +1048,100 @@ class Worker:
 
     @staticmethod
     def _resolve_health_on_success(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
         *,
         recover_auth_failed: bool = False,
     ) -> None:
-        """Resolve a successful turn without masking unrelated red states."""
-        recoverable = {"in_progress"}
-        if recover_auth_failed:
-            recoverable.add("auth_failed")
-        if runtime.health not in recoverable:
+        """Transition ``in_progress`` → ``ok``; skip any in-turn red."""
+        if runtime.health != "in_progress" and not (
+            recover_auth_failed and runtime.health == "auth_failed"
+        ):
             return
         previous_health = runtime.health
         runtime.health = "ok"
         runtime.error = ""
         runtime.save(agent_id)
         log.info(
-            "agent %s: runtime.health %s → ok", agent_id, previous_health,
+            "agent %s: runtime.health %s → ok", agent_id, previous_health
         )
+
+    def _note_no_progress_turn(self, agent_id: str) -> None:
+        """A turn woke on an announced batch and consumed none of it.
+
+        Deliberately *not* symmetrical with the success lane: this does not
+        clear anything and does not settle the runtime back to ``ok``. A
+        single such turn is a legitimate deferral, so the first
+        ``_NO_PROGRESS_TURN_THRESHOLD - 1`` only hold the previous health and
+        let the next wake-up retry; the streak past that is the signal.
+
+        The stronger reds stay authoritative — this only ever overwrites the
+        states that mean "nothing is known to be wrong", which is exactly the
+        gap it exists to close: a driver that mis-reports a failed turn as a
+        completed one leaves the agent sitting in ``ok`` forever.
+        """
+        streak = getattr(self, "_no_progress_turns", 0) + 1
+        self._no_progress_turns = streak
+        rt = self.runtime
+        if streak < _NO_PROGRESS_TURN_THRESHOLD:
+            logger.info(
+                "agent %s: turn made no progress on its announced batch "
+                "(%d/%d); leaving runtime.health = %s for the next wake-up",
+                agent_id, streak, _NO_PROGRESS_TURN_THRESHOLD, rt.health,
+            )
+            return
+        if rt.health not in ("ok", "in_progress", "unknown", "no_progress"):
+            logger.info(
+                "agent %s: %d consecutive no-progress turns, but "
+                "runtime.health = %s already names a cause; leaving it",
+                agent_id, streak, rt.health,
+            )
+            return
+        Worker._write_no_progress_red(self, agent_id, streak)
+
+    def _write_no_progress_red(self, agent_id: str, streak: int) -> None:
+        rt = self.runtime
+        if rt.health != "no_progress":
+            logger.warning(
+                "agent %s: %d consecutive turns woke on pending messages and "
+                "read none; runtime.health %s → no_progress",
+                agent_id, streak, rt.health,
+            )
+        rt.health = "no_progress"
+        rt.error = (
+            "Woke for new messages but the provider read none of them "
+            f"{streak} times in a row. The turns are being reported as "
+            "completed while the messages stay unread — check the provider "
+            "credentials and the harness driver's error mapping."
+        )
+        rt.save(agent_id)
+
+    def _reassert_no_progress_after_cancel(self, agent_id: str) -> None:
+        """A cancelled turn is not recovery evidence.
+
+        ``_flip_health_in_progress`` overrides the ``no_progress`` red at
+        batch-top; settling the cancelled turn through the success resolver
+        would launder that into ``ok`` with zero ``read_inbox`` admissions in
+        between. While the streak that earned the red is still live, put the
+        red back instead. Below threshold — or when the turn set a health
+        value that names a cause — the ordinary resolution stands (the
+        resolver only ever touches ``in_progress``).
+        """
+        streak = getattr(self, "_no_progress_turns", 0)
+        if streak >= _NO_PROGRESS_TURN_THRESHOLD and self.runtime.health in (
+            "ok", "in_progress", "unknown", "no_progress",
+        ):
+            Worker._write_no_progress_red(self, agent_id, streak)
+            return
+        Worker._resolve_health_on_success(self.runtime, agent_id, logger)
 
     def _resolve_health_after_success(self, agent_id: str) -> None:
         recovering_api_key = (
             getattr(self, "_claude_api_key_mode", False)
             and getattr(self, "_api_key_auth_recovery_pending", False)
         )
-        Worker._resolve_health_on_success(
+        self._resolve_health_on_success(
             self.runtime,
             agent_id,
             logger,
@@ -857,10 +1150,23 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # Transport readiness, refresh and cancellation are not model success.
+        if self.runtime.health == "extra_usage_required":
+            self.runtime.health = "ok"
+            self.runtime.error = ""
+            self.runtime.save(agent_id)
+        self._extra_usage_notification_sent = False
+        # a turn that consumed its announced batch clears the no-progress streak
+        self._no_progress_turns = 0
+        # a completed turn is proof quota is available again
+        Worker._clear_drained(self.runtime, agent_id, logger)
+        self._drained_notification_sent = False
+        self._drained_resets_at = None
+        self._drained_budget_cap = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         turn_error: str | None,
         log: logging.Logger,
@@ -876,7 +1182,46 @@ class Worker:
         runtime.save(agent_id)
         log.warning(
             "agent %s: runtime.health → unhandled_error (%s)",
-            agent_id, runtime.error,
+            agent_id,
+            runtime.error,
+        )
+
+    @staticmethod
+    def _mark_api_error_abandoned_if_in_progress(
+        runtime: RuntimeState,
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """Record a bounded provider retry budget reaching its terminal edge."""
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "api_error_abandoned"
+        runtime.error = turn_error or "provider retry budget exhausted"
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: runtime.health → api_error_abandoned (%s)",
+            agent_id,
+            runtime.error,
+        )
+
+    @staticmethod
+    def _mark_provider_failure_if_in_progress(
+        runtime: RuntimeState,
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """Record a categorized provider failure without calling it unhandled."""
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "provider_error"
+        runtime.error = turn_error or "provider could not complete the turn"
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: runtime.health → provider_error (%s)",
+            agent_id,
+            runtime.error,
         )
 
     def __init__(
@@ -902,21 +1247,33 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        self._drained_notification_sent = False
+        self._extra_usage_notification_sent = False
+        self._drained_resets_at: int | None = None
+        self._drained_budget_cap = False
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
-            and bool(_claude_cli_api_key(
-                daemon_cfg,
-                agent_cfg.runtime.harness or "claude-code",
-            ))
+            and bool(
+                _claude_cli_api_key(
+                    daemon_cfg,
+                    agent_cfg.runtime.harness or "claude-code",
+                )
+            )
         )
         self._api_key_auth_recovery_pending = False
         self.runtime = RuntimeState(
-            status="running",
+            status="starting",
             started_at=int(time.time()),
             msg_count=0,
         )
+        # A restart permits a fresh attempt, but is not proof billing recovered.
+        previous = RuntimeState.load(agent_cfg.id)
+        if previous is not None and previous.health == "extra_usage_required":
+            self.runtime.health = previous.health
+            self.runtime.error = provider_failure_message("extra_usage_required")
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._restart_required = False
         self._adapter: Adapter | None = None
         # Held here so ``stop()`` can close the SQLite + WS handles
         # the client owns. Required on Windows so ``messages.db*``
@@ -925,24 +1282,124 @@ class Worker:
         # Signalled when warm() finishes (success, failure, or skipped).
         # Daemon awaits this to serialise heavy startup across workers.
         self._warm_done = asyncio.Event()
+        # Proactive (between-turns) profile reload state. The refresh
+        # watcher (see ``_run``) and the turn-start ``_process_refresh_flags``
+        # call share this lock so a flag is consumed exactly once —
+        # whichever path wins takes it; the loser hits the early-return
+        # when the flags are already gone. ``_turn_active`` gates the
+        # watcher so it never applies mid-generation (deferred to the
+        # turn-start path). ``_refresh_now`` is a signal-driven wake so
+        # SIGHUP can beat the 250 ms idle poll.
+        self._reload_lock = asyncio.Lock()
+        self._turn_active = False
+        self._refresh_now = asyncio.Event()
+        # MCP transport probe state (see ``probe_mcp_transport``): missed
+        # handshakes since the last confirmed one, and how many consecutive
+        # adapter reloads failed before their flags were abandoned.
+        self._mcp_probe_strikes = 0
+        self._refresh_reload_failures = 0
+
+    def notify_refresh(self) -> None:
+        """Wake the proactive refresh watcher now (sub-poll latency).
+        Called from the daemon's SIGHUP handler, which runs on the loop
+        thread. No-op safe: setting an already-set Event is idempotent,
+        and if the worker has no watcher yet (pre-``_run``) the flag is
+        simply observed on the first watcher tick."""
+        self._refresh_now.set()
+
+    async def _proactive_refresh_tick(self, flag_paths, apply) -> bool:
+        """One proactive-watcher iteration's decision + apply. Skips when
+        a turn owns flag consumption (``_turn_active``) or no flag in
+        ``flag_paths`` is pending; otherwise takes ``_reload_lock`` (the
+        same lock the turn-start path holds → consume-once), re-checks
+        ``_turn_active``, and awaits ``apply`` (the bound
+        ``_process_refresh_flags`` call). Returns whether ``apply`` ran.
+        Exceptions from ``apply`` are swallowed so the watcher never
+        kills the worker — the turn-start path is the backstop."""
+        if self._turn_active:
+            # A turn owns flag consumption; never apply mid-turn.
+            return False
+        if not any(_refresh_flag_is_pending(p) for p in flag_paths):
+            # Cheap exists() check before taking the lock.
+            return False
+        async with self._reload_lock:
+            if self._turn_active:
+                # A turn started between the check and the lock; defer to
+                # the turn-start path.
+                return False
+            try:
+                await apply()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: proactive refresh failed: %s",
+                    self.agent_cfg.id,
+                    exc,
+                )
+            return True
+
+    async def _refresh_watcher_loop(
+        self,
+        flag_paths,
+        apply,
+        *,
+        interval: float = 0.25,
+    ) -> None:
+        """Proactive between-turns profile reload loop. Polls
+        ``flag_paths`` every ``interval`` s (waking immediately when
+        ``notify_refresh()`` fires) so a ``profile.md`` / host-sync /
+        session edit takes effect while the agent is IDLE — instead of
+        only lazily at the next turn. Each pending flag is funneled into
+        ``apply``, the bound turn-start ``_process_refresh_flags`` /
+        ``adapter.reload`` primitive (adapter-only reload: the bridge WS
+        on ``self._client`` and the worker are untouched). No-op unless a
+        flag is present, so native/desktop runtimes see no behavioral
+        change beyond applying an already-written flag sooner. Runs as a
+        sibling task of ``heartbeat``; ends when ``_stop`` is set."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._refresh_now.wait(),
+                    timeout=interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._refresh_now.clear()
+            if self._stop.is_set():
+                break
+            await self._proactive_refresh_tick(flag_paths, apply)
 
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
             return self._task
-        self._task = asyncio.ensure_future(self._run())
+        self.runtime.status = "starting"
+        self.runtime.error = ""
+        self.runtime.save(self.agent_cfg.id)
+        self._task = spawn(self._run(), name="run")
         return self._task
+
+    @property
+    def restart_required(self) -> bool:
+        """Whether a post-start fatal failure requires daemon replacement."""
+        return (
+            self._restart_required
+            and self._task is not None
+            and self._task.done()
+        )
 
     async def wait_warm(self, timeout: float | None = None) -> bool:
         """Block until warm() finishes or the worker exits early.
-        Returns True on completion, False on timeout."""
+        Returns True only when startup reached ``running``."""
         try:
             await asyncio.wait_for(self._warm_done.wait(), timeout=timeout)
-            return True
+            return self.runtime.status == "running"
         except asyncio.TimeoutError:
             return False
 
     def set_profile_cache(
-        self, slug: str, display_name: str, avatar_url: str,
+        self,
+        slug: str,
+        display_name: str,
+        avatar_url: str,
     ) -> None:
         """Cross-process bridge for the MCP ``get_user_info`` tool —
         the subprocess fetches fresh from puffo-server then POSTs the
@@ -961,7 +1418,17 @@ class Worker:
             return None
         from .host_mcp_handler import HostMcpContext
         from .state import agent_home_dir
-        harness = self.agent_cfg.runtime.harness or "claude-code"
+
+        runtime = self.agent_cfg.runtime
+        runtime_kind = getattr(runtime, "kind", "") or "cli-local"
+        provider = resolve_effective_provider(
+            runtime_kind, getattr(runtime, "provider", "")
+        )
+        harness = resolve_effective_harness(
+            runtime_kind,
+            provider,
+            getattr(runtime, "harness", ""),
+        )
         return HostMcpContext(
             agent_id=self.agent_cfg.id,
             slug=client.slug,
@@ -972,6 +1439,7 @@ class Worker:
             keystore=client.keystore,
             http_client=client.http,
             message_client=client,
+            send_coordinator=getattr(client, "send_delegate", None),
         )
 
     async def stop(self) -> None:
@@ -1005,61 +1473,91 @@ class Worker:
                 )
             except Exception as exc:
                 logger.warning(
-                    "agent %s: adapter aclose failed: %s", self.agent_cfg.id, exc,
-                )
-        if self._client is not None:
-            # Release WS + SQLite handles. Required on Windows so
-            # ``messages.db*`` is renamable by ``agent archive``.
-            try:
-                await asyncio.wait_for(self._client.stop(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "agent %s: client.stop timed out after 10s",
+                    "agent %s: adapter aclose failed: %s",
                     self.agent_cfg.id,
+                    exc,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: client.stop failed: %s", self.agent_cfg.id, exc,
-                )
-            self._client = None
+        await self._close_client()
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
+    async def _close_client(self) -> None:
+        """Release a partially or fully started message client."""
+        if self._client is None:
+            return
+        # Release WS + SQLite handles. Required on Windows so
+        # ``messages.db*`` is renamable by ``agent archive``.
+        try:
+            await asyncio.wait_for(self._client.stop(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "agent %s: client.stop timed out after 10s",
+                self.agent_cfg.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: client.stop failed: %s",
+                self.agent_cfg.id,
+                exc,
+            )
+        self._client = None
+
     def _runtime_info(self) -> dict[str, object]:
-        """Heartbeat payload: the agent's runtime, so the operator's portal can
-        show + pre-select the live model. An edit restarts the worker, so the
-        next instance reports the updated values."""
         rt = self.agent_cfg.runtime
+        kind = getattr(rt, "kind", "") or "cli-local"
+        if kind == RUNTIME_WS_LOCAL:
+            return {
+                "kind": kind,
+                "provider": "",
+                "harness": "",
+                "model": "",
+                "inference_level": "",
+            }
+        provider = getattr(rt, "provider", "")
+        configured_harness = getattr(rt, "harness", "")
+        if (
+            not provider
+            and kind in (RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER)
+            and configured_harness
+        ):
+            supported = HARNESS_PROVIDERS.get(configured_harness, frozenset())
+            if len(supported) == 1:
+                provider = next(iter(supported))
+        provider = resolve_effective_provider(kind, provider)
+        harness = resolve_effective_harness(kind, provider, configured_harness)
+        daemon_cfg = getattr(self, "daemon_cfg", None)
+        provider_cfg = getattr(daemon_cfg, provider, None)
+        model = getattr(rt, "model", "") or getattr(provider_cfg, "model", "")
         info: dict[str, object] = {
-            "kind": rt.kind,
-            "provider": rt.provider,
-            "harness": rt.harness,
-            "model": rt.model,
-            "inference_level": rt.inference_level,
+            "kind": kind,
+            "provider": provider,
+            "harness": harness,
+            "model": model,
+            "inference_level": getattr(rt, "inference_level", ""),
         }
-        if rt.harness == "claude-code":
+        adapter = getattr(self, "_adapter", None)
+        context_limits = getattr(adapter, "context_limits", None)
+        limits = context_limits() if callable(context_limits) else (None, None)
+        env_overrides = getattr(self.agent_cfg, "env_overrides", {})
+        if harness == "claude-code":
             from .control.context_telemetry import build_context_runtime
 
-            adapter = getattr(self, "_adapter", None)
-            limits = adapter.context_limits() if adapter is not None else (None, None)
             info.update(
                 build_context_runtime(
-                    model=getattr(adapter, "model", "") or rt.model,
+                    model=getattr(adapter, "model", "") or model,
                     max_context=limits[0],
                     auto_compact_threshold=limits[1],
-                    env_overrides=self.agent_cfg.env_overrides,
+                    env_overrides=env_overrides,
                 )
             )
-        elif rt.harness == "codex":
+        elif harness == "codex":
             from .control.context_telemetry import (
                 compact_threshold_pct,
                 configured_compact_pct,
             )
 
-            adapter = getattr(self, "_adapter", None)
-            limits = adapter.context_limits() if adapter is not None else (None, None)
             configured_pct = configured_compact_pct(
-                "codex", getattr(self.agent_cfg, "env_overrides", {}),
+                "codex", env_overrides
             )
             info.update({
                 "max_context": limits[0],
@@ -1069,9 +1567,9 @@ class Worker:
                     else compact_threshold_pct(limits[0], limits[1])
                 ),
             })
-        if rt.harness in {"claude-code", "codex"}:
-            max_context = int(info["max_context"] or 0)
-            threshold_pct = info["auto_compact_threshold_pct"]
+        if harness in {"claude-code", "codex"}:
+            max_context = int(info.get("max_context") or 0)
+            threshold_pct = info.get("auto_compact_threshold_pct")
             runtime_state = getattr(self, "runtime", None)
             if (
                 runtime_state is not None
@@ -1085,6 +1583,48 @@ class Worker:
                 runtime_state.save(self.agent_cfg.id)
         return info
 
+    def _build_status_reporter(self, client) -> StatusReporter:
+        from ..agent.processing_receipts import ProcessingReportDispatcher
+
+        bridge = getattr(client, "_bridge", None)
+        processing_reports = None
+        if bridge is None and not bool(getattr(client.http, "keyless", False)):
+            store = getattr(client, "store", None)
+            if store is not None:
+                processing_reports = ProcessingReportDispatcher(store, client.http)
+                client._processing_reports = processing_reports
+                register_connected = getattr(client, "add_connected_callback", None)
+                if callable(register_connected):
+                    register_connected(processing_reports.on_transport_connected)
+        agent_id = self.agent_cfg.id
+
+        # health only travels on heartbeats; without this a red written just
+        # after a turn settles waits out the interval before the server hears
+        # it. The periodic tick remains the fallback.
+        #
+        # One stable callable, bound and released together, so the module
+        # global is scoped to a running loop instead of outliving a stopped
+        # worker — and so neither shutdown path has to remember separately.
+        def _wake_heartbeat() -> None:
+            reporter.request_immediate_heartbeat()
+
+        reporter = StatusReporter(
+            client.http,
+            runtime_health_provider=lambda: self.runtime.health,
+            runtime_provider=self._runtime_info,
+            status_sender=bridge.send_status if bridge is not None else None,
+            processing_reports=processing_reports,
+            on_loop_start=lambda: set_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+            on_loop_stop=lambda: clear_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+        )
+        if bridge is not None:
+            bridge.add_connected_callback(reporter.report_current_status)
+        return reporter
+
     async def _run_ws_local(self) -> None:
         """ws-local agents run no harness consumer. Build the client,
         register an attach point, and idle — the bridge's /v1/ws-local
@@ -1095,15 +1635,13 @@ class Worker:
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
                 )
-            client = _build_puffo_core_client(
-                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
-            )
+            client = self._build_wired_client()
             self._client = client
-            reporter = StatusReporter(
-                client.http,
-                runtime_health_provider=lambda: self.runtime.health,
-                runtime_provider=self._runtime_info,
-            )
+            reporter = self._build_status_reporter(client)
+            identity = client.keystore.load_identity(client.slug)
+            root_public_key = Ed25519KeyPair.from_secret_bytes(
+                decode_secret(identity.root_secret_key)
+            ).public_key_bytes()
             point = AttachPoint(
                 slug=self.agent_cfg.puffo_core.slug,
                 agent_id=agent_id,
@@ -1112,9 +1650,12 @@ class Worker:
                 reporter=reporter,
                 ack_timeout_s=180.0,
                 ping_interval_s=30.0,
+                root_public_key=root_public_key,
             )
         except Exception as e:
-            logger.error("agent %s: ws-local init failed: %s", agent_id, e, exc_info=True)
+            logger.error(
+                "agent %s: ws-local init failed: %s", agent_id, e, exc_info=True
+            )
             self.runtime.status = "error"
             self.runtime.error = str(e)
             self.runtime.save(agent_id)
@@ -1136,9 +1677,11 @@ class Worker:
             try:
                 await sync_full_profile(self.agent_cfg)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("agent %s: ws-local profile sync failed: %s", agent_id, exc)
+                logger.warning(
+                    "agent %s: ws-local profile sync failed: %s", agent_id, exc
+                )
 
-        asyncio.ensure_future(_ws_local_profile_sync())
+        spawn(_ws_local_profile_sync(), name="ws_local_profile_sync")
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
         try:
             await self._stop.wait()
@@ -1152,516 +1695,9 @@ class Worker:
         if (self.agent_cfg.runtime.kind or "") == RUNTIME_WS_LOCAL:
             await self._run_ws_local()
             return
-        agent_id = self.agent_cfg.id
-        try:
-            self._adapter = build_adapter(self.daemon_cfg, self.agent_cfg)
-            profile_path = str(self.agent_cfg.resolve_profile_path())
-            memory_path = str(self.agent_cfg.resolve_memory_dir())
-            workspace_path = str(self.agent_cfg.resolve_workspace_dir())
-            claude_path = str(self.agent_cfg.resolve_claude_dir())
-            Path(memory_path).mkdir(parents=True, exist_ok=True)
-            Path(workspace_path).mkdir(parents=True, exist_ok=True)
-            _seed_claude_dir(Path(claude_path))
+        from .worker_run import StandardWorkerRun
 
-            # Managed CLAUDE.md (primer + profile + memory) written user-level for
-            # auto-discovery; project-level stays agent-editable. chat/sdk-local
-            # get the same string as system_prompt.
-            shared_path = docker_shared_dir()
-            claude_md = _rebuild_managed_system_prompt(
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
-                agent_id=agent_id,
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-            )
-
-            # One-time migration: remove an older project-level
-            # managed CLAUDE.md, but only if it still carries our
-            # managed-content marker — never clobber user content.
-            old_managed = Path(claude_path) / "CLAUDE.md"
-            if looks_like_managed_claude_md(old_managed):
-                try:
-                    old_managed.unlink()
-                    logger.info(
-                        "agent %s: migrated stale managed CLAUDE.md out of %s",
-                        agent_id, old_managed,
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "agent %s: could not remove stale %s: %s",
-                        agent_id, old_managed, exc,
-                    )
-
-            puffo = PuffoAgent(
-                adapter=self._adapter,
-                system_prompt=claude_md,
-                memory_dir=memory_path,
-                workspace_dir=workspace_path,
-                claude_dir=claude_path,
-                agent_id=agent_id,
-            )
-
-            if not self.agent_cfg.puffo_core.is_configured():
-                raise RuntimeError(
-                    f"agent {agent_id!r}: puffo_core block in agent.yml "
-                    "is incomplete. Required fields: server_url, slug, "
-                    "device_id, space_id."
-                )
-            client = _build_puffo_core_client(
-                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
-            )
-            self._client = client
-        except Exception as e:
-            logger.error("agent %s: failed to initialise: %s", agent_id, e, exc_info=True)
-            self.runtime.status = "error"
-            self.runtime.error = str(e)
-            self.runtime.save(agent_id)
-            # Init crashed before warm() — release the startup gate.
-            self._warm_done.set()
-            return
-
-        # Per-agent refresh_ping retired; daemon-level CredentialRefresher is
-        # the single writer of ~/.claude/.credentials.json.
-
-        # Warm the adapter so persisted-session agents re-spawn their
-        # subprocess now rather than on the first DM. Non-fatal.
-        warm_ok = False
-        try:
-            await self._adapter.warm(claude_md)
-            warm_ok = True
-        except Exception as exc:
-            logger.warning(
-                "agent %s: warm() failed (will retry on first turn): %s",
-                agent_id, exc,
-            )
-        if warm_ok:
-            await self._run_post_warm_gate(agent_id)
-        else:
-            # Warm failed; release the startup gate so the daemon's
-            # wait_warm doesn't block forever. Probe would have nothing
-            # to verify anyway since the adapter never came up.
-            self._warm_done.set()
-
-        # Per-agent counterpart to daemon-startup full-sync: covers
-        # paused→running flips + restart.flag respawns. Fire-and-
-        # forget; never blocks listen().
-        async def _post_warm_sync() -> None:
-            from .profile_sync import sync_full_profile
-            try:
-                await sync_full_profile(self.agent_cfg)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "agent %s: post-warm profile sync failed: %s",
-                    agent_id, exc,
-                )
-
-        asyncio.ensure_future(_post_warm_sync())
-
-        pa_dir = Path(workspace_path) / ".puffo-agent"
-        refresh_agent_flag_path = pa_dir / "refresh_agent.flag"
-        refresh_host_sync_flag_path = pa_dir / "refresh_host_sync.flag"
-        refresh_session_flag_path = pa_dir / "refresh_session.flag"
-        # Per-turn context for the cli-local permission hook. The hook
-        # is a separate subprocess and reads this file to learn which
-        # channel + root to reply to.
-        current_turn_path = Path(workspace_path) / ".puffo-agent" / "current_turn.json"
-
-        async def on_message_batch(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            """One agent turn per thread batch. The puffo-core client
-            collapses every arrival on the same ``root_id`` into a
-            single list and hands it here in arrival order. The agent
-            sees every message in one turn and decides whom (and how
-            many times) to reply on its own.
-
-            Server-side processing-run telemetry is keyed on the
-            triggering post id; we use the LAST envelope in the batch
-            as that anchor since it's the most recent thing the agent
-            is reasoning about. The reply, if any, posts back to
-            ``root_id`` as a thread reply (or to the channel root for
-            a top-level batch).
-            """
-            if not batch:
-                return
-            # Duplicate tracer: same envelope_id in two lines within seconds =
-            # cursor or dispatching_ids miss.
-            batch_ids = [m.get("envelope_id", "") for m in batch]
-            logger.info(
-                "agent %s: on_message_batch root=%s size=%d envelopes=%s",
-                agent_id, root_id, len(batch), batch_ids,
-            )
-            # Per-batch telemetry: first message gets /processing/start (yellow
-            # dot); the rest flip white->green via /processing/end:batch.
-            first_post_id = batch[0].get("envelope_id", "")
-            channel_id = channel_meta.get("channel_id", "")
-
-            await _process_refresh_flags(
-                agent_id=agent_id,
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-                puffo=puffo,
-                adapter=self._adapter,
-                refresh_agent_flag=refresh_agent_flag_path,
-                refresh_host_sync_flag=refresh_host_sync_flag_path,
-                refresh_session_flag=refresh_session_flag_path,
-            )
-            try:
-                current_turn_path.parent.mkdir(parents=True, exist_ok=True)
-                current_turn_path.write_text(
-                    json.dumps({
-                        "channel_id": channel_id,
-                        "root_id": root_id,
-                        "triggering_post_id": first_post_id,
-                    }),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: could not write current_turn.json: %s "
-                    "(permission hook will fail-open)", agent_id, exc,
-                )
-            # New batch while auth_failed: wake the refresher to check
-            # for a re-login now (the flip below would mask auth_failed).
-            self._maybe_wake_refresher_if_auth_failed(agent_id)
-            # Pre-delivery credential gate. The single-use refresh_token race is
-            # OS-agnostic: N agents refreshing in parallel lose N-1 with
-            # invalid_grant. Skipped for non-claude runtimes (ws-local, api-puffo).
-            if (
-                self._ensure_fresh_token is not None
-                and self.agent_cfg.runtime.kind in (
-                    RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
-                )
-            ):
-                ok = await self._ensure_fresh_token()
-                if not ok:
-                    # Token stuck: _enter_auth_failed flips health + DMs the operator once
-                    # per episode; raise pushes the batch into the consumer retry path so
-                    # it redelivers on recovery.
-                    logger.warning(
-                        "agent %s: pre-delivery token refresh failed; "
-                        "flagging auth_failed and deferring batch",
-                        agent_id,
-                    )
-                    self._enter_auth_failed(agent_id)
-                    raise AgentAPIError(
-                        "credential refresh failed before delivery",
-                    )
-            try:
-                Worker._flip_health_in_progress(self.runtime, agent_id, logger)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "agent %s: _flip_health_in_progress failed: %s",
-                    agent_id, exc,
-                )
-            # Server-side processing-run + status transitions.
-            # Reporter swallows network errors so a flaky status push
-            # never blocks the actual reply.
-            run_id = (
-                await reporter.begin_turn(first_post_id)
-                if first_post_id
-                else None
-            )
-            turn_succeeded = True
-            turn_will_retry = False
-            turn_error: str | None = None
-            try:
-                reply = await puffo.handle_message_batch(
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                )
-            except AgentAPIError as exc:
-                # Adapter surfaced an "API Error" string. Mark turn
-                # errored and re-raise; the consumer loop re-enqueues
-                # the batch with cursor preserved and backs off.
-                if getattr(exc, "is_auth", False):
-                    # Auth: skip the pointless kick-retries — flag
-                    # auth_failed + DM now; consumer abandons (redelivers).
-                    logger.warning(
-                        "agent %s: adapter auth error — flagging auth_failed, "
-                        "no kick-retry", agent_id,
-                    )
-                    self._enter_auth_failed(agent_id)
-                    turn_error = "auth error"
-                else:
-                    logger.warning("agent %s: api-error retry: %s", agent_id, exc)
-                    turn_error = "API Error"
-                reply = None
-                turn_succeeded = False
-                turn_will_retry = True
-                raise
-            except Exception as exc:
-                logger.error(
-                    "agent %s: handle_message_batch error: %s",
-                    agent_id, exc, exc_info=True,
-                )
-                reply = None
-                turn_succeeded = False
-                turn_error = f"{type(exc).__name__}: {exc}"
-            finally:
-                if turn_error:
-                    from .control.reporter import get_reporter
-
-                    asyncio.ensure_future(
-                        get_reporter().emit(agent_id, "error", {"error": turn_error})
-                    )
-                if run_id is not None and first_post_id:
-                    # First row reuses the /start run_id (server UPDATE); the rest get
-                    # fresh run_ids (server UPSERT, started_at = ended_at = now).
-                    runs: list[dict] = [{
-                        "run_id": run_id,
-                        "message_id": first_post_id,
-                        "succeeded": turn_succeeded,
-                        "error_text": turn_error,
-                    }]
-                    for msg in batch[1:]:
-                        mid = msg.get("envelope_id", "")
-                        if not mid:
-                            continue
-                        runs.append({
-                            "run_id": f"run_{uuid.uuid4().hex}",
-                            "message_id": mid,
-                            "succeeded": turn_succeeded,
-                            "error_text": turn_error,
-                        })
-                    await reporter.end_turn_batch(runs)
-                # AgentAPIError leaves in_progress for next batch's flip.
-                if turn_succeeded:
-                    try:
-                        self._resolve_health_after_success(agent_id)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: _resolve_health_on_success failed: %s",
-                            agent_id, exc,
-                        )
-                elif not turn_will_retry:
-                    try:
-                        Worker._fallback_unhandled_error_if_stuck_in_progress(
-                            self.runtime, agent_id, turn_error, logger,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: in_progress backstop failed: %s",
-                            agent_id, exc,
-                        )
-                # Clear turn context so post-turn background work
-                # doesn't inherit a stale channel/root. Hook
-                # fails-open when the file is absent.
-                try:
-                    current_turn_path.unlink()
-                except OSError:
-                    pass
-            # One batch = one "message" for the runtime counter; the
-            # display still reads as "N messages processed."
-            self.runtime.msg_count += 1
-            self.runtime.last_event_at = int(time.time())
-            if reply:
-                suppressed, backoff = _handle_suppressed_reply(
-                    reply,
-                    self.runtime,
-                    agent_id,
-                    scope="fallback",
-                    on_auth_failure=self._notify_refresh_needed,
-                    on_auth_failed_enter=self._on_auth_failed_enter,
-                    auth_error_message=self._auth_failed_error(
-                        self._claude_api_key_mode,
-                    ),
-                )
-                if suppressed:
-                    await asyncio.sleep(backoff)
-                else:
-                    # Fallback reply when the agent skipped both
-                    # send_message and [SILENT].
-                    await client.send_fallback_message(
-                        channel_id, reply, root_id=root_id,
-                    )
-
-        async def on_api_error_retry(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            """Kick-retry path after an ``AgentAPIError``. Calls the
-            agent's retry method, which sends a small "session
-            errored on rate limiting, please resume processing"
-            kick to claude-code over ``--resume`` instead of
-            re-appending the original batch. If ``--resume`` is no
-            longer valid, the adapter falls back to the full
-            ``batch`` payload on its own.
-
-            Raises ``AgentAPIError`` again if the kick also surfaces
-            the rate limit, so the consumer's outer retry loop can
-            apply another backoff or give up after the cap.
-            """
-            channel_id = channel_meta.get("channel_id", "")
-            reply = await puffo.handle_api_error_retry(
-                root_id=root_id,
-                channel_meta=channel_meta,
-                fallback_batch=batch,
-            )
-            self.runtime.msg_count += 1
-            self.runtime.last_event_at = int(time.time())
-            if reply:
-                suppressed, backoff = _handle_suppressed_reply(
-                    reply,
-                    self.runtime,
-                    agent_id,
-                    scope="api-error-retry",
-                    on_auth_failure=self._notify_refresh_needed,
-                    on_auth_failed_enter=self._on_auth_failed_enter,
-                    auth_error_message=self._auth_failed_error(
-                        self._claude_api_key_mode,
-                    ),
-                )
-                if suppressed:
-                    # Hottest leak site (FB-88 / FB-159 case-studies).
-                    # Backoff samples instead of hammering when the
-                    # underlying limit / outage is still active.
-                    await asyncio.sleep(backoff)
-                else:
-                    await client.send_fallback_message(
-                        channel_id, reply, root_id=root_id,
-                    )
-
-        async def on_api_error_abandon(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-            attempts: int,
-        ):
-            """PUF-252: surface the abandoned-batch state on
-            ``runtime`` so the discoverable-action affordance has a
-            signal to render. Pre-PUF-252 the abandon was silent and
-            Sam's Scout appeared ``state=running`` even though the
-            consumer had given up on the pending DM. Now
-            ``runtime.health`` flips to ``api_error_abandoned`` +
-            ``runtime.error`` carries a human-readable summary.
-
-            UI consumers live in Nova's lane: **FB-197**
-            (agent-state status dot) + **FB-198** (restart lever),
-            both folded into the Operator Action Panel cluster
-            alongside FB-67 / PUF-220 / PUF-248 / PUF-250 / FB-179.
-            Deliberately NO auto-recovery here -- per the
-            ``feedback_dedup_triage_policy.md`` revision at PUF-249
-            closure, platform doesn't substitute for user-action
-            when user-action exists. Auto-recovery is storage-
-            shaped-defense-with-time-delay; same rejection criterion
-            as throttling. FB-198's restart lever is the right
-            recovery surface; this hook just feeds it honest data.
-            """
-            self.runtime.health = "api_error_abandoned"
-            self.runtime.error = (
-                f"Worker abandoned a batch on thread {root_id} after "
-                f"{attempts} rate-limit kick-retries. The agent has "
-                "gone silent on this thread until a new message "
-                "arrives OR the agent is refreshed/restarted."
-            )
-            self.runtime.save(agent_id)
-            logger.warning(
-                "agent %s: api-error-abandon on thread %s (attempts=%d)",
-                agent_id, root_id, attempts,
-            )
-
-        async def on_turn_success(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            Worker._clear_api_error_abandoned_if_recoverable(
-                self.runtime, agent_id, root_id, logger,
-            )
-            # retry-success path bypasses on_message_batch's finally.
-            self._resolve_health_after_success(agent_id)
-
-        async def heartbeat():
-            interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
-            while not self._stop.is_set():
-                self.runtime.save(agent_id)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass
-
-        # Per-agent credential_refresh coroutine retired; CredentialRefresher
-        # owns the loop daemon-wide (single writer, no rotation race).
-
-        # Status reporter: heartbeat task + inline begin/end_turn; no-op
-        # without an http client (tests). Lazy provider reads live runtime.health.
-        reporter = (
-            StatusReporter(
-                client.http,
-                runtime_health_provider=lambda: self.runtime.health,
-                runtime_provider=self._runtime_info,
-            )
-            if hasattr(client, "http")
-            else None
-        )
-        if reporter is None:  # pragma: no cover — defensive
-            class _NoopReporter:
-                async def begin_turn(self, _mid):
-                    return None
-                async def end_turn(self, *_a, **_kw):
-                    return None
-                async def end_turn_batch(self, *_a, **_kw):
-                    return None
-                async def report_error(self, _t):
-                    return None
-                async def run_heartbeat_loop(self):
-                    return None
-                def stop(self):
-                    return None
-            reporter = _NoopReporter()  # type: ignore[assignment]
-
-        hb_task = asyncio.ensure_future(heartbeat())
-        status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
-        try:
-            while not self._stop.is_set():
-                try:
-                    await client.listen(
-                        on_message=on_message_batch,
-                        on_api_error_retry=on_api_error_retry,
-                        on_api_error_abandon=on_api_error_abandon,
-                        on_turn_success=on_turn_success,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning(
-                        "agent %s: listen() crashed: %s: %s — reconnecting in %.1fs",
-                        agent_id, type(exc).__name__, exc, RECONNECT_BACKOFF_SECONDS,
-                    )
-                    self.runtime.error = f"{type(exc).__name__}: {exc}"
-                    self.runtime.save(agent_id)
-                    # Surface the failure on the agent's row so the
-                    # operator sees it without tailing logs.
-                    try:
-                        await reporter.report_error(self.runtime.error or "listen crashed")
-                    except Exception:
-                        pass
-                if self._stop.is_set():
-                    break
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=RECONNECT_BACKOFF_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            reporter.stop()
-            hb_task.cancel()
-            status_task.cancel()
-            for task in (hb_task, status_task):
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            self.runtime.status = "stopped"
-            self.runtime.save(agent_id)
+        await StandardWorkerRun(self).run()
 
 
 async def _process_refresh_flags(
@@ -1677,49 +1713,38 @@ async def _process_refresh_flags(
     refresh_agent_flag: Path,
     refresh_host_sync_flag: Path,
     refresh_session_flag: Path,
-) -> None:
-    """Consume any worker-scope refresh flags into a single
-    ``adapter.reload(prompt, with_session=…)`` call at turn start.
-    Order: host sync → CLAUDE.md rebuild → session drop. A changed
-    primer/profile slice drops the session too (``--resume`` would replay
-    the stale baked prompt); memory-only or no-op rebuilds keep it."""
-    host_sync_seen = refresh_host_sync_flag.exists()
-    agent_seen = refresh_agent_flag.exists()
-    session_seen = refresh_session_flag.exists()
-    if not (host_sync_seen or agent_seen or session_seen):
-        return
+    refresh_provider_auth_flag: Path,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
+    puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
+) -> bool:
+    """Consume worker refresh flags in one idle-boundary adapter reload.
+
+    Resource and credential changes preserve session identity. Only an explicit
+    session refresh starts a new logical and native provider conversation.
+
+    Returns whether the reload succeeded. On failure the flag files are
+    kept byte-for-byte (their content may carry scheduling fields owned
+    by the daemon) so the next turn-start or watcher tick retries; the
+    caller owns the give-up policy (``Worker._note_refresh_reload``).
+    Everything that runs before the reload is idempotent re-run work.
+    """
+    host_sync_seen = _refresh_flag_is_pending(refresh_host_sync_flag)
+    agent_seen = _refresh_flag_is_pending(refresh_agent_flag)
+    session_seen = _refresh_flag_is_pending(refresh_session_flag)
+    provider_auth_exists = refresh_provider_auth_flag.exists()
+    provider_auth_seen = _refresh_flag_is_pending(refresh_provider_auth_flag)
+    if provider_auth_exists and (host_sync_seen or agent_seen or session_seen):
+        provider_auth_seen = True
+    if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
+        return True
 
     if host_sync_seen:
-        try:
-            if harness_name == "codex":
-                # TODO: Implement Codex host sync for both cli-local and
-                # cli-docker instead of requiring a worker restart.
-                logger.info(
-                    "agent %s: refresh_host_sync for Codex is deferred until "
-                    "the worker restarts",
-                    agent_id,
-                )
-            else:
-                from .state import (
-                    agent_home_dir,
-                    sync_host_mcp_servers,
-                    sync_host_skills,
-                )
-                host_home = Path.home()
-                ah = agent_home_dir(agent_id)
-                skill_count = sync_host_skills(host_home, ah)
-                merged_mcp, _unreach = sync_host_mcp_servers(host_home, ah)
-                logger.info(
-                    "agent %s: refresh_host_sync (skills=%d mcp=%d)",
-                    agent_id, skill_count, merged_mcp,
-                )
-        except Exception as exc:
-            logger.warning(
-                "agent %s: refresh_host_sync failed: %s", agent_id, exc,
-            )
+        _sync_refresh_host_assets(agent_id)
 
     new_prompt: str | None = None
-    prompt_changed = False
     if agent_seen:
         try:
             new_prompt = _rebuild_managed_system_prompt(
@@ -1729,41 +1754,93 @@ async def _process_refresh_flags(
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=display_name,
+                role=role,
+                role_short=role_short,
+                puffo_handle=puffo_handle,
+                workspace_shared_status=workspace_shared_status,
             )
-            from ..agent.shared_content import MEMORY_SECTION_HEADER
-
-            def _session_core(prompt: str) -> str:
-                return prompt.split(MEMORY_SECTION_HEADER, 1)[0]
-
-            prompt_changed = _session_core(new_prompt) != _session_core(
-                puffo.system_prompt
-            )
+            prompt_changed = new_prompt != puffo.system_prompt
             puffo.system_prompt = new_prompt
             logger.info(
                 "agent %s: system prompt rebuilt from disk (changed=%s)",
-                agent_id, prompt_changed,
+                agent_id,
+                prompt_changed,
             )
         except Exception as exc:
             logger.warning(
-                "agent %s: refresh_agent failed: %s", agent_id, exc,
+                "agent %s: refresh_agent failed: %s",
+                agent_id,
+                exc,
             )
 
     try:
         await adapter.reload(
             new_prompt if new_prompt is not None else puffo.system_prompt,
-            with_session=session_seen or prompt_changed,
+            with_session=session_seen,
         )
+        if provider_auth_seen:
+            logger.info(
+                "agent %s: provider runtime reloaded after credential replacement",
+                agent_id,
+            )
     except Exception as exc:
         logger.warning(
-            "agent %s: adapter.reload after refresh failed: %s",
-            agent_id, exc,
+            "agent %s: adapter.reload after refresh failed "
+            "(flags kept for retry): %s",
+            agent_id,
+            exc,
         )
+        return False
 
-    for flag in (refresh_host_sync_flag, refresh_agent_flag, refresh_session_flag):
+    _pin_refreshed_generation(agent_id)
+    _unlink_refresh_flags(
+        refresh_host_sync_flag, refresh_agent_flag,
+        refresh_session_flag, refresh_provider_auth_flag,
+    )
+    return True
+
+
+def _pin_refreshed_generation(agent_id: str) -> None:
+    """The refresh reload rebuilt the spec and minted a fresh mcp
+    generation: pin it at the switch (see
+    ``rpc_service.pin_mcp_generation``)."""
+    from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+    from . import rpc_service
+
+    mgr = get_runtime_manager(agent_id)
+    if mgr is not None and mgr.spec.mcp_generation:
+        rpc_service.pin_mcp_generation(agent_id, mgr.spec.mcp_generation)
+
+
+def _unlink_refresh_flags(*flags: Path) -> None:
+    for flag in flags:
         try:
             flag.unlink()
         except OSError:
             pass
+
+
+def _sync_refresh_host_assets(agent_id: str) -> None:
+    try:
+        from .state import agent_home_dir, sync_host_mcp_servers, sync_host_skills
+
+        host_home = Path.home()
+        agent_home = agent_home_dir(agent_id)
+        skill_count = sync_host_skills(host_home, agent_home)
+        merged_mcp, _unreachable = sync_host_mcp_servers(host_home, agent_home)
+        logger.info(
+            "agent %s: refresh_host_sync (skills=%d mcp=%d)",
+            agent_id,
+            skill_count,
+            merged_mcp,
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent %s: refresh_host_sync failed: %s",
+            agent_id,
+            exc,
+        )
 
 
 _CLAUDE_DIR_SUBDIRS = ("agents", "commands", "skills", "hooks")

@@ -9,9 +9,9 @@ duplicate prompts in the operator's confirm thread (~10× on Sam's
 host per Tier-1 screenshot evidence).
 
 We don't drive the real ``listen()`` here — it spins up a WS
-connection + priority queue + a consumer task — but we can pin the
-invariant the fix preserves: ``_processed_invite_ids`` initialised
-on ``__init__`` survives subsequent listen-style operations, and
+connection and background transport tasks — but we can pin the invariant
+the fix preserves: ``_processed_invite_ids`` initialised on ``__init__``
+survives subsequent listen-style operations, and
 ``_poll_pending_invites`` doesn't re-emit a DM for an already-
 processed invite even when fed the same server response twice.
 """

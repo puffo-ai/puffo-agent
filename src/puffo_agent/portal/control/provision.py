@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import time
 from typing import Any
@@ -12,8 +11,16 @@ from typing import Any
 from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode
 from ...crypto.primitives import ed25519_verify
-from ...mcp.config import INFERENCE_LEVELS
-from ..runtime_matrix import validate_triple
+from ...mcp.config import supported_inference_levels
+from ..host_assets import _atomic_write_private, _ensure_private_directory
+from ..runtime_matrix import (
+    RUNTIME_CLI_LOCAL,
+    migrate_legacy_kind,
+    normalize_inference_level,
+    resolve_effective_harness,
+    resolve_effective_provider,
+    validate_triple,
+)
 from ..state import (
     AgentConfig,
     PuffoCoreConfig,
@@ -33,9 +40,9 @@ MAX_ROLE_SHORT_LEN = 32
 
 
 class ProvisionError(Exception):
-    def __init__(self, reason: str, **fields: Any) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.reason = message
         self.fields = fields
 
 
@@ -72,6 +79,43 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
     if not all(isinstance(item, dict) for item in (bundle, core, runtime_input)):
         raise ProvisionError("identity_bundle, puffo_core, and runtime are required")
 
+    bound_slug, device_cert = _verify_identity_bundle(
+        bundle,
+        operator_key,
+        operator_root_key_b64,
+    )
+    core_fields = _verify_core(core, bound_slug, device_cert)
+    profile_fields = _verify_profile(payload, bound_slug)
+    runtime = _verify_runtime(runtime_input)
+    desired_skills, desired_mcps = _verify_desired(payload)
+    server_url, slug, device_id, space_id, operator_slug = core_fields
+    display_name, avatar_url, role, role_short, profile_text = profile_fields
+    return {
+        "agent_id": slug,
+        "display_name": display_name,
+        "avatar_url": avatar_url,
+        "role": role,
+        "role_short": role_short,
+        "profile_text": profile_text,
+        "server_url": server_url,
+        "slug": slug,
+        "device_id": device_id,
+        "space_id": space_id,
+        "operator_slug": operator_slug,
+        "runtime": runtime,
+        "desired_skills": desired_skills,
+        "desired_mcps": desired_mcps,
+        "bundle": bundle,
+    }
+
+
+def _verify_identity_bundle(
+    bundle: dict,
+    operator_key: bytes,
+    operator_root_key_b64: str,
+) -> tuple[str, dict]:
+    """Validate the signed identity chain and return its bound slug/device."""
+
     identity_cert = bundle.get("identity_cert")
     device_cert = bundle.get("device_cert")
     attestation = bundle.get("operator_attestation")
@@ -104,6 +148,15 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         _verify_attestation(attestation, agent_key, operator_key)
     except CertError as exc:
         raise ProvisionError(str(exc)) from exc
+    return bound_slug, device_cert
+
+
+def _verify_core(
+    core: dict,
+    bound_slug: str,
+    device_cert: dict,
+) -> tuple[str, str, str, str, str]:
+    """Validate the server addressing block against the signed identity."""
 
     server_url = str(core.get("server_url") or "").strip()
     slug = str(core.get("slug") or "").strip()
@@ -120,6 +173,11 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         raise ProvisionError("puffo_core.device_id != device_cert.device_id")
     if not is_valid_agent_id(slug):
         raise ProvisionError(f"slug {slug!r} is not a valid agent id")
+    return server_url, slug, device_id, space_id, operator_slug
+
+
+def _verify_profile(payload: dict, slug: str) -> tuple[str, str, str, str, str]:
+    """Validate user-visible profile fields and derive the role chip."""
 
     display_name = str(payload.get("display_name") or slug).strip() or slug
     avatar_url = str(payload.get("avatar_url") or "").strip()
@@ -148,24 +206,62 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
     profile_text = payload.get("profile")
     if not isinstance(profile_text, str) or not profile_text.strip():
         raise ProvisionError("profile (markdown body) is required")
+    return display_name, avatar_url, role, role_short, profile_text
 
+
+def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
+    """Build a runtime config that is valid for its effective harness."""
+
+    raw_kind = str(runtime_input.get("kind", RUNTIME_CLI_LOCAL))
+    kind = migrate_legacy_kind(raw_kind, agent_id="control-provision")
+    provider = str(runtime_input.get("provider", ""))
+    harness = str(runtime_input.get("harness", "claude-code"))
+    inference_level = str(runtime_input.get("inference_level", ""))
+    harness_command = runtime_input.get("harness_command") or []
+    if not isinstance(harness_command, list) or not all(
+        isinstance(item, str) and item for item in harness_command
+    ):
+        raise ProvisionError(
+            "runtime.harness_command must be a list of non-empty strings"
+        )
+    if raw_kind != kind and not validate_triple(kind, provider, harness).ok:
+        harness = resolve_effective_harness(kind, provider, "")
+        inference_level = normalize_inference_level(
+            kind, provider, harness, inference_level
+        )
     runtime = RuntimeConfig(
-        kind=str(runtime_input.get("kind", "chat-local")),
-        provider=str(runtime_input.get("provider", "")),
+        kind=kind,
+        provider=provider,
         model=str(runtime_input.get("model", "")),
         api_key=str(runtime_input.get("api_key", "")),
-        harness=str(runtime_input.get("harness", "claude-code")),
+        harness=harness,
+        harness_command=list(harness_command),
         permission_mode=str(runtime_input.get("permission_mode", "bypassPermissions")),
-        inference_level=str(runtime_input.get("inference_level", "")),
+        inference_level=inference_level,
         max_turns=int(runtime_input.get("max_turns", 10)),
     )
     validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
-    if runtime.inference_level and runtime.inference_level not in INFERENCE_LEVELS:
+    if runtime.kind == RUNTIME_CLI_LOCAL and runtime.harness == "acp" and not runtime.harness_command:
         raise ProvisionError(
-            "runtime.inference_level must be one of: " + ", ".join(INFERENCE_LEVELS)
+            "runtime.harness_command is required when runtime.harness='acp'"
         )
+    effective_harness = resolve_effective_harness(
+        runtime.kind,
+        resolve_effective_provider(runtime.kind, runtime.provider),
+        runtime.harness,
+    )
+    levels = supported_inference_levels(effective_harness)
+    if runtime.inference_level and runtime.inference_level not in levels:
+        raise ProvisionError(
+            "runtime.inference_level must be one of: " + ", ".join(levels)
+        )
+    return runtime
+
+
+def _verify_desired(payload: dict) -> tuple[list[str], list[str]]:
+    """Validate operator-selected skill and MCP template identifiers."""
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []
     if not isinstance(desired_skills, list) or not all(
@@ -176,29 +272,13 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         isinstance(value, str) and value for value in desired_mcps
     ):
         raise ProvisionError("desired_mcps must be a list of non-empty template-id strings")
-    return {
-        "agent_id": slug,
-        "display_name": display_name,
-        "avatar_url": avatar_url,
-        "role": role,
-        "role_short": role_short,
-        "profile_text": profile_text,
-        "server_url": server_url,
-        "slug": slug,
-        "device_id": device_id,
-        "space_id": space_id,
-        "operator_slug": operator_slug,
-        "runtime": runtime,
-        "desired_skills": list(desired_skills),
-        "desired_mcps": list(desired_mcps),
-        "bundle": bundle,
-    }
+    return list(desired_skills), list(desired_mcps)
 
 
 def _write_keystore(context: dict) -> None:
     bundle = context["bundle"]
     target = agent_dir(context["agent_id"]) / "keys" / f"{context['slug']}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(target.parent)
     stored = {
         "slug": context["slug"],
         "device_id": context["device_id"],
@@ -209,9 +289,7 @@ def _write_keystore(context: dict) -> None:
         "identity_cert_json": json.dumps(bundle["identity_cert"]),
         "slug_binding_json": json.dumps(bundle["slug_binding"]),
     }
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(json.dumps(stored, indent=2), encoding="utf-8")
-    os.replace(temporary, target)
+    _atomic_write_private(target, json.dumps(stored, indent=2))
 
 
 def write_agent_from_context(context: dict) -> dict:
@@ -222,7 +300,9 @@ def write_agent_from_context(context: dict) -> dict:
     if target.exists():
         raise ProvisionError(f"agent directory {target} already exists")
     try:
-        target.mkdir(parents=True, exist_ok=False)
+        _ensure_private_directory(target.parent)
+        target.mkdir(mode=0o700, exist_ok=False)
+        _ensure_private_directory(target)
         AgentConfig(
             id=agent_id,
             state="running",
@@ -253,9 +333,15 @@ def write_agent_from_context(context: dict) -> dict:
 
 
 async def provision_agent_from_bundle(
-    payload: dict, operator_root_key_b64: str, *, materialize=None,
+    payload: dict,
+    operator_root_key_b64: str,
+    *,
+    preflight=None,
+    materialize=None,
 ) -> dict:
     context = verify_agent_bundle(payload, operator_root_key_b64)
+    if preflight is not None:
+        await preflight(context)
     if materialize is not None:
         await materialize(context)
     result = write_agent_from_context(context)

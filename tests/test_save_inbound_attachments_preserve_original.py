@@ -15,7 +15,13 @@ from types import SimpleNamespace
 
 from PIL import Image
 
+from puffo_agent.agent import bridge_transport
+from puffo_agent.agent import inbound_attachments
 from puffo_agent.agent import puffo_core_client as pcc
+from puffo_agent.agent.bridge_transport import (
+    payload_from_bridge_frame,
+    save_inbound_bridge_attachments,
+)
 from puffo_agent.agent.puffo_core_client import (
     _DEFAULT_IMAGE_EDGE_PX,
     _HIGH_RES_IMAGE_EDGE_PX,
@@ -23,11 +29,11 @@ from puffo_agent.agent.puffo_core_client import (
 )
 
 
-def _meta(blob_id: str, filename: str) -> dict:
+def _meta(blob_id: str, filename: str, mime_type: str = "image/png") -> dict:
     return {
         "blob_id": blob_id,
         "filename": filename,
-        "mime_type": "image/png",
+        "mime_type": mime_type,
         "size": 0,
         "key": "a" * 43,
         "nonce": "b" * 16,
@@ -231,6 +237,148 @@ def test_non_image_attachment_keeps_bare_name(tmp_path, monkeypatch):
     assert paths == [str(inbox / "notes.txt")]
 
 
+def test_inbound_attachment_count_and_byte_limits(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_attachments, "MAX_INBOUND_ATTACHMENT_BYTES", 8)
+    monkeypatch.setattr(
+        inbound_attachments,
+        "MAX_INBOUND_ATTACHMENT_TOTAL_BYTES",
+        10,
+    )
+    payloads = {
+        "actual-too-large": b"x" * 9,
+        "first": b"a" * 6,
+        "aggregate-too-large": b"b" * 6,
+        "past-count-cap": b"late",
+    }
+    fetched: list[str] = []
+
+    async def fake_fetch(_http, blob_id):
+        fetched.append(blob_id)
+        return payloads[blob_id]
+
+    monkeypatch.setattr(pcc, "_fetch_blob_with_retry", fake_fetch)
+    monkeypatch.setattr(
+        "puffo_agent.crypto.attachments.decrypt_attachment",
+        lambda ciphertext, _meta: ciphertext,
+    )
+    declared = _meta("declared-too-large", "declared.bin")
+    declared["size"] = 9
+    first = _meta("first", "first.bin")
+    first["size"] = 6
+    aggregate = _meta("aggregate-too-large", "aggregate.bin")
+    aggregate["size"] = 6
+    refs = [
+        declared,
+        _meta("actual-too-large", "actual.bin"),
+        first,
+        aggregate,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        _meta("past-count-cap", "late.bin"),
+    ]
+
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            _stub_self(tmp_path),
+            envelope_id="env_limits",
+            metas_raw=refs,
+        )
+    )
+
+    expected = tmp_path / ".puffo" / "inbox" / "env_limits" / "first.bin"
+    assert paths == [str(expected)]
+    assert expected.read_bytes() == b"a" * 6
+    assert fetched == ["actual-too-large", "first"]
+
+
+def test_inbound_image_pixel_cap_is_checked_before_decode(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_attachments, "MAX_INBOUND_IMAGE_PIXELS", 50)
+    _patch_decrypt(monkeypatch, {"blob-1": _png_bytes(10, 10)})
+
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            _stub_self(tmp_path),
+            envelope_id="env_pixel_cap",
+            metas_raw=[_meta("blob-1", "large-raster.png")],
+        )
+    )
+
+    assert paths == []
+    assert not (
+        tmp_path / ".puffo" / "inbox" / "env_pixel_cap" / "large-raster.png"
+    ).exists()
+
+
+def test_non_image_attachment_skips_image_dimension_checks(tmp_path, monkeypatch):
+    """A text attachment must not be opened by Pillow or emit image warnings."""
+    _patch_decrypt(monkeypatch, {"blob-1": b"plain text"})
+    scale_calls: list[Path] = []
+
+    def scale_image(path, original_path, edge_px):
+        scale_calls.append(path)
+        return False
+
+    paths = asyncio.run(
+        inbound_attachments.save_inbound_attachments(
+            workspace=str(tmp_path),
+            envelope_id="env_text",
+            metas_raw=[_meta("blob-1", "notes.txt", "text/plain")],
+            image_edge_px=_DEFAULT_IMAGE_EDGE_PX,
+            http=object(),
+            log=logging.getLogger("puf-text-test"),
+            fetch_blob=lambda _http, _blob_id: asyncio.sleep(0, result=b"plain text"),
+            strip_wrapper=lambda data: data,
+            scale_image=scale_image,
+        )
+    )
+
+    expected = tmp_path / ".puffo" / "inbox" / "env_text" / "notes.txt"
+    assert paths == [str(expected)]
+    assert expected.read_bytes() == b"plain text"
+    assert scale_calls == []
+
+
+def test_bridge_non_image_attachment_skips_image_normalization(
+    tmp_path, monkeypatch,
+):
+    """The bridge lane applies the same non-image gate as native delivery."""
+
+    class Bridge:
+        async def download_blob(self, _blob_id):
+            return b"plain text"
+
+    async def fail_normalize(**_kwargs):
+        raise AssertionError("text attachment must not enter image normalization")
+
+    monkeypatch.setattr(bridge_transport, "normalize_saved_image", fail_normalize)
+    stub = SimpleNamespace(
+        workspace=str(tmp_path),
+        _log=logging.getLogger("puf-bridge-text-test"),
+        _bridge=Bridge(),
+        _image_edge_px=_DEFAULT_IMAGE_EDGE_PX,
+    )
+
+    paths = asyncio.run(
+        save_inbound_bridge_attachments(
+            stub,
+            envelope_id="env_bridge_text",
+            refs=[{
+                "blob_id": "blob-1",
+                "filename": "notes.txt",
+                "mime_type": "text/plain",
+            }],
+        )
+    )
+
+    expected = tmp_path / ".puffo" / "inbox" / "env_bridge_text" / "notes.txt"
+    assert paths == [str(expected)]
+    assert expected.read_bytes() == b"plain text"
+
+
 def test_mixed_envelope_only_oversized_splits(tmp_path, monkeypatch):
     """A single envelope with text + small image + oversized image: only the
     oversized one gets the compressed/origin split."""
@@ -264,3 +412,60 @@ def test_mixed_envelope_only_oversized_splits(tmp_path, monkeypatch):
         str(inbox / "thumb.png"),
         str(inbox / "big.compressed.png"),
     }
+
+
+def test_traversal_envelope_id_and_unnamed_blob_stay_inside_the_inbox(
+    tmp_path, monkeypatch
+):
+    """The envelope id is a directory name and the filename may be empty.
+
+    A traversal-shaped ``envelope_id`` reached ``mkdir(parents=True)``
+    verbatim on both savers and became the store's primary key on the one
+    lane the Server does not format-check, and the native saver's filename
+    fallback was the raw ``blob_id`` — a server-issued string, not a path
+    component. Everything now stays under ``<workspace>/.puffo/inbox/``.
+    """
+    _patch_decrypt(monkeypatch, {"a/../../blob-9": _png_bytes(10, 10)})
+    stub = _stub_self(tmp_path)
+    meta = _meta("a/../../blob-9", "shot.png")
+
+    escaped = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="../../evil", metas_raw=[meta],
+        )
+    )
+    assert escaped == []
+    assert not (tmp_path.parent / "evil").exists()
+    assert not (tmp_path / ".puffo").exists()
+
+    # Same rejection on the keyless lane: at the saver, and at frame parse
+    # before the id can become a primary key.
+    bridge_stub = SimpleNamespace(
+        workspace=str(tmp_path),
+        _log=logging.getLogger("puf308-test"),
+        _bridge=object(),
+        _image_edge_px=_DEFAULT_IMAGE_EDGE_PX,
+    )
+    assert asyncio.run(
+        save_inbound_bridge_attachments(
+            bridge_stub,
+            envelope_id="../../evil",
+            refs=[{"blob_id": "blob-9", "filename": "shot.png"}],
+        )
+    ) == []
+    assert payload_from_bridge_frame(
+        bridge_stub, {"envelope_id": "../../evil", "plaintext": "x"},
+    ) is None
+    assert not (tmp_path / ".puffo").exists()
+
+    # Empty filename ⇒ the blob_id fallback, basename-reduced.
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub,
+            envelope_id="msg_a1b2",
+            metas_raw=[_meta("a/../../blob-9", "")],
+        )
+    )
+    inbox = tmp_path / ".puffo" / "inbox" / "msg_a1b2"
+    assert paths == [str(inbox / "blob-9")]
+    assert [p.name for p in inbox.iterdir()] == ["blob-9"]

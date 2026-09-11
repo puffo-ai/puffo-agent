@@ -11,6 +11,11 @@ import textwrap
 
 import pytest
 
+# ``_scan_mcp_servers`` lives in ``widgets/agent_detail`` which imports
+# PySide6 at module level; PySide6 now ships only in the ``[gui]`` extra.
+# Skip this file when the extra isn't installed rather than failing.
+pytest.importorskip("PySide6")
+
 
 @pytest.fixture(autouse=True)
 def _qt_offscreen(monkeypatch):

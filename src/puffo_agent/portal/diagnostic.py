@@ -6,8 +6,8 @@ subcommand:
 
   - Returns a structured ``ProbeReport`` (markdown) on stdout.
   - Classifies each step as ``OK`` / ``FAIL`` / ``NEEDS_ATTENTION``.
-  - Redacts secrets aggressively — token strings are shown only as
-    ``len=NNN sha256_prefix=XXXXXXXX``, never raw.
+  - Redacts secrets aggressively — token strings are shown only by length,
+    never raw or as a reusable fingerprint.
 
 Cross-platform: every subcommand runs everywhere, but non-Darwin hosts
 get a ``skipped: not applicable`` body so Linux/Windows reviewers can
@@ -17,7 +17,6 @@ also sanity-check the output format.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -101,12 +100,12 @@ class ProbeReport:
 # Secret-safe printing
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _redact_token(s: str) -> str:
-    """Show length + sha256 prefix, never raw token."""
+    """Show only token length, never raw content or a stable fingerprint."""
     if not s:
         return "(empty)"
-    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-    return f"len={len(s)} sha256_prefix={digest}"
+    return f"len={len(s)}"
 
 
 def _summarise_blob(raw: str) -> str:
@@ -127,9 +126,7 @@ def _summarise_blob(raw: str) -> str:
 
 def _access_token(blob: str) -> str:
     try:
-        return (
-            (json.loads(blob).get("claudeAiOauth") or {}).get("accessToken")
-        ) or ""
+        return ((json.loads(blob).get("claudeAiOauth") or {}).get("accessToken")) or ""
     except json.JSONDecodeError:
         return ""
 
@@ -137,6 +134,7 @@ def _access_token(blob: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Probes
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def probe_keychain_read() -> ProbeReport:
     """Step 1: can the daemon read the Keychain entry?"""
@@ -271,13 +269,21 @@ def probe_refresh_flush() -> ProbeReport:
     try:
         proc = subprocess.run(
             [
-                claude_bin, "--dangerously-skip-permissions",
-                "--print", "--max-turns", "1",
-                "--output-format", "stream-json", "--verbose",
+                claude_bin,
+                "--dangerously-skip-permissions",
+                "--print",
+                "--max-turns",
+                "1",
+                "--output-format",
+                "stream-json",
+                "--verbose",
                 "ok",
             ],
-            env=env, cwd=str(host_home),
-            capture_output=True, text=True, timeout=90,
+            env=env,
+            cwd=str(host_home),
+            capture_output=True,
+            text=True,
+            timeout=90,
         )
         code = proc.returncode
         stderr_tail = (proc.stderr or "")[-500:]
@@ -290,8 +296,7 @@ def probe_refresh_flush() -> ProbeReport:
         rpt.add(
             "claude-oneshot",
             VERDICT_FAIL,
-            f"exit={code}, elapsed_ms={elapsed_ms}\n"
-            f"stderr (last 500): {stderr_tail}",
+            f"exit={code}, elapsed_ms={elapsed_ms}\nstderr (last 500): {stderr_tail}",
         )
         return rpt
     rpt.add("claude-oneshot", VERDICT_OK, f"exit=0, elapsed_ms={elapsed_ms}")
@@ -304,30 +309,24 @@ def probe_refresh_flush() -> ProbeReport:
             f"re-read after claude oneshot failed: {post.error}",
         )
         return rpt
-    new_token = _access_token(post.blob)
+    _report_refresh_outcome(rpt, old_token, _access_token(post.blob))
+    return rpt
+
+
+def _report_refresh_outcome(rpt: ProbeReport, old_token: str, new_token: str) -> None:
     rotated = bool(new_token) and old_token != new_token
     rpt.add(
         "keychain-after",
         VERDICT_OK if rotated else VERDICT_NEEDS_ATTENTION,
         "token rotated: {}\nold: {}\nnew: {}".format(
-            rotated, _redact_token(old_token), _redact_token(new_token),
+            rotated, _redact_token(old_token), _redact_token(new_token)
         ),
     )
-
-    if rotated:
-        rpt.summary = (
-            "Refresh flush works — claude rotated the token and the new "
-            "value is live in Keychain."
-        )
-    else:
-        rpt.summary = (
-            "claude exited OK but the token wasn't rotated — current "
-            "token is still valid, so claude correctly skipped the "
-            "OAuth round-trip. The production refresh path is "
-            "exercised whenever the daemon's poll hits a "
-            "naturally-expiring token (within ~10 min of expiresAt)."
-        )
-    return rpt
+    rpt.summary = (
+        "Refresh flush works — claude rotated the token and the new value is live in Keychain."
+        if rotated
+        else "claude exited OK but the token wasn't rotated — current token is still valid, so claude correctly skipped the OAuth round-trip. The production refresh path is exercised whenever the daemon's poll hits a naturally-expiring token (within ~10 min of expiresAt)."
+    )
 
 
 def probe_full() -> ProbeReport:
@@ -357,9 +356,7 @@ def probe_full() -> ProbeReport:
     if overall == VERDICT_OK:
         rpt.summary = "All probes green."
     elif overall == VERDICT_NEEDS_ATTENTION:
-        rpt.summary = (
-            "Some probes flagged NEEDS_ATTENTION — review each item."
-        )
+        rpt.summary = "Some probes flagged NEEDS_ATTENTION — review each item."
     else:
         rpt.summary = "At least one probe FAILED."
     return rpt
@@ -368,6 +365,7 @@ def probe_full() -> ProbeReport:
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI plumbing
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _print_report(rpt: ProbeReport, *, save_to: Optional[Path] = None) -> int:
     body = rpt.render_markdown()

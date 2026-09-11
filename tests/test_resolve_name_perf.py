@@ -38,6 +38,7 @@ def _bare_client(http: _FakeHttp) -> PuffoCoreMessageClient:
     client.http = http  # type: ignore[assignment]
     client._space_name_cache = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     return client
 
 

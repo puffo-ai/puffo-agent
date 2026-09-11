@@ -4,15 +4,26 @@ validation layer, and the hook's puffo-core transport."""
 
 from __future__ import annotations
 
-import json
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import pytest
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient as AiohttpTestClient, TestServer
 
 from puffo_agent.portal import rpc_service
-from puffo_agent.portal import host_mcp_handler
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
+from puffo_agent.portal.local_service_auth import (
+    issue_local_service_token,
+    local_service_headers,
+)
+
+
+class TestClient(AiohttpTestClient):
+    async def _request(self, method, path, **kwargs):
+        agent_id = unquote(urlsplit(str(path)).path.split("/")[3])
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.update(local_service_headers(issue_local_service_token(agent_id)))
+        return await super()._request(method, path, headers=headers, **kwargs)
 
 
 class _StubMessageClient:
@@ -163,130 +174,3 @@ async def test_permission_request_end_to_end_over_socket(app_client_factory):
     assert (await resp.json()) == {"message": "allow"}
     assert sent[0]["text"].startswith("/permission ")
     assert any("Approved" in d["text"] for d in sent)
-
-
-# ─── hook transport (puffo-core branch) ───────────────────────────────
-
-
-def _run_rpc_hook(monkeypatch, capsys, *, response=None, error=None):
-    """Drive hooks.permission.request_via_rpc with a stubbed transport;
-    returns (SystemExit.code, stdout, stderr)."""
-    from puffo_agent.hooks import permission as hook
-
-    def _stub_post(url, headers, payload, timeout=10.0):
-        _stub_post.called = {"url": url, "payload": payload, "timeout": timeout}
-        if error is not None:
-            raise error
-        return response
-
-    _stub_post.called = None
-    monkeypatch.setattr(hook, "_http_post", _stub_post)
-    with pytest.raises(SystemExit) as exc:
-        hook.request_via_rpc("http://127.0.0.1:63385", "agent-1", "Bash", "- x", 60)
-    out = capsys.readouterr()
-    return exc.value.code, out.out, out.err, _stub_post.called
-
-
-def test_hook_rpc_allow_emits_allow_json(monkeypatch, capsys):
-    code, out, _err, called = _run_rpc_hook(
-        monkeypatch, capsys, response={"message": "allow"},
-    )
-    assert code == 0
-    decision = json.loads(out)
-    assert decision["hookSpecificOutput"]["permissionDecision"] == "allow"
-    assert called["url"].endswith("/v1/rpc/agent-1/permission-request")
-    assert called["payload"]["tool_name"] == "Bash"
-    # Transport padded past the decision window.
-    assert called["timeout"] > 60
-
-
-def test_hook_rpc_deny_exits_2(monkeypatch, capsys):
-    code, _out, err, _ = _run_rpc_hook(
-        monkeypatch, capsys, response={"message": "deny"},
-    )
-    assert code == 2
-    assert "denied" in err
-
-
-def test_hook_rpc_timeout_exits_2(monkeypatch, capsys):
-    code, _out, err, _ = _run_rpc_hook(
-        monkeypatch, capsys, response={"message": "timeout"},
-    )
-    assert code == 2
-    assert "timed out" in err
-
-
-def test_hook_rpc_transport_error_fails_open(monkeypatch, capsys):
-    code, out, err, _ = _run_rpc_hook(
-        monkeypatch, capsys, error=OSError("connection refused"),
-    )
-    assert code == 0
-    assert out == ""  # no allow JSON — claude falls through to native flow
-    assert "fail-open" in err
-
-
-def test_hook_rpc_unexpected_decision_fails_open(monkeypatch, capsys):
-    code, out, _err, _ = _run_rpc_hook(
-        monkeypatch, capsys, response={"message": "maybe"},
-    )
-    assert code == 0
-    assert out == ""
-
-
-def test_hook_main_routes_to_rpc_when_no_legacy_creds(monkeypatch, capsys):
-    from puffo_agent.hooks import permission as hook
-
-    monkeypatch.delenv("PUFFO_URL", raising=False)
-    monkeypatch.delenv("PUFFO_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("PUFFO_RPC_URL", "http://127.0.0.1:63385")
-    monkeypatch.setenv("PUFFO_AGENT_ID", "agent-9")
-    monkeypatch.setenv("PUFFO_PERMISSION_TIMEOUT", "45")
-
-    captured: dict[str, Any] = {}
-
-    def _stub_rpc(rpc_url, agent_id, tool_name, summary, timeout_s):
-        captured.update(
-            rpc_url=rpc_url, agent_id=agent_id, tool_name=tool_name,
-            summary=summary, timeout_s=timeout_s,
-        )
-        raise SystemExit(0)
-
-    monkeypatch.setattr(hook, "request_via_rpc", _stub_rpc)
-    import io
-    monkeypatch.setattr(
-        "sys.stdin",
-        io.StringIO(json.dumps(
-            {"tool_name": "Bash", "tool_input": {"command": "ls"}}
-        )),
-    )
-    with pytest.raises(SystemExit):
-        hook.main()
-    assert captured["agent_id"] == "agent-9"
-    assert captured["tool_name"] == "Bash"
-    assert "ls" in captured["summary"]
-    assert captured["timeout_s"] == 45
-
-
-def test_hook_main_rpc_branch_fails_open_on_bad_stdin(monkeypatch, capsys):
-    from puffo_agent.hooks import permission as hook
-
-    monkeypatch.delenv("PUFFO_URL", raising=False)
-    monkeypatch.delenv("PUFFO_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("PUFFO_RPC_URL", "http://127.0.0.1:63385")
-    import io
-    monkeypatch.setattr("sys.stdin", io.StringIO("{not json"))
-    with pytest.raises(SystemExit) as exc:
-        hook.main()
-    assert exc.value.code == 0
-    assert "could not parse hook payload" in capsys.readouterr().err
-
-
-def test_hook_main_fails_open_without_any_transport(monkeypatch, capsys):
-    from puffo_agent.hooks import permission as hook
-
-    for var in ("PUFFO_URL", "PUFFO_BOT_TOKEN", "PUFFO_RPC_URL"):
-        monkeypatch.delenv(var, raising=False)
-    with pytest.raises(SystemExit) as exc:
-        hook.main()
-    assert exc.value.code == 0
-    assert "fail-open" in capsys.readouterr().err

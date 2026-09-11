@@ -8,9 +8,11 @@ session + consumer against that agent's client. One hub per daemon.
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from typing import Any
 
+from .auth import AuthedAgent
 from .registry import SessionRegistry
 from .session import WsLocalSession
 
@@ -27,6 +29,7 @@ class AttachPoint:
     reporter: Any
     ack_timeout_s: float
     ping_interval_s: float
+    root_public_key: bytes = b""
 
 
 class WsLocalHub:
@@ -44,5 +47,12 @@ class WsLocalHub:
     def get(self, slug: str) -> AttachPoint | None:
         return self._points.get(slug)
 
-    def is_servable(self, slug: str) -> bool:
-        return slug in self._points
+    def is_servable(self, authed: AuthedAgent) -> bool:
+        point = self._points.get(authed.slug)
+        return bool(
+            point is not None
+            and point.agent_id == authed.agent_id
+            and len(point.root_public_key) == 32
+            and len(authed.root_public_key) == 32
+            and hmac.compare_digest(point.root_public_key, authed.root_public_key)
+        )

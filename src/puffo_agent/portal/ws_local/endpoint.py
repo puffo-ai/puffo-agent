@@ -1,17 +1,17 @@
 """Serve one localhost WS connection end to end.
 
 Glue, but dependency-injected so the decision logic stays unit-testable:
-read the ``connect`` frame, authenticate by decrypting the export, gate
-on "agent is managed here and is a ws-local runtime", claim the
+read the ``connect`` frame, decrypt and identity-bind the export, gate on
+"agent is managed here and is a ws-local runtime", claim the
 single-WS slot, hand back the live agent context, then run the tool
 attached — the session frame-loop and the message consumer together —
 until either ends, and always free the slot on the way out.
 
-The daemon supplies the collaborators: ``make_session`` builds the
-session wired to the ``bridge``; ``start_consumer`` runs the agent's
-``PuffoCoreMessageClient.listen`` with the bridge's dispatch callback;
-``agent_context`` reads the live role + profile.md. Attaching a tool is
-what brings the agent online (point 4) — no tool, no consumer.
+The daemon supplies the collaborators: ``make_session`` builds the session
+wired to the bridge and its ``GlobalInboxRuntime``;
+``start_consumer`` runs the durable message listener and scheduler;
+``agent_context`` reads the live role + profile.md. Attaching a tool is what
+brings the agent online — no tool, no consumer.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from .bridge import WsLocalBridge
 from .protocol import Connect, Connected, Error, ProtocolError, decode_inbound, encode
 from .registry import SessionRegistry
 from .session import Transport, WsLocalSession
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,13 @@ async def serve_connection(
     transport: Transport,
     *,
     authenticate: Callable[[bytes, str], AuthedAgent],
-    is_servable: Callable[[str], bool],
+    is_servable: Callable[[AuthedAgent], bool],
     agent_context: Callable[[str], Awaitable[dict]],
     registry: SessionRegistry[WsLocalSession],
-    make_session: Callable[[AuthedAgent, str, Transport, WsLocalBridge], WsLocalSession],
+    make_session: Callable[
+        [AuthedAgent, str, Transport, WsLocalBridge, tuple[str, ...]],
+        WsLocalSession,
+    ],
     start_consumer: Callable[[AuthedAgent, Callable], Awaitable[None]],
     new_session_id: Callable[[], str],
     base64_decode: Callable[[str], bytes],
@@ -65,20 +69,26 @@ async def serve_connection(
         await _reject(transport, f"authentication failed: {exc}")
         return
 
-    if not is_servable(authed.slug):
+    if not is_servable(authed):
         await _reject(transport, f"{authed.slug!r} is not a ws-local agent on this daemon")
         return
 
     session_id = new_session_id()
     bridge = WsLocalBridge()
-    session = make_session(authed, session_id, transport, bridge)
+    session = make_session(
+        authed, session_id, transport, bridge, frame.capabilities
+    )
     if not registry.acquire(authed.slug, session):
         await _reject(transport, f"{authed.slug!r} already has an active connection")
         return
 
     try:
         context = await agent_context(authed.slug)
-        await transport.send(encode(Connected(session_id, context)))
+        await transport.send(encode(Connected(
+            session_id,
+            context,
+            capabilities=("multi-target-v2", "explicit-admission-v2"),
+        )))
         await _run_attached(authed, session, bridge, start_consumer)
     except Exception as exc:  # noqa: BLE001
         logger.exception("ws-local %s: serve failed: %s", authed.slug, exc)
@@ -99,8 +109,13 @@ async def _run_attached(
     async def on_message(root_id, batch, channel_meta):
         await bridge.dispatch(session, root_id, batch, channel_meta)
 
-    session_task = asyncio.ensure_future(session.run())
-    consumer_task = asyncio.ensure_future(start_consumer(authed, on_message))
+    # Cleanup below only records diagnostic DEBUG context.  Keep the central
+    # reporter as the single alertable, traceback-bearing failure record.
+    session_task = spawn(session.run(), name="session.run")
+    consumer_task = spawn(
+        start_consumer(authed, on_message),
+        name="start_consumer",
+    )
     try:
         await asyncio.wait(
             {session_task, consumer_task}, return_when=asyncio.FIRST_COMPLETED

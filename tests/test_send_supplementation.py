@@ -18,6 +18,8 @@ from puffo_agent.crypto.message import (
 )
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.mcp.puffo_core_tools import _supplement_missing_devices
+from puffo_agent.agent.send_coordinator import CHANNEL_SEND_PATH
+from .test_send_coordinator import coordinator_fixture
 
 
 def _make_recipient() -> tuple[RecipientDevice, KemKeyPair]:
@@ -195,3 +197,65 @@ async def test_supplementation_swallows_http_failure():
         recipient_slugs=["alice-0001"],
         missing_device_ids=[dev_added.device_id],
     )
+
+
+@pytest.mark.asyncio
+async def test_channel_supplementation_uses_v2_and_preserves_freshness():
+    coordinator, _, http = await coordinator_fixture(baseline=3)
+    original, original_key = _make_recipient()
+    env, content_key = encrypt_message_with_content_key(
+        _channel_input([original]), Ed25519KeyPair.generate(),
+    )
+    added, _ = _make_recipient()
+
+    async def fetch(_path):
+        from puffo_agent.crypto.encoding import base64url_encode
+        return {
+            "entries": [{
+                "kind": "device_cert",
+                "seq": 1,
+                "cert": {
+                    "device_id": added.device_id,
+                    "kem_public_key": base64url_encode(added.kem_public_key),
+                },
+            }],
+            "has_more": False,
+        }
+
+    posts = []
+    http.get = fetch
+
+    async def post(path, body):
+        posts.append((path, body))
+        return {
+            "state": "sent",
+            "envelope_id": env["envelope_id"],
+            "seq": 8,
+            "replay": True,
+            "missing_devices": [],
+            "freshness": {
+                "mode": "require_current",
+                "context_baseline_seq": 3,
+                "seen_seq": 3,
+                "latest_seq_before_send": 3,
+            },
+        }
+
+    http.post = post
+    freshness = {
+        "context_baseline_seq": 3,
+        "seen_seq": 3,
+        "mode": "require_current",
+    }
+    await coordinator._supplement_channel(
+        env, content_key, ["alice-1"], [added.device_id], freshness,
+    )
+    assert len(posts) == 1
+    path, body = posts[0]
+    assert path == CHANNEL_SEND_PATH
+    assert body["freshness"] == freshness
+    supplement = body["envelope"]
+    assert supplement["envelope_id"] == env["envelope_id"]
+    assert supplement["content_nonce"] == env["content_nonce"]
+    assert supplement["content_ciphertext"] == env["content_ciphertext"]
+    assert all(path != "/messages" for path, _ in posts)

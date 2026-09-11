@@ -1,22 +1,582 @@
-import os
-import glob
+"""Agent memory persistence and structured-memory compatibility.
+
+The active runtime contract matches Puffo Agent 1.2: ``memory/*.md`` is
+standing memory and is loaded into every provider prompt.  The structured
+memory tree remains available to existing alpha installs and MCP tools, but
+startup never migrates flat files into it or rewrites user content.
+
+Layout under an agent's memory root::
+
+    memory/
+      <topic>.md          # active 1.2 standing memory
+      briefing/           # retained alpha compatibility topics
+        profile.md        # old managed profile; only user addenda survive
+        <topic>.md        # included when no flat topic has the same name
+      notes/              # durable detail; searchable, never injected
+      recollection/       # reserved (M4)
+      imports/index.md    # reserved; provenance of imported content
+
+The standalone structured compile remains deterministic and bounded for MCP
+compatibility. The active standing-memory view is deterministic but does not
+apply those alpha limits to flat files.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import stat
+import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+from .memory_errors import BriefingCompileError, MemoryStoreError
+
+logger = logging.getLogger(__name__)
+
+# Re-exported so ``from .memory import MemoryStoreError`` /
+# ``BriefingCompileError`` keeps working now that the classes live in
+# the leaf ``memory_errors`` module.
+__all__ = ["BriefingCompileError", "MemoryStoreError"]
+
+BRIEFING_DIR = "briefing"
+NOTES_DIR = "notes"
+RECOLLECTION_DIR = "recollection"
+IMPORTS_DIR = "imports"
+
+# Bounded-briefing budget (M1 ships the top of the design's ranges;
+# M2 may tighten). Byte sizes of the UTF-8 encoded content.
+PER_FILE_LIMIT = 16 * 1024
+TOTAL_LIMIT = 64 * 1024
+
+PROFILE_BRIEFING_NAME = "profile.md"
+MIGRATED_NOTES_TOPIC = "migrated-notes"
+
+_IMPORTS_INDEX_SEED = """\
+# Imports index
+
+Provenance of content imported into this agent's memory. Reserved —
+maintained by the platform; one entry per import.
+"""
+
+PROFILE_MANAGED_BEGIN = "<!-- puffo:managed-profile -->"
+PROFILE_MANAGED_END = "<!-- /puffo:managed-profile -->"
+
+_MANAGED_BLOCK_RE = re.compile(
+    re.escape(PROFILE_MANAGED_BEGIN) + r".*?" + re.escape(PROFILE_MANAGED_END),
+    re.DOTALL,
+)
+
+_MIGRATED_NOTE_POINTER_RE = re.compile(
+    rf"^- ({re.escape(NOTES_DIR)}/.+\.md) — migrated from flat memory$"
+)
+
+
+def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> bool:
+    """Drop ``refresh_agent.flag`` so the worker rebuilds the prompt
+    artifacts on the next batch. Best-effort; same payload shape as
+    ``profile_sync.write_refresh_agent_flag``. No-op without a
+    workspace dir. Returns True iff the flag was written (the M3
+    tools layer maps this to the ``provider_reload`` post-effect)."""
+    if not workspace_dir:
+        return False
+    from ..portal.state import refresh_agent_flag_path
+
+    flag_path = refresh_agent_flag_path(Path(workspace_dir))
+    try:
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        flag_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "requested_at": int(time.time()),
+                    "reason": reason,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning(
+            "refresh_agent.flag write failed (%s): %s",
+            reason,
+            exc,
+        )
+        return False
+    return True
+
+
+def ensure_memory_tree(memory_root: Path) -> None:
+    """Create the M1 memory tree under ``memory_root``. Idempotent;
+    never touches existing content. All paths are built by joining
+    fixed names under the root — nothing is written outside it."""
+    memory_root = Path(memory_root)
+    memory_root.mkdir(parents=True, exist_ok=True)
+    resolved_root = memory_root.resolve()
+    for sub in (BRIEFING_DIR, NOTES_DIR, RECOLLECTION_DIR, IMPORTS_DIR):
+        path = memory_root / sub
+        if path.exists() or path.is_symlink():
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                raise MemoryStoreError(
+                    "memory_invalid_path",
+                    path=sub,
+                    suggestion="Memory scope roots must be real directories.",
+                ) from exc
+            if not stat.S_ISDIR(mode) or path.resolve().parent != resolved_root:
+                raise MemoryStoreError(
+                    "memory_invalid_path",
+                    path=sub,
+                    suggestion="Memory scope roots must be real directories.",
+                )
+        else:
+            path.mkdir()
+    index = memory_root / IMPORTS_DIR / "index.md"
+    if not index.exists():
+        index.write_text(_IMPORTS_INDEX_SEED, encoding="utf-8")
+
+
+def safe_memory_scope(memory_root: Path, scope: str) -> Path | None:
+    """Return a real contained scope directory, never a followed symlink."""
+
+    root = Path(memory_root).resolve()
+    path = Path(memory_root) / scope
+    try:
+        mode = path.lstat().st_mode
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(mode) or resolved.parent != root:
+        return None
+    return path
+
+
+def _byte_size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _resolves_within_root(path: Path, memory_root: Path) -> bool:
+    """True iff ``path`` resolves to a location inside ``memory_root``.
+
+    The host-side compile / migration paths read the filesystem
+    directly (not through the M2 store), so a symlink under the memory
+    tree could otherwise pull in content from outside it. Resolving
+    both sides collapses symlinks in either the leaf or an ancestor
+    dir; a resolution failure is treated as "not contained"."""
+    try:
+        return path.resolve().is_relative_to(memory_root.resolve())
+    except OSError:
+        return False
+
+
+def _is_briefing_topic(path: Path) -> bool:
+    return (
+        path.is_file()
+        # ``is_file()`` follows symlinks; a symlinked briefing/<t>.md
+        # would inject its target's bytes, so exclude symlinks outright.
+        and not path.is_symlink()
+        and path.suffix == ".md"
+        and not path.name.startswith(".")
+    )
+
+
+def _read_briefing_entries(
+    memory_root: Path,
+    *,
+    enforce_per_file: bool = True,
+) -> tuple[str, list[tuple[str, str]]]:
+    """``(profile_body, [(stem, body), ...])`` in compile order:
+    profile first, remaining topics by sorted filename. Empty bodies
+    are dropped. Raises ``BriefingCompileError`` on a per-file limit
+    violation unless ``enforce_per_file`` is off."""
+    memory_root = Path(memory_root)
+    briefing = memory_root / BRIEFING_DIR
+    profile_body = ""
+    entries: list[tuple[str, str]] = []
+    if not briefing.is_dir():
+        return profile_body, entries
+    profile_path = briefing / PROFILE_BRIEFING_NAME
+    paths = [p for p in sorted(briefing.glob("*.md")) if _is_briefing_topic(p)]
+    if profile_path in paths:
+        paths.remove(profile_path)
+        paths.insert(0, profile_path)
+    for path in paths:
+        # ``_is_briefing_topic`` already dropped leaf symlinks; this
+        # catches a topic that resolves outside the root through a
+        # symlinked ancestor dir (e.g. a symlinked briefing/).
+        if not _resolves_within_root(path, memory_root):
+            logger.warning(
+                "memory briefing: skipping %s — resolves outside the memory root",
+                path,
+            )
+            continue
+        body = path.read_text(encoding="utf-8")
+        if enforce_per_file and _byte_size(body) > PER_FILE_LIMIT:
+            raise BriefingCompileError(
+                "memory_file_too_large",
+                path=str(path),
+                size=_byte_size(body),
+                limit=PER_FILE_LIMIT,
+                suggestion=(
+                    "Trim this briefing topic; move detail to "
+                    f"memory/{NOTES_DIR}/ (searchable, not injected)."
+                ),
+            )
+        body = body.strip()
+        if not body:
+            continue
+        if path == profile_path:
+            profile_body = body
+        else:
+            entries.append((path.stem, body))
+    return profile_body, entries
+
+
+def _compose_briefing(profile_body: str, entries: list[tuple[str, str]]) -> str:
+    parts: list[str] = []
+    if profile_body:
+        parts.append(profile_body)
+    for stem, body in entries:
+        parts.append(f"### {stem}\n\n{body}")
+    return "\n\n".join(parts)
+
+
+def compile_briefing(memory_root: Path) -> str:
+    """Deterministically compile ``briefing/`` into one prompt block:
+    profile.md body first (verbatim), then every other ``*.md`` as a
+    ``### <stem>`` section in sorted filename order. Enforces
+    ``PER_FILE_LIMIT`` per file and ``TOTAL_LIMIT`` on the joined
+    output; raises ``BriefingCompileError`` instead of truncating.
+    Returns ``""`` for an empty/missing briefing."""
+    memory_root = Path(memory_root)
+    profile_body, entries = _read_briefing_entries(memory_root)
+    compiled = _compose_briefing(profile_body, entries)
+    total = _byte_size(compiled)
+    if total > TOTAL_LIMIT:
+        raise BriefingCompileError(
+            "memory_briefing_too_large",
+            path=str(memory_root / BRIEFING_DIR),
+            size=total,
+            limit=TOTAL_LIMIT,
+            suggestion=(
+                "The compiled briefing exceeds the total budget; move "
+                f"topics to memory/{NOTES_DIR}/ or trim them."
+            ),
+        )
+    return compiled
+
+
+def migrate_flat_memory(memory_root: Path) -> list[str]:
+    """Migrate legacy flat ``memory/*.md`` files into the tree.
+
+    Deterministic rule: files are processed in sorted filename order
+    (``README.md`` and dotfiles excluded). A file moves to
+    ``briefing/<name>`` iff it is ≤ ``PER_FILE_LIMIT`` bytes, the
+    briefing slot is free, and the would-be compiled briefing
+    (current briefing + already-migrated files + this file) stays
+    ≤ ``TOTAL_LIMIT``; otherwise it moves to ``notes/<name>`` (or
+    ``notes/<stem>-migrated.md`` on collision) and a pointer line is
+    appended to ``briefing/migrated-notes.md``. Idempotent: a pass
+    leaves no flat ``*.md`` behind, so re-runs are no-ops.
+
+    Returns the migrated files' new memory-root-relative paths.
+    """
+    memory_root = Path(memory_root)
+    if not memory_root.is_dir():
+        return []
+    ensure_memory_tree(memory_root)
+    flat = _flat_memory_files(memory_root)
+    if not flat:
+        return []
+    return _migrate_flat_files(memory_root, flat)
+
+
+def _flat_memory_files(memory_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in sorted(memory_root.glob("*.md")):
+        if not path.is_file() or path.name == "README.md" or path.name.startswith("."):
+            continue
+        if path.is_symlink() or not _resolves_within_root(path, memory_root):
+            logger.warning(
+                "memory: skipping %s — symlink or resolves outside the memory root",
+                path,
+            )
+            continue
+        files.append(path)
+    return files
+
+
+def read_standing_memory_entries(memory_root: Path) -> list[tuple[str, str]]:
+    """Return the prompt-visible standing-memory view.
+
+    Flat ``memory/*.md`` files are authoritative and retain the 1.2 runtime
+    behavior.  Structured briefing topics and notes referenced by the alpha
+    migration pointer are compatibility fallbacks, so an upgrade cannot make
+    previously migrated memory disappear.  Files are never moved or rewritten;
+    a flat topic wins when both layouts contain the same stem.
+    """
+    root = Path(memory_root)
+    if not root.is_dir():
+        return []
+
+    entries: dict[str, str] = {}
+    for path in _flat_memory_files(root):
+        _add_standing_memory_entry(entries, path)
+
+    briefing = safe_memory_scope(root, BRIEFING_DIR)
+    if briefing is not None:
+        for path in sorted(briefing.glob("*.md")):
+            if not _is_briefing_topic(path):
+                continue
+            if not _resolves_within_root(path, root):
+                continue
+            if path.name == PROFILE_BRIEFING_NAME:
+                _add_profile_addendum(entries, path)
+                continue
+            if path.stem == MIGRATED_NOTES_TOPIC:
+                continue
+            _add_standing_memory_entry(entries, path)
+
+    for path in _migrated_note_targets(root):
+        _add_standing_memory_entry(entries, path)
+
+    return sorted(entries.items())
+
+
+def _add_standing_memory_entry(
+    entries: dict[str, str],
+    path: Path,
+    *,
+    topic: str = "",
+) -> None:
+    stem = topic or path.stem
+    if stem in entries:
+        return
+    try:
+        body = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return
+    if body:
+        entries[stem] = body
+
+
+def _add_profile_addendum(entries: dict[str, str], path: Path) -> None:
+    """Keep user text outside the alpha managed-profile block."""
+    try:
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return
+    addendum = _MANAGED_BLOCK_RE.sub("", body).strip()
+    if addendum:
+        entries.setdefault("profile-notes", addendum)
+
+
+def _migrated_note_targets(memory_root: Path) -> list[Path]:
+    pointer = memory_root / BRIEFING_DIR / f"{MIGRATED_NOTES_TOPIC}.md"
+    if (
+        not pointer.is_file()
+        or pointer.is_symlink()
+        or not _resolves_within_root(pointer, memory_root)
+    ):
+        return []
+    try:
+        lines = pointer.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+
+    targets: list[Path] = []
+    for line in lines:
+        match = _MIGRATED_NOTE_POINTER_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        logical = Path(match.group(1))
+        if len(logical.parts) != 2 or logical.parts[0] != NOTES_DIR:
+            continue
+        path = memory_root / logical
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and _resolves_within_root(path, memory_root)
+        ):
+            targets.append(path)
+    return sorted(set(targets))
+
+
+def _migrate_flat_files(memory_root: Path, flat: list[Path]) -> list[str]:
+    from .memory_store import MemoryStore
+
+    briefing_dir = memory_root / BRIEFING_DIR
+    notes_dir = memory_root / NOTES_DIR
+    pointer_path = briefing_dir / f"{MIGRATED_NOTES_TOPIC}.md"
+    profile_body, entries = _read_briefing_entries(memory_root, enforce_per_file=False)
+    entry_map = dict(entries)
+    store = MemoryStore(memory_root)
+    moved: list[str] = []
+    for path in flat:
+        body = path.read_text(encoding="utf-8")
+        if _fits_briefing(path, body, briefing_dir, profile_body, entry_map):
+            dest = briefing_dir / path.name
+            path.rename(dest)
+            entry_map[path.stem] = body.strip()
+            moved.append(f"{BRIEFING_DIR}/{dest.name}")
+            continue
+        dest = _migrate_note_path(notes_dir, path)
+        path.rename(dest)
+        moved.append(f"{NOTES_DIR}/{dest.name}")
+        _write_migration_pointer(store, pointer_path, entry_map, dest)
+    return moved
+
+
+def _fits_briefing(
+    path: Path,
+    body: str,
+    briefing_dir: Path,
+    profile_body: str,
+    entry_map: dict[str, str],
+) -> bool:
+    candidate = dict(entry_map)
+    candidate[path.stem] = body.strip()
+    return (
+        _byte_size(body) <= PER_FILE_LIMIT
+        and path.name != PROFILE_BRIEFING_NAME
+        and not (briefing_dir / path.name).exists()
+        and _byte_size(_compose_briefing(profile_body, sorted(candidate.items())))
+        <= TOTAL_LIMIT
+    )
+
+
+def _migrate_note_path(notes_dir: Path, path: Path) -> Path:
+    dest = notes_dir / path.name
+    if not dest.exists():
+        return dest
+    dest = notes_dir / f"{path.stem}-migrated.md"
+    index = 2
+    while dest.exists():
+        dest = notes_dir / f"{path.stem}-migrated-{index}.md"
+        index += 1
+    return dest
+
+
+def _write_migration_pointer(
+    store, pointer_path: Path, entry_map: dict[str, str], dest: Path
+) -> None:
+    existing = (
+        pointer_path.read_text(encoding="utf-8")
+        if pointer_path.exists()
+        else ("" if entry_map.get(MIGRATED_NOTES_TOPIC) else "# Migrated notes\n\n")
+    )
+    new_body = existing + f"- {NOTES_DIR}/{dest.name} — migrated from flat memory\n"
+    try:
+        store.put_memory_file(f"{BRIEFING_DIR}/{MIGRATED_NOTES_TOPIC}.md", new_body)
+    except BriefingCompileError as exc:
+        logger.warning(
+            "memory migrate: pointer to %s skipped (%s) — the note migrated but the briefing budget is full",
+            dest.name,
+            exc.code,
+        )
+        return
+    entry_map[MIGRATED_NOTES_TOPIC] = new_body.strip()
+
+
+def render_profile_briefing(
+    *,
+    agent_id: str = "",
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
+    soul: str = "",
+    puffo_handle: str = "",
+) -> str:
+    """Identity framing for ``briefing/profile.md``: display name,
+    role lines, soul body. Deliberately NO ``## Instructions`` and no
+    runtime-behavior sections — those live in the agent-root
+    profile.md / primer. Missing fields degrade to a minimal identity
+    line derived from agent id + display name.
+
+    ``puffo_handle`` is the agent's authenticated ``puffo_core.slug`` —
+    its unique identity on the network, and what peers actually address.
+    An imported agent can keep a local directory ``agent_id`` that
+    differs from it, so the handle wins for the model-facing line while
+    ``agent_id`` keeps naming local storage.
+    """
+    handle = puffo_handle or agent_id
+    name = display_name or handle or "agent"
+    identity = f"You are {name}"
+    if handle:
+        identity += f" (agent `{handle}`)"
+    identity += "."
+    lines = [f"# {name}", "", identity]
+    if role:
+        lines += ["", f"Role: {role}"]
+    if role_short:
+        lines.append(f"Role (short): {role_short}")
+    if soul.strip():
+        lines += ["", "## Soul", "", soul.strip()]
+    return "\n".join(lines) + "\n"
+
+
+def sync_profile_briefing(
+    memory_root: Path,
+    *,
+    agent_id: str = "",
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
+    soul: str = "",
+    puffo_handle: str = "",
+) -> Path:
+    """(Re)write the managed block of ``briefing/profile.md`` from the
+    native profile surfaces (agent.yml identity fields + the ``# Soul``
+    body of agent-root profile.md). Content between the
+    ``puffo:managed-profile`` markers is regenerated on every managed
+    rebuild; user-authored text outside the markers is preserved — which
+    is also how an imported agent picks up its authenticated
+    ``puffo_handle`` with no migration step."""
+    memory_root = Path(memory_root)
+    ensure_memory_tree(memory_root)
+    path = memory_root / BRIEFING_DIR / PROFILE_BRIEFING_NAME
+    rendered = render_profile_briefing(
+        agent_id=agent_id,
+        display_name=display_name,
+        role=role,
+        role_short=role_short,
+        soul=soul,
+        puffo_handle=puffo_handle,
+    )
+    block = f"{PROFILE_MANAGED_BEGIN}\n{rendered}{PROFILE_MANAGED_END}\n"
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        if _MANAGED_BLOCK_RE.search(text):
+            new_text = _MANAGED_BLOCK_RE.sub(
+                lambda _m: block.rstrip("\n"),
+                text,
+                count=1,
+            )
+        else:
+            # Pre-existing user file without markers: identity framing
+            # leads, user content follows untouched.
+            new_text = block + "\n" + text
+    else:
+        new_text = block
+    from .memory_store import MemoryStore
+
+    MemoryStore(memory_root).put_memory_file(
+        f"{BRIEFING_DIR}/{PROFILE_BRIEFING_NAME}",
+        new_text,
+    )
+    return path
 
 
 class MemoryManager:
-    def __init__(self, memory_dir: str):
-        self.memory_dir = memory_dir
-        self.memories: dict[str, str] = {}
-        self._load()
+    """The Puffo Agent 1.2 flat-memory compatibility surface."""
 
-    def _load(self):
-        for path in glob.glob(os.path.join(self.memory_dir, "*.md")):
-            if os.path.basename(path) == "README.md":
-                continue
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            topic = os.path.splitext(os.path.basename(path))[0]
-            self.memories[topic] = content
+    def __init__(self, memory_dir: str, workspace_dir: str = ""):
+        self.memory_dir = memory_dir
+        self.workspace_dir = workspace_dir
+        Path(memory_dir).mkdir(parents=True, exist_ok=True)
+        self.memories = dict(read_standing_memory_entries(Path(memory_dir)))
 
     def get_context(self) -> str:
         if not self.memories:
@@ -27,11 +587,21 @@ class MemoryManager:
         return "\n".join(parts)
 
     def save(self, topic: str, content: str):
-        self.memories[topic] = content
         safe_topic = topic.replace(" ", "_").replace("/", "-")
-        path = os.path.join(self.memory_dir, f"{safe_topic}.md")
         # Aware-UTC with ``Z`` suffix (``datetime.utcnow`` is
         # deprecated in 3.12+).
-        updated = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"---\ntopic: {topic}\nupdated: {updated}\n---\n\n{content}\n")
+        updated = (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        body = f"---\ntopic: {topic}\nupdated: {updated}\n---\n\n{content}\n"
+        root = Path(self.memory_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{safe_topic}.md").write_text(body, encoding="utf-8")
+        self.memories[topic] = content
+        self._request_refresh(topic)
+
+    def _request_refresh(self, topic: str) -> None:
+        request_prompt_refresh(self.workspace_dir, f"memory.save:{topic}")

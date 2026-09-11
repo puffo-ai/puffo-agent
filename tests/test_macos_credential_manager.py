@@ -17,7 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -78,9 +77,12 @@ def test_cache_write_is_atomic(tmp_path):
     cache.write(_BLOB)
     assert cache.path.exists()
     cache.write(_REFRESHED_BLOB)
-    siblings = list(cache.path.parent.glob(".claude-credentials.json.tmp.*"))
+    siblings = list(cache.path.parent.glob(".claude-credentials.json*.tmp*"))
     assert siblings == []
     assert cache.read() == _REFRESHED_BLOB
+    if os.name != "nt":
+        assert cache.path.parent.stat().st_mode & 0o777 == 0o700
+        assert cache.path.stat().st_mode & 0o777 == 0o600
 
 
 def test_cache_access_token_handles_malformed_blob(tmp_path):
@@ -437,6 +439,10 @@ def test_keychain_backend_sync_to_agent_writes_per_agent_file(tmp_path, monkeypa
     assert not agent_creds.is_symlink()
     assert agent_creds.read_text() == _view(_BLOB)
     assert "refreshToken" not in agent_creds.read_text()
+    if os.name != "nt":
+        assert agent_home.stat().st_mode & 0o777 == 0o700
+        assert agent_creds.parent.stat().st_mode & 0o777 == 0o700
+        assert agent_creds.stat().st_mode & 0o777 == 0o600
 
 
 def test_keychain_backend_sync_skips_when_cache_empty(tmp_path, monkeypatch):
@@ -583,6 +589,34 @@ def test_keychain_backend_poll_external_rotation_detects_change(
     rotated = asyncio.run(backend.poll_external_rotation())
     assert rotated is True
     assert backend.cache.read() == _REFRESHED_BLOB
+    assert backend._last_propagated_blob == _REFRESHED_BLOB
+
+
+def test_keychain_rotation_stays_retryable_when_cache_write_fails(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    backend = _make_keychain_backend(tmp_path)
+    backend._last_propagated_blob = _BLOB
+    backend.cache.write(_BLOB)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            True, _REFRESHED_BLOB, None, None,
+        ),
+    )
+
+    real_write = backend.cache.write
+    monkeypatch.setattr(
+        backend.cache,
+        "write",
+        lambda _blob: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+    assert asyncio.run(backend.poll_external_rotation()) is False
+    assert backend._last_propagated_blob == _BLOB
+
+    monkeypatch.setattr(backend.cache, "write", real_write)
+    assert asyncio.run(backend.poll_external_rotation()) is True
     assert backend._last_propagated_blob == _REFRESHED_BLOB
 
 
@@ -882,6 +916,8 @@ def test_sync_to_agent_is_idempotent_when_target_matches(
     backend.sync_to_agent(agent_home)
     target = agent_home / ".claude" / ".credentials.json"
     assert target.read_text() == _view(_BLOB)
+    if os.name != "nt":
+        target.chmod(0o644)
 
     import os as _os
     replace_calls = 0
@@ -896,6 +932,8 @@ def test_sync_to_agent_is_idempotent_when_target_matches(
     # Second sync — target already matches → no write.
     backend.sync_to_agent(agent_home)
     assert replace_calls == 0
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_poll_external_rotation_detects_disk_rotation_when_keychain_dead(

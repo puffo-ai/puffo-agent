@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -72,8 +73,9 @@ AUTHED = AuthedAgent("puffotest-19b1", "puffotest", "Puffo Test")
 def _serve(transport, **overrides):
     built = []
 
-    def make_session(authed, session_id, t, bridge):
+    def make_session(authed, session_id, t, bridge, capabilities):
         sess = overrides.get("session") or FakeSession(bridge)
+        sess.capabilities = frozenset(capabilities)
         built.append((authed, session_id, sess, bridge))
         return sess
 
@@ -153,7 +155,7 @@ async def test_release_and_close_on_error_after_acquire():
 
 
 @pytest.mark.asyncio
-async def test_consumer_exception_torn_down_cleanly():
+async def test_consumer_exception_has_one_authoritative_failure_record(caplog):
     reg: SessionRegistry = SessionRegistry()
     t = FakeTransport()
     t.feed({"type": "connect", "bundle": "Yg==", "password": "pw"})
@@ -162,8 +164,18 @@ async def test_consumer_exception_torn_down_cleanly():
         raise RuntimeError("server stream died")
 
     coro, _ = _serve(t, registry=reg, consumer=consumer)
-    await coro  # exception is logged, not propagated
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        await coro  # exception is logged, not propagated
+        await asyncio.sleep(0)
     assert reg.current("puffotest") is None
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "puffo_agent.tasks" and record.levelno >= logging.ERROR
+    ]
+    assert len(records) == 1
+    assert records[0].getMessage() == "worker task died: start_consumer"
+    assert isinstance(records[0].exc_info[1], RuntimeError)
 
 
 @pytest.mark.asyncio

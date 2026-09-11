@@ -1,7 +1,7 @@
 # Test CI — runs the pytest suite (unit + integration) on every push to
 # main and every PR. puffo-agent's tests are self-contained (isolated
 # per-test homes, SQLite, a mocked relay), so there's no live-server e2e
-# stage and no services to stand up — the pytest run is the gate.
+# stage and no services to stand up. Structural checks and pytest are the gates.
 name: CI
 
 on:
@@ -9,7 +9,7 @@ on:
     branches: [main]
   pull_request:
 
-# Least privilege: the test job only needs to read the repo.
+# Least privilege: CI jobs only need to read the repo.
 permissions:
   contents: read
 
@@ -18,9 +18,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install quality tools
+        run: pip install -e ".[dev]"
+      - name: repository checks
+        # no-commit-to-branch guards local commits; in CI the checkout *is*
+        # main on push, so the hook would fail the job for doing its job.
+        env:
+          SKIP: no-commit-to-branch
+        run: pre-commit run --all-files
+
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     env:
       QT_QPA_PLATFORM: offscreen  # the PySide6 UI tests render headless
     strategy:
@@ -54,4 +73,4 @@ jobs:
           puffo-agent --help > /dev/null
 
       - name: pytest
-        run: pytest -p no:warnings
+        run: timeout --signal=INT --kill-after=30s 8m pytest -vv -p no:warnings

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
+import os
 from typing import Any
 
 import aiohttp
@@ -23,11 +26,123 @@ class HttpError(Exception):
         super().__init__(f"HTTP {status}: {body}")
 
 
+_DEAD_EXECUTOR_MESSAGE = "cannot schedule new futures after shutdown"
+
+
+def _heal_dead_default_executor() -> None:
+    """Install a fresh default executor on the running loop.
+
+    Every aiohttp request rides the loop's default ThreadPoolExecutor
+    (threaded DNS, netrc lookup under ``trust_env``), and
+    ``websockets.connect`` does through ``loop.getaddrinfo``. After a
+    long process suspension (macOS App Nap — see the 8/30 incident) that
+    executor has been observed shut down while the loop itself keeps
+    running, which turns every subsequent request into
+    ``RuntimeError: cannot schedule new futures after shutdown`` forever;
+    nothing else ever recreates it. Replacing it is loop-global, so one
+    heal here also revives WS reconnects and any other transport on the
+    loop. The distinct 'Executor shutdown has been called' /
+    'after interpreter shutdown' errors mean an intentional teardown and
+    are deliberately not healed.
+    """
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="puffo-healed-executor"
+        )
+    )
+    logger.warning(
+        "default executor was shut down while the loop kept running; "
+        "installed a fresh one"
+    )
+
+
+def heal_if_dead_executor(exc: BaseException) -> bool:
+    """Heal the loop's default executor iff ``exc`` is the dead-executor
+    RuntimeError; returns whether it healed.
+
+    Shared by the HTTP wrapper and the WS reconnect loop: with a valid
+    subkey ``connect_once`` reaches ``websockets.connect`` (and its
+    ``loop.getaddrinfo``) without a single prior HTTP request, so the WS
+    path cannot rely on an HTTP-side heal having happened first.
+    """
+    if _DEAD_EXECUTOR_MESSAGE not in str(exc):
+        return False
+    _heal_dead_default_executor()
+    return True
+
+
+async def _probe_default_executor() -> bool:
+    """Run a no-op through the loop's default executor; heal if dead.
+
+    ``run_in_executor(None, ...)`` is the same scheduling call aiohttp
+    makes for threaded DNS and ``trust_env`` netrc lookups, so a passing
+    probe means this request's own executor hops cannot raise the
+    shutdown error — short of a concurrent shutdown mid-request, which
+    is surfaced to the caller, never retried. Returns whether it healed.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: None)
+        return False
+    except RuntimeError as exc:
+        if not heal_if_dead_executor(exc):
+            raise
+        return True
+
+
+class _HealedRequest:
+    """One aiohttp request attempt, healed *before* any bytes go out.
+
+    A dead default executor is detected by a no-op probe and replaced
+    prior to sending; the pooled connections from before the suspension
+    are dropped with it. A dead-executor RuntimeError that still fires
+    mid-request is healed so the caller's next attempt works, then
+    re-raised — never replayed: aiohttp re-enters the executor on every
+    automatic-redirect hop, so past the first hop the original request
+    is already on the wire and a replay double-sends it (reproduced
+    live: POST → 307, hop-2 executor death, replayed POST).
+    """
+
+    def __init__(self, client: PuffoCoreHttpClient, method: str, url: str, kwargs: dict):
+        self._client = client
+        self._method = method
+        self._url = url
+        self._kwargs = kwargs
+        self._ctx = None
+
+    async def __aenter__(self):
+        if await _probe_default_executor():
+            await self._client.close()
+        try:
+            http = await self._client._get_session()
+            self._ctx = http.request(self._method, self._url, **self._kwargs)
+            return await self._ctx.__aenter__()
+        except RuntimeError as exc:
+            if heal_if_dead_executor(exc):
+                await self._client.close()
+            raise
+
+    async def __aexit__(self, *exc_info):
+        return await self._ctx.__aexit__(*exc_info)
+
+
 class PuffoCoreHttpClient:
-    def __init__(self, server_url: str, keystore: KeyStore, slug: str):
+    def __init__(
+        self,
+        server_url: str,
+        keystore: KeyStore,
+        slug: str,
+        keyless: bool = False,
+    ):
         self.server_url = server_url.rstrip("/")
         self.keystore = keystore
         self.slug = slug
+        # T23 keyless bridge transport: outbound tool work goes over the
+        # unsigned ``/v2/cloud-agents/*`` routes and the E2B egress proxy
+        # injects ``x-sandbox-token`` on the way out. Tools branch on this
+        # to pick the keyless vs native (signed) path; native agents leave
+        # it False and are byte-for-byte unchanged.
+        self.keyless = keyless
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -35,10 +150,16 @@ class PuffoCoreHttpClient:
             self._session = create_remote_http_session(self.server_url)
         return self._session
 
+    def _healed_request(self, method: str, url: str, **kwargs):
+        return _HealedRequest(self, method, url, kwargs)
+
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        # Detach before awaiting: a concurrent _get_session() during the
+        # await may install a fresh session, which a post-await
+        # ``self._session = None`` would orphan with a live connector.
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
 
     def _load_signing_key(self) -> tuple[Ed25519KeyPair, str]:
         sess = self.keystore.load_session(self.slug)
@@ -68,8 +189,8 @@ class PuffoCoreHttpClient:
             "POST", "/devices/subkeys", body,
         )
 
-        http = await self._get_session()
-        async with http.post(
+        async with self._healed_request(
+            "POST",
             f"{self.server_url}/devices/subkeys",
             data=body,
             headers=auth.to_dict(),
@@ -122,8 +243,9 @@ class PuffoCoreHttpClient:
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
 
-        http = await self._get_session()
-        async with http.request(method, url, data=body or None, headers=headers) as resp:
+        async with self._healed_request(
+            method, url, data=body or None, headers=headers
+        ) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text)
@@ -135,26 +257,45 @@ class PuffoCoreHttpClient:
         _, data = await self._request("GET", path)
         return data
 
-    async def get_bytes(self, path: str) -> bytes:
+    async def get_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
         """Signed GET returning raw bytes (e.g. /blobs/{id})."""
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer")
         await self._ensure_subkey()
-        bytes_out = await self._do_request_bytes("GET", path)
+        bytes_out = await self._do_request_bytes("GET", path, max_bytes=max_bytes)
         return bytes_out
 
-    async def _do_request_bytes(self, method: str, path: str) -> bytes:
+    async def _do_request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         signing_key, signer_id = self._load_signing_key()
         from .http_auth import sign_request
         auth = sign_request(signing_key, self.slug, signer_id, method, path, b"")
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
-        http = await self._get_session()
-        async with http.request(method, url, headers=headers) as resp:
+        async with self._healed_request(method, url, headers=headers) as resp:
             if resp.status == 401:
                 # Caller retries after a rotation.
                 raise HttpError(401, await resp.text())
             if resp.status >= 400:
                 raise HttpError(resp.status, await resp.text())
-            return await resp.read()
+            if max_bytes is None:
+                return await resp.read()
+            if resp.content_length is not None and resp.content_length > max_bytes:
+                raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            return bytes(body)
 
     async def post(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
@@ -178,17 +319,87 @@ class PuffoCoreHttpClient:
         return data
 
     async def delete(self, path: str, body: dict | None = None) -> Any:
+        """Signed DELETE, optionally carrying a JSON body.
+
+        Some routes identify their target in the body rather than the
+        path — ``DELETE /blocklists`` takes ``{"id": "<slug>"}``. The
+        body is serialized exactly as ``post()`` does and handed to
+        ``_request``, so ``sign_request`` covers the same bytes that go
+        on the wire (the server verifies the signature over the raw
+        body). Bodyless DELETEs are byte-for-byte unchanged.
+        """
         raw = json.dumps(body).encode() if body else b""
         _, data = await self._request("DELETE", path, raw)
         return data
 
+    def _egress_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Merge the test-only egress ``x-sandbox-token`` shim into the
+        request headers.
+
+        In production the E2B egress proxy injects the sandbox token on
+        outbound HTTPS, so ``PUFFO_LOCAL_SANDBOX_TOKEN`` is unset and this
+        returns ``base`` untouched — no header is written into any config
+        file or request. Set the env var locally to simulate that
+        injection against a plaintext test server. Called ONLY from the
+        unsigned keyless methods below; native signed requests never hit
+        this path.
+        """
+        headers = dict(base or {})
+        token = os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
+        if token:
+            headers["x-sandbox-token"] = token
+        return headers
+
     async def post_unsigned(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
-        http = await self._get_session()
-        async with http.post(
+        async with self._healed_request(
+            "POST",
             f"{self.server_url}{path}",
             data=raw,
-            headers={"content-type": "application/json"},
+            headers=self._egress_headers({"content-type": "application/json"}),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
+    async def put_unsigned(self, path: str, body: dict | None = None) -> Any:
+        """Unsigned JSON PUT for the keyless cloud-Agent namespace.
+
+        Mirrors ``post_unsigned`` so provider-neutral callers retain the
+        existing egress-token boundary instead of opening a second aiohttp
+        request path in a scheduler or tool.
+        """
+        raw = json.dumps(body).encode() if body else b""
+        async with self._healed_request(
+            "PUT",
+            f"{self.server_url}{path}",
+            data=raw,
+            headers=self._egress_headers({"content-type": "application/json"}),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
+    async def post_bytes_unsigned(self, path: str, body: bytes) -> Any:
+        """POST raw bytes unsigned (keyless blob upload). Mirrors
+        ``post_unsigned`` but carries an ``application/octet-stream`` body
+        and no signature — the egress proxy supplies auth via
+        ``x-sandbox-token``."""
+        async with self._healed_request(
+            "POST",
+            f"{self.server_url}{path}",
+            data=body,
+            headers=self._egress_headers(
+                {"content-type": "application/octet-stream"}
+            ),
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -199,8 +410,11 @@ class PuffoCoreHttpClient:
                 return text
 
     async def get_unsigned(self, path: str) -> Any:
-        http = await self._get_session()
-        async with http.get(f"{self.server_url}{path}") as resp:
+        async with self._healed_request(
+            "GET",
+            f"{self.server_url}{path}",
+            headers=self._egress_headers(),
+        ) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 raise HttpError(resp.status, text)

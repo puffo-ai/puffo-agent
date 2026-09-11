@@ -99,6 +99,9 @@ def test_view_written_with_blanked_refresh_token(tmp_path):
     data = json.loads(view.read_text(encoding="utf-8"))
     assert data["tokens"]["refresh_token"] == ""
     assert data["tokens"]["access_token"] == "at-123"
+    if os.name != "nt":
+        assert agent_codex.stat().st_mode & 0o777 == 0o700
+        assert view.stat().st_mode & 0o777 == 0o600
 
 
 def test_view_idempotent(tmp_path):
@@ -108,6 +111,20 @@ def test_view_idempotent(tmp_path):
 
     assert sync_host_codex_auth_view(host, agent_codex) == "view"
     assert sync_host_codex_auth_view(host, agent_codex) == "view (fresh)"
+
+
+def test_fresh_view_repairs_private_mode(tmp_path):
+    if os.name == "nt":
+        pytest.skip("posix permission bits")
+    host = tmp_path / "host"
+    agent_codex = tmp_path / "agent" / ".codex"
+    _write_host(host)
+    assert sync_host_codex_auth_view(host, agent_codex) == "view"
+    view = agent_codex / "auth.json"
+    view.chmod(0o644)
+
+    assert sync_host_codex_auth_view(host, agent_codex) == "view (fresh)"
+    assert view.stat().st_mode & 0o777 == 0o600
 
 
 def test_view_tracks_host_rotation(tmp_path):
@@ -155,25 +172,6 @@ def test_no_host_file(tmp_path):
     agent_codex = tmp_path / "agent" / ".codex"
     assert sync_host_codex_auth_view(host, agent_codex) == "no-host-file"
     assert not (agent_codex / "auth.json").exists()
-
-
-def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
-    host = tmp_path / "host"
-    agent_codex = tmp_path / "agent" / ".codex"
-    _write_host(host)
-
-    real_chmod = Path.chmod
-
-    def _fail_chmod(self, *args, **kwargs):
-        if "auth.json.tmp" in self.name:
-            raise OSError("simulated chmod failure")
-        return real_chmod(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "chmod", _fail_chmod)
-
-    assert sync_host_codex_auth_view(host, agent_codex) == "view"
-    data = json.loads((agent_codex / "auth.json").read_text(encoding="utf-8"))
-    assert data["tokens"]["refresh_token"] == ""
 
 
 def test_agent_read_error_falls_through_to_rewrite(tmp_path, monkeypatch):

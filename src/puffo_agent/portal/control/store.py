@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...crypto.encoding import base64url_decode, base64url_encode
 from ...crypto.primitives import Ed25519KeyPair, KemKeyPair, sha256
+from ..host_assets import (
+    _atomic_write_private,
+    _ensure_private_directory,
+    _set_private_file_mode,
+)
 from ..state import home_dir
 
 
@@ -21,7 +25,7 @@ def derive_machine_id(signing_pubkey: bytes) -> str:
 
 def control_dir() -> Path:
     d = home_dir() / "control"
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(d)
     return d
 
 
@@ -31,12 +35,6 @@ def _machine_path() -> Path:
 
 def _pairings_path() -> Path:
     return control_dir() / "pairings.json"
-
-
-def _atomic_write(path: Path, data: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
 
 
 @dataclass
@@ -68,6 +66,7 @@ def load_or_create_machine() -> MachineControlIdentity:
     use. The private keys never leave this file."""
     path = _machine_path()
     if path.exists():
+        _set_private_file_mode(path)
         raw = json.loads(path.read_text(encoding="utf-8"))
         return MachineControlIdentity(
             machine_id=raw["machine_id"],
@@ -82,7 +81,7 @@ def load_or_create_machine() -> MachineControlIdentity:
         signing_secret=base64url_encode(signing.secret_bytes()),
         kem_secret=base64url_encode(kem.secret_bytes()),
     )
-    _atomic_write(
+    _atomic_write_private(
         path,
         json.dumps(
             {
@@ -134,6 +133,7 @@ def load_pairings() -> dict[str, ControlPairing]:
     path = _pairings_path()
     if not path.exists():
         return {}
+    _set_private_file_mode(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
     return {slug: ControlPairing.from_dict(p) for slug, p in raw.items()}
 
@@ -141,7 +141,7 @@ def load_pairings() -> dict[str, ControlPairing]:
 def save_pairing(pairing: ControlPairing) -> None:
     pairings = load_pairings()
     pairings[pairing.operator_slug] = pairing
-    _atomic_write(
+    _atomic_write_private(
         _pairings_path(),
         json.dumps({s: p.to_dict() for s, p in pairings.items()}, indent=2),
     )
@@ -156,7 +156,7 @@ def delete_pairing(operator_slug: str) -> bool:
     if operator_slug not in pairings:
         return False
     del pairings[operator_slug]
-    _atomic_write(
+    _atomic_write_private(
         _pairings_path(),
         json.dumps({s: p.to_dict() for s, p in pairings.items()}, indent=2),
     )
@@ -170,6 +170,7 @@ def current_machine_id() -> str | None:
     if not path.exists():
         return None
     try:
+        _set_private_file_mode(path)
         return json.loads(path.read_text(encoding="utf-8")).get("machine_id")
     except Exception:  # noqa: BLE001
         return None

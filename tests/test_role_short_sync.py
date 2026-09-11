@@ -265,13 +265,10 @@ def test_cli_agent_profile_warns_on_explicit_role_short(
 
 def test_cli_agent_create_warns_on_explicit_role_short(monkeypatch, capsys):
     isolated_home()
-    monkeypatch.setattr(
-        "puffo_agent.portal.cli._resolve_api_key_for_create", lambda **k: ""
-    )
     args = argparse.Namespace(
         id="chip-bot",
-        runtime="chat-local",
-        provider=None,
+        runtime="cli-local",
+        provider="anthropic",
         api_key=None,
         model=None,
         role="coder: main puffo-core coder",

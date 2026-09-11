@@ -6,19 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
+import logging
 import time
 from pathlib import Path
 
 import pytest
 
+
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
-    RATE_LIMIT_FAST_RETRY_MAX_SECONDS,
-    RATE_LIMIT_FAST_RETRY_MIN_SECONDS,
     REFRESH_BROKEN_THRESHOLD,
     REFRESH_PROBE_MODEL,
-    REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
     FileBackend,
     RefreshOutcome,
@@ -274,6 +272,36 @@ def test_run_loop_wakes_early_on_refresh_request(tmp_path, monkeypatch):
     assert wake_latency < 1.0, f"wake_latency={wake_latency:.3f}s — event didn't short-circuit poll"
 
 
+@pytest.mark.asyncio
+async def test_tick_wait_failures_are_reported_once_each_with_tracebacks(
+    tmp_path, caplog,
+):
+    class BrokenEvent:
+        def __init__(self, message):
+            self._message = message
+
+        async def wait(self):
+            raise ValueError(self._message)
+
+    refresher = CredentialRefresher(host_home=tmp_path)
+    refresher._refresh_request = BrokenEvent("refresh wait failed")
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        await refresher._sleep_until_next_tick(BrokenEvent("stop wait failed"))
+        await asyncio.sleep(0)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert sorted(record.getMessage() for record in records) == [
+        "worker task died: refresh_request.wait",
+        "worker task died: stop_event.wait",
+    ]
+    assert all(record.exc_info is not None for record in records)
+    assert {str(record.exc_info[1]) for record in records} == {
+        "stop wait failed",
+        "refresh wait failed",
+    }
+
+
 # ── refresh-token flag round-trip (CLI ↔ daemon sentinel) ──────
 
 
@@ -433,6 +461,8 @@ def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch)
     captured: list[RefreshOutcome] = []
 
     class _FakeBackend:
+        refresh_lock_path = tmp_path / "fake-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -458,6 +488,8 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     captured: list[RefreshOutcome] = []
 
     class _ExplodingBackend:
+        refresh_lock_path = tmp_path / "exploding-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -477,7 +509,7 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     assert captured == [RefreshOutcome.FAILED]
 
 
-def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, caplog):
+def test_filebackend_unchanged_redacts_stdout_and_stderr(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.credential_refresh import FileBackend
     _write_creds(tmp_path, expires_in_seconds=3600)
     backend = FileBackend(host_home=tmp_path)
@@ -495,8 +527,9 @@ def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, cap
     outcome = asyncio.run(backend.refresh())
     assert outcome is RefreshOutcome.UNCHANGED
     joined = " ".join(rec.getMessage() for rec in caplog.records)
-    assert "hello-out" in joined
-    assert "hello-err" in joined
+    assert "hello-out" not in joined
+    assert "hello-err" not in joined
+    assert "output_category=unchanged" in joined
 
 
 def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
