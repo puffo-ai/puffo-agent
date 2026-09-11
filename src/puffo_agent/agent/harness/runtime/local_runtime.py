@@ -75,10 +75,11 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
-from ....portal.host_assets import _atomic_write_private
+from ....portal.host_assets import atomic_write_private
 from ....portal.state import subscription_token
 from ..support.subscription_credentials import (
     AUTH_MODE_SUBSCRIPTION,
+    SubscriptionUnsupported,
     resolve_subscription_credentials,
 )
 from ..drivers.acp import selects_puffo_v0_profile
@@ -407,6 +408,14 @@ class LocalRuntimePreparer:
         return runtime.model or getattr(provider_cfg, "model", "") or ""
 
     def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # Only the claude-code spec resolves a plan credential. Running the
+            # api-gateway path here instead would bill the metered account for
+            # the life of the agent and look like success -- so refuse loudly.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                f"the 'generic' runtime path yet; only claude-code implements it."
+            )
         executable, launch_args = self._resolve_generic_command()
         controlled, opencode_config = self._prepare_executable_configuration(
             executable, system_prompt
@@ -777,7 +786,7 @@ class LocalRuntimePreparer:
             llm_env = dict(subscription.env)
             extra_allowed = subscription.extra_allowed
             for path, content in subscription.files.items():
-                _atomic_write_private(path, content)
+                atomic_write_private(path, content)
         environment = build_child_environment(
             overrides=self.agent_cfg.env_overrides,
             controlled={
@@ -808,6 +817,14 @@ class LocalRuntimePreparer:
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # Only the claude-code spec resolves a plan credential. Running the
+            # api-gateway path here instead would bill the metered account for
+            # the life of the agent and look like success -- so refuse loudly.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                f"the 'codex' runtime path yet; only claude-code implements it."
+            )
         codex_home = agent_codex_user_dir(self.agent_id)
         codex_home.mkdir(parents=True, exist_ok=True)
         agents_md = codex_home / "AGENTS.md"

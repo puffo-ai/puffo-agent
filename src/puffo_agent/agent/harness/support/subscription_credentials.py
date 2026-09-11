@@ -21,8 +21,9 @@ The secret arrives as an argument, never from ``agent.yml`` and never read
 here from the ambient environment. ``agent.yml`` is on disk, synced, and backed
 up, so a token in it would outlive every place we can revoke it; and the
 harness boundary is forbidden from re-reading ``os.environ`` (see
-``tests/test_child_env_allowlist.py``). The daemon resolves the token once at
-startup and passes it down, exactly as it does the gateway API key.
+``tests/test_child_env_allowlist.py``). ``portal.state.subscription_token`` resolves it on the
+provisioning side of the harness boundary and passes it down as an argument,
+the same shape ``claude_cli_api_key`` uses for the gateway key.
 
 ``build_child_environment`` drops anything outside its allowlist, so the only
 way these reach the child is the ``controlled`` mapping -- which is exactly the
@@ -36,6 +37,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ....macos.keychain import is_macos
+
 AUTH_MODE_API_GATEWAY = "api-gateway"
 AUTH_MODE_SUBSCRIPTION = "subscription"
 AUTH_MODES = frozenset({AUTH_MODE_API_GATEWAY, AUTH_MODE_SUBSCRIPTION})
@@ -46,6 +49,15 @@ CLAUDE_SUBSCRIPTION_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 CODEX_SUBSCRIPTION_ENV = "CODEX_SUBSCRIPTION_AUTH_JSON"
 #: Every name above, for the never-inherit set in ``child_env``.
 SUBSCRIPTION_ENV_NAMES = frozenset({CLAUDE_SUBSCRIPTION_ENV, CODEX_SUBSCRIPTION_ENV})
+
+
+class SubscriptionUnsupported(RuntimeError):
+    """``subscription`` asked for on a platform or harness that cannot serve it.
+
+    Raised rather than quietly running the api-gateway path, so an unsupported
+    combination is loud at startup instead of silently billing the metered
+    account for the life of the agent.
+    """
 
 
 class SubscriptionCredentialMissing(RuntimeError):
@@ -63,8 +75,10 @@ class ChildCredentials:
 
     ``files`` maps an absolute path to its content; the caller writes each at
     mode ``0600`` before spawning. ``extra_allowed`` names variables the child
-    may additionally inherit (``CODEX_HOME`` points at a directory, not a
-    secret, so it travels as an allowance rather than a controlled value).
+    may additionally *inherit* from the ambient environment -- unused today,
+    kept because a harness that needs one should not have to widen the
+    boundary. Anything we set ourselves goes in ``env`` instead, which reaches
+    the child deterministically via ``controlled``.
     """
 
     env: Mapping[str, str] = field(default_factory=dict)
@@ -84,7 +98,22 @@ def resolve_subscription_credentials(
     path stays with the runtime that owns it. ``token`` is the daemon-resolved
     secret -- an OAuth token for claude-code, an ``auth.json`` document for
     codex.
+
+    Refused on macOS. anthropics/claude-code#37512: with
+    ``CLAUDE_CODE_OAUTH_TOKEN`` set, the CLI runs
+    ``security delete-generic-password "Claude Code-credentials"`` on exit via
+    its fallback-combiner cleanup, destroying the *operator's own* login.
+    ``HOME``/``CLAUDE_CONFIG_DIR`` redirection does not help -- the Keychain item
+    is user-wide. Cloud agents are Linux, so this costs them nothing; see
+    ``macos/keychain.py``.
     """
+    if is_macos():
+        raise SubscriptionUnsupported(
+            f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is refused on macOS: "
+            "setting CLAUDE_CODE_OAUTH_TOKEN makes the CLI delete the operator's "
+            "own Keychain login on exit (anthropics/claude-code#37512). Run this "
+            f"agent on {AUTH_MODE_API_GATEWAY!r}, or in a Linux sandbox."
+        )
     if harness == "codex":
         return _codex(token, agent_home)
     return _claude_code(token)
@@ -95,8 +124,8 @@ def _claude_code(token: str) -> ChildCredentials:
     if not token:
         raise SubscriptionCredentialMissing(
             f"runtime.auth_mode is {AUTH_MODE_SUBSCRIPTION!r} for a claude-code "
-            f"agent but no subscription token was supplied (daemon config / "
-            f"{CLAUDE_SUBSCRIPTION_ENV}). Generate one with `claude setup-token`."
+            f"agent but {CLAUDE_SUBSCRIPTION_ENV} is unset in the agent process "
+            "environment. Generate one with `claude setup-token`."
         )
     return ChildCredentials(env={CLAUDE_SUBSCRIPTION_ENV: token})
 
@@ -106,12 +135,14 @@ def _codex(token: str, agent_home: Path) -> ChildCredentials:
     if not blob:
         raise SubscriptionCredentialMissing(
             f"runtime.auth_mode is {AUTH_MODE_SUBSCRIPTION!r} for a codex agent "
-            f"but no subscription credential was supplied (daemon config / "
-            f"{CODEX_SUBSCRIPTION_ENV}). It holds a Codex `auth.json` document."
+            f"but {CODEX_SUBSCRIPTION_ENV} is unset in the agent process environment. "
+            "It holds a Codex `auth.json` document."
         )
     codex_home = agent_home / ".codex"
+    # CODEX_HOME is a path, not a secret, but it still travels in ``env``: we
+    # are setting it, not inheriting it, and ``controlled`` is what guarantees
+    # the child sees the value we chose.
     return ChildCredentials(
         env={"CODEX_HOME": str(codex_home)},
         files={codex_home / "auth.json": blob},
-        extra_allowed=("CODEX_HOME",),
     )

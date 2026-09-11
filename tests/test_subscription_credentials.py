@@ -23,9 +23,20 @@ from puffo_agent.agent.harness.support.subscription_credentials import (
     CLAUDE_SUBSCRIPTION_ENV,
     CODEX_SUBSCRIPTION_ENV,
     SubscriptionCredentialMissing,
+    SubscriptionUnsupported,
     resolve_subscription_credentials,
 )
 from puffo_agent.portal.state import RuntimeConfig
+
+_CREDS = "puffo_agent.agent.harness.support.subscription_credentials"
+
+
+@pytest.fixture
+def on_linux(monkeypatch):
+    """Resolution is refused on macOS (Keychain deletion, #37512), so the
+    credential tests pin the Linux/sandbox behaviour explicitly rather than
+    depending on whoever's laptop runs them."""
+    monkeypatch.setattr(f"{_CREDS}.is_macos", lambda: False)
 
 
 def test_auth_mode_defaults_to_api_gateway():
@@ -35,7 +46,7 @@ def test_auth_mode_defaults_to_api_gateway():
     assert AUTH_MODES == {AUTH_MODE_API_GATEWAY, AUTH_MODE_SUBSCRIPTION}
 
 
-def test_claude_code_subscription_supplies_the_oauth_token(tmp_path: Path):
+def test_claude_code_subscription_supplies_the_oauth_token(on_linux, tmp_path: Path):
     creds = resolve_subscription_credentials(
         "claude-code",
         agent_home=tmp_path,
@@ -48,7 +59,7 @@ def test_claude_code_subscription_supplies_the_oauth_token(tmp_path: Path):
     assert not creds.files
 
 
-def test_codex_subscription_is_file_based(tmp_path: Path):
+def test_codex_subscription_is_file_based(on_linux, tmp_path: Path):
     """Codex has no token variable; its plan auth is an auth.json under
     CODEX_HOME, so the credential is written rather than exported."""
     blob = json.dumps({"tokens": {"access_token": "x"}})
@@ -58,14 +69,19 @@ def test_codex_subscription_is_file_based(tmp_path: Path):
     target = tmp_path / ".codex" / "auth.json"
     assert dict(creds.files) == {target: blob}
     assert creds.env == {"CODEX_HOME": str(tmp_path / ".codex")}
-    assert creds.extra_allowed == ("CODEX_HOME",)
+    # CODEX_HOME is set by us, so it travels in env -> controlled, which is what
+    # guarantees the child sees our value. extra_allowed is for inheriting an
+    # ambient variable, which this is not.
+    assert creds.extra_allowed == ()
 
 
 @pytest.mark.parametrize(
     "harness, env_name",
     [("claude-code", CLAUDE_SUBSCRIPTION_ENV), ("codex", CODEX_SUBSCRIPTION_ENV)],
 )
-def test_missing_credential_fails_closed(harness: str, env_name: str, tmp_path: Path):
+def test_missing_credential_fails_closed(
+    on_linux, harness: str, env_name: str, tmp_path: Path
+):
     """Never fall back to the gateway. A fallback keeps working, bills the
     metered account, and looks like success."""
     with pytest.raises(SubscriptionCredentialMissing) as excinfo:
@@ -74,7 +90,7 @@ def test_missing_credential_fails_closed(harness: str, env_name: str, tmp_path: 
 
 
 @pytest.mark.parametrize("harness", ["claude-code", "codex"])
-def test_blank_credential_is_treated_as_missing(harness: str, tmp_path: Path):
+def test_blank_credential_is_treated_as_missing(on_linux, harness: str, tmp_path: Path):
     with pytest.raises(SubscriptionCredentialMissing):
         resolve_subscription_credentials(harness, agent_home=tmp_path, token="   ")
 
@@ -135,3 +151,23 @@ def test_invalid_auth_mode_is_rejected():
     assert _validate_auth_mode("a", AUTH_MODE_SUBSCRIPTION) == AUTH_MODE_SUBSCRIPTION
     with pytest.raises(RuntimeError, match="auth_mode must be one of"):
         _validate_auth_mode("a", "gateway")
+
+
+def test_macos_refuses_subscription_outright(monkeypatch, tmp_path: Path):
+    """anthropics/claude-code#37512: with CLAUDE_CODE_OAUTH_TOKEN set, the CLI
+    deletes the operator's own Keychain login on exit. HOME/CLAUDE_CONFIG_DIR
+    redirection does not help -- the item is user-wide -- so the only safe
+    answer on macOS is to refuse. Cloud agents are Linux and unaffected."""
+    monkeypatch.setattr(f"{_CREDS}.is_macos", lambda: True)
+    with pytest.raises(SubscriptionUnsupported, match="macOS"):
+        resolve_subscription_credentials(
+            "claude-code", agent_home=tmp_path, token="sk-ant-oat01-real"
+        )
+
+
+def test_macos_refusal_beats_a_missing_credential(monkeypatch, tmp_path: Path):
+    """Platform is checked first: on macOS the answer is 'never', not 'set the
+    variable and retry'."""
+    monkeypatch.setattr(f"{_CREDS}.is_macos", lambda: True)
+    with pytest.raises(SubscriptionUnsupported):
+        resolve_subscription_credentials("claude-code", agent_home=tmp_path, token="")

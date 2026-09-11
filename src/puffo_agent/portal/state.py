@@ -473,10 +473,16 @@ def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
 def subscription_token(daemon_cfg: DaemonConfig | None, harness: str) -> str:
     """The operator's plan credential for ``harness``, or "".
 
-    Resolved daemon-side so the harness boundary never reads the ambient
-    environment. Falls back to the process environment the daemon itself was
-    started with, which is how a cloud sandbox receives it: the provisioner
-    sets it at sandbox creation and it is never written to agent.yml.
+    Read from the environment the agent process was started with -- which is how
+    a cloud sandbox receives it: the provisioner sets it at sandbox creation and
+    it is never written to agent.yml. ``daemon_cfg`` is accepted for symmetry
+    with :func:`claude_cli_api_key` and as the seam for a future configured
+    source; nothing reads it yet.
+
+    This lives in ``portal`` rather than the harness tree on purpose. The harness
+    boundary is forbidden from reading ambient environment (see
+    ``tests/test_child_env_allowlist.py``); resolution belongs on this side of it,
+    and the value is handed down as an argument.
     """
     import os
 
@@ -485,11 +491,9 @@ def subscription_token(daemon_cfg: DaemonConfig | None, harness: str) -> str:
         CODEX_SUBSCRIPTION_ENV,
     )
 
+    del daemon_cfg  # reserved; see docstring
     name = CODEX_SUBSCRIPTION_ENV if harness == "codex" else CLAUDE_SUBSCRIPTION_ENV
-    configured = getattr(
-        getattr(daemon_cfg, "subscription", None), "token", ""
-    )
-    return (configured or os.environ.get(name, "")).strip()
+    return (os.environ.get(name, "") or "").strip()
 
 
 @dataclass

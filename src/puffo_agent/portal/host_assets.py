@@ -64,6 +64,11 @@ def _atomic_write_private(target: Path, data: str | bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+#: Public alias. The harness tree writes credential files through this rather
+#: than reaching across the package boundary for a private symbol.
+atomic_write_private = _atomic_write_private
+
+
 def strip_claude_api_key_from_settings(path: Path) -> bool:
     """Remove a persisted Claude API key override from agent settings."""
     try:
