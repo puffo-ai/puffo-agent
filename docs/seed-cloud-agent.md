@@ -3,6 +3,18 @@
 The exact commands, in order, and the two handles you need. Verified end to end
 on 2026-09-12 (`optionexpe-9840-999e4666` → `optionexpe-7146-d57f9ef1`, 10/10).
 
+## Shortcut — one command from a cloud-infra checkout
+
+```bash
+aws sso login --profile puffo-staging-admin
+./aim -e staging seed desk-6332-b73d5e96 desk-iv        # <local prefix> <cloud slug or prefix>
+```
+`aim seed` does steps 1–5 below by itself (credentials from Secrets Manager, slug
+lookup, resume, dry-run, `--profile --deliver`, `--verify`) and fetches this repo
+next to cloud-infra if it is missing. Exit `2` = target already holds memory
+(seed-once): delete + recreate it in the Hub. The rest of this page is the
+long form — what the command does and how to run the pieces by hand.
+
 ## What you need before you start
 
 ### Two handles
