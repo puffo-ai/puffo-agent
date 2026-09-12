@@ -138,6 +138,25 @@ class TestCollectingMemory:
         assert out["profile_bytes"] > 0
         assert not any("profile" in k for k in files)
 
+    def test_the_platform_managed_briefing_is_not_seeded(self, tmp_path):
+        """It names the SOURCE agent and the platform regenerates it from the
+        store-owned profile. The live demo agent read a seeded copy and
+        concluded it was `optionexpe-9840-…` instead of itself."""
+        managed = "<!-- puffo:managed-profile -->\n# OptionExpert\nYou are OptionExpert (agent optionexpe-9840-999e4666).\n"
+        src = _agent(tmp_path / "fleet", "optionexpe-9840-999e4666", profile="# Soul\nx\n",
+                     notes=[("briefing/profile.md", managed), ("notes/lesson.md", "keep me")])
+        files, out = collect_memory(src)
+        assert set(files) == {"notes/lesson.md"}
+        assert b"optionexpe-9840" not in b"".join(files.values())
+        assert out["memory_files"] == 1
+
+    def test_a_hand_written_briefing_is_still_seeded(self, tmp_path):
+        """Only the managed file is excluded; a user's own briefing note is content."""
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("briefing/context.md", "# My standing context\nremember this")])
+        files, _ = collect_memory(src)
+        assert set(files) == {"briefing/context.md"}
+
     def test_agent_with_no_memory_is_not_a_failure(self, tmp_path):
         """30 of the surveyed fleet have no memory dir."""
         src = _agent(tmp_path / "fleet", "grist-1-aaaaaaaa", profile="# Soul\nx\n")
