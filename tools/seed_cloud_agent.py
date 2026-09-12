@@ -180,7 +180,7 @@ def collect_memory(agent_dir: Path) -> tuple[dict[str, bytes], dict]:
     }
 
 
-def _control(path: str, payload: dict) -> dict:
+def _control(path: str, payload: dict, method: str = "PUT") -> dict:
     """One authenticated call to the AIM control API. Stdlib only.
 
     Needs ``AIM_CONTROL_URL`` + ``AIM_CONTROL_TOKEN``. That token is a PLATFORM
@@ -203,7 +203,7 @@ def _control(path: str, payload: dict) -> dict:
             "Authorization": f"Bearer {token}",
             "X-Operator": os.environ.get("USER", "seed-cli"),
         },
-        method="PUT",
+        method=method,
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
@@ -213,6 +213,24 @@ def _control(path: str, payload: dict) -> dict:
         raise SeedError(f"control API said {exc.code}: {detail}") from None
     except urllib.error.URLError as exc:
         raise SeedError(f"could not reach {base}: {exc.reason}") from None
+
+
+def deliver(cloud_slug: str) -> dict:
+    """Push the STORED memory into the agent's RUNNING sandbox — once, if empty.
+
+    An upload is "stored, not delivered": a sandbox is seeded only when it
+    boots, so memory uploaded after the agent was created sits in the store
+    while the agent answers from an empty brain. A reboot is not the answer —
+    a cloud agent's identity keys live only in its sandbox, so recreating it
+    mints a new identity and breaks the agent in the Hub.
+
+    This asks AIM to seed the live sandbox instead. The seed-once rule holds:
+    if the sandbox already has any memory, nothing is written and the server
+    says so. The agent reads its memory dir per turn, so delivered files are
+    live on its next message.
+    """
+    ack = _control(f"/agents/{cloud_slug}/memory/deliver", {}, method="POST")
+    return {"delivered": int(ack.get("delivered", 0)), "reason": str(ack.get("reason", ""))}
 
 
 def upload(cloud_slug: str, files: dict[str, bytes]) -> int:
@@ -407,6 +425,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fleet", type=Path, default=DEFAULT_FLEET)
     ap.add_argument("--to", metavar="CLOUD_SLUG", help="cloud agent to upload the memory to")
     ap.add_argument("--dry-run", action="store_true", help="report, write nothing")
+    ap.add_argument(
+        "--deliver",
+        action="store_true",
+        help="after upload (or alone with --to), seed the RUNNING sandbox from the store "
+        "— only if its memory tree is empty; no reboot",
+    )
     ap.add_argument("--verify", metavar="CLOUD_SLUG", help="check a live cloud agent is ready to serve")
     ap.add_argument("--expect-template", default="", help="--verify: template id the agent should have booted")
     ap.add_argument("--expect-auth-mode", default="", help="--verify: api-gateway | subscription")
@@ -423,8 +447,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    if args.deliver and not args.source and not args.all:
+        # Deliver-only: the memory is already in the store (an earlier upload).
+        if not args.to:
+            ap.error("--deliver needs --to <cloud-slug>")
+        try:
+            out = deliver(args.to)
+        except SeedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"delivered {out['delivered']} memory file(s) to {args.to}: {out['reason']}")
+        return 0 if out["delivered"] or "not empty" in out["reason"] else 1
+
     if not args.all and not args.source:
-        ap.error("give --from <agent>, --all, or --verify <cloud-slug>")
+        ap.error("give --from <agent>, --all, --verify <cloud-slug>, or --deliver --to <cloud-slug>")
     if not args.dry_run and not args.to:
         ap.error("--to <cloud-slug> is required unless --dry-run")
     if args.all and args.to:
@@ -460,8 +496,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"\nuploaded {n} memory file(s) to {args.to}")
-    print("Stored, not delivered: a running agent keeps the memory it has.")
-    print("Memory is seeded into a sandbox only on a FRESH boot.")
+    if args.deliver:
+        try:
+            out = deliver(args.to)
+        except SeedError as exc:
+            print(f"error: upload succeeded but delivery failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"delivered {out['delivered']} memory file(s) into the running sandbox: {out['reason']}")
+    else:
+        print("Stored, not delivered: a running agent keeps the memory it has.")
+        print("Memory is seeded into a sandbox only on a FRESH boot — add --deliver to seed it now.")
     if summary["profile_bytes"]:
         print(
             f"\nprofile.md ({summary['profile_bytes']}B) was NOT uploaded — the agent "

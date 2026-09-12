@@ -28,6 +28,7 @@ from seed_cloud_agent import (  # noqa: E402
     agent_name,
     soul_body,
     collect_memory,
+    deliver,
     upload,
 )
 
@@ -297,3 +298,43 @@ class TestTheProbeExtractsTheRelayHost:
     def test_no_server_url_yields_empty_not_garbage(self, tmp_path):
         """Empty is the signal `conns_relay=-1` rides on — it must stay empty."""
         assert self._extract(tmp_path, "harness: claude-code\n") == ""
+
+
+
+class TestDeliver:
+    """Closes "stored, not delivered" without a reboot — a reboot mints a new
+    identity (keys/ lives only in the sandbox) and breaks the Hub agent."""
+
+    def test_it_posts_to_the_deliver_route(self, monkeypatch):
+        seen = {}
+
+        def fake(path, payload, method="PUT"):
+            seen.update(path=path, method=method)
+            return {"delivered": 2, "reason": "seeded into the running sandbox"}
+
+        monkeypatch.setattr(seed_cloud_agent, "_control", fake)
+        out = deliver("desk-cloud-2779")
+        assert seen == {"path": "/agents/desk-cloud-2779/memory/deliver", "method": "POST"}
+        assert out["delivered"] == 2
+
+    def test_a_non_empty_sandbox_is_reported_not_raised(self, monkeypatch):
+        """seed-once: the server leaves an agent with memory alone and says why."""
+        monkeypatch.setattr(
+            seed_cloud_agent, "_control",
+            lambda p, b, method="PUT": {"delivered": 0, "reason": "sandbox memory is not empty"},
+        )
+        out = deliver("a1")
+        assert out["delivered"] == 0 and "not empty" in out["reason"]
+
+    def test_deliver_only_mode_needs_to(self, capsys):
+        with pytest.raises(SystemExit):
+            seed_cloud_agent.main(["--deliver"])
+        assert "--to" in capsys.readouterr().err
+
+    def test_deliver_only_mode_runs_without_from(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            seed_cloud_agent, "_control",
+            lambda p, b, method="PUT": {"delivered": 3, "reason": "seeded"},
+        )
+        assert seed_cloud_agent.main(["--deliver", "--to", "a1"]) == 0
+        assert "delivered 3" in capsys.readouterr().out
