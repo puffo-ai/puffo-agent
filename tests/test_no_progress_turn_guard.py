@@ -308,7 +308,7 @@ def test_repeated_no_progress_backs_off_instead_of_spinning():
 
 def test_the_backoff_is_bounded():
     rt = _rearm_runtime()
-    for _ in range(40):
+    for _ in range(1100):
         rt.note_no_progress_turn()
     assert rt.next_no_progress_rearm_delay() == 300.0
 
@@ -402,13 +402,14 @@ def test_the_escalation_ladder_is_explicit():
 # the settle block must fail a test, not just look wrong in review.
 
 
-def _loop_runtime(outcomes):
+def _loop_runtime(outcomes, workspace):
     """A runtime whose turns settle as ``outcomes`` says, with the real
     ``process_once`` / ``_wake_remaining_pending`` bodies and everything else
     stubbed to the shortest thing that lets the turn reach its settle."""
     from puffo_agent.agent.global_inbox_types import RuntimeHealth
 
     rt = _rearm_runtime()
+    rt.workspace = workspace
     rt.health = RuntimeHealth()
     rt._boundary = asyncio.Lock()
     rt._turn_state_lock = asyncio.Lock()
@@ -452,21 +453,21 @@ def _immediate(value):
     return _run()
 
 
-def test_a_wedged_turn_stops_spinning_after_the_first_repeat():
+def test_a_wedged_turn_stops_spinning_after_the_first_repeat(tmp_path):
     """The storm, reproduced: every turn settles ``no_progress`` and the rows
     stay pending. Before the bound, each pass re-armed at zero delay and the
     loop ran as fast as the provider could fail."""
-    rt = _loop_runtime(["no_progress"] * 4)
+    rt = _loop_runtime(["no_progress"] * 4, tmp_path)
     for _ in range(4):
         assert asyncio.run(rt.process_once()) is True
     assert rt.notified == 1, "only the first repeat re-arms immediately"
     assert rt.coalescer.delays == [5.0, 10.0, 20.0]
 
 
-def test_a_turn_that_makes_progress_clears_the_bound():
+def test_a_turn_that_makes_progress_clears_the_bound(tmp_path):
     """A recovered provider must not stay throttled: the next wedged turn
     starts the ladder again from immediate."""
-    rt = _loop_runtime(["no_progress", "no_progress", "succeeded", "no_progress"])
+    rt = _loop_runtime(["no_progress", "no_progress", "succeeded", "no_progress"], tmp_path)
     for _ in range(4):
         asyncio.run(rt.process_once())
     assert rt.coalescer.delays == [5.0], "one backed-off re-arm, before the success"

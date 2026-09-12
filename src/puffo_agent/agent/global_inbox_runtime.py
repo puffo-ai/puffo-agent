@@ -30,7 +30,7 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
-from .errors import AgentAPIError
+from .errors import AgentAPIError, ProviderFailureError
 from .turn_recovery import read_recovery, recovery_required
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from ._usage_markers import looks_like_budget_cap
@@ -1357,7 +1357,7 @@ class GlobalInboxRuntime(
         terminal_error = operator_failure_text(exc)
         if process_outcome in {"drained", "extra_usage_required"}:
             if process_outcome == "drained" and (
-                getattr(exc, "error_code", "") == "budget_exceeded"
+                (isinstance(exc, ProviderFailureError) and exc.error_code == "budget_exceeded")
                 or looks_like_budget_cap(terminal_error)
             ):
                 hold = self.next_budget_park_hold()

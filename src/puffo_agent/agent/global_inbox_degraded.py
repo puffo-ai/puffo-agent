@@ -120,9 +120,12 @@ class DegradedRecoveryMixin:
         """
         if self._no_progress_rearm_attempts <= 1:
             return 0.0
+        # Six doublings reach the 300s cap. Bound before exponentiation so a
+        # persistent failure cannot overflow while calculating a capped delay.
+        exponent = min(self._no_progress_rearm_attempts - 2, 6)
         return min(
             NO_PROGRESS_REARM_BASE_SECONDS
-            * 2 ** (self._no_progress_rearm_attempts - 2),
+            * 2 ** exponent,
             NO_PROGRESS_REARM_MAX_SECONDS,
         )
 

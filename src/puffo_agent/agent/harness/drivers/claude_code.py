@@ -1090,10 +1090,18 @@ def _result_error_code(frame: dict[str, Any], subtype: str) -> str:
     return normalized or "execution_error"
 
 
-def _result_provider_error(frame: dict[str, Any]) -> dict[str, Any]:
+def _result_provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize a ``result`` frame that carries ``is_error: true``."""
     raw_status = frame.get("api_error_status", frame.get("apiErrorStatus"))
     status = raw_status if type(raw_status) is int else None
+    if (
+        frame.get("subtype") not in {None, "", "success"}
+        and status is None
+        and frame.get("terminal_reason") != "api_error"
+    ):
+        # CLI errors such as invalid_resume also set is_error. Preserve their
+        # existing recovery codes unless the frame identifies an API failure.
+        return None
     errors = frame.get("errors")
     fragments = [
         str(frame.get("result") or ""),
