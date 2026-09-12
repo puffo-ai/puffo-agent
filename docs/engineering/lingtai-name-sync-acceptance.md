@@ -54,11 +54,13 @@
 ## 最终集成结果
 
 - Web 9b217098；daemon e48b168b；server 18d3538（Boris e398d2a8的同内容cherry-pick）。
-- Server补丁独立验证：profiles39、v2 identities27、WS107；完整lib1428通过/3忽略。组合Docker镜像构建并在隔离本地栈运行成功。
+- Server补丁独立验证：profiles39、v2 identities27、WS107；组合18d3538完整lib1429通过/0失败/3忽略（Boris seq199053复核）。组合Docker镜像构建并在隔离本地栈运行成功。
 - 两个真实账号（owner / non-owner）打开聊天和资料页，未刷新即收到更新。清空时两边原始profile缓存均为null，分别显示“未命名”/“Unnamed”；恢复时两边收到同一个真实名称。
 - 本轮source mutation由验收脚本执行，每阶段比较写入后的完整.agent.json与同步后字节，均未被同步器改写；随后恢复原来的测试名称。
 - 证据位于workspace artifacts/lingtai-import/restoration/name-sync-*.json/.png。此文档只记录已执行证据，先前e24a97a0验收包的导入与工具调用证据继续适用，名称同步由本轮补充。
 
 上游待定项由 LingTai 协作者登记于 [lingtai-kernel#1709](https://github.com/Lingtai-AI/lingtai-kernel/issues/1709)，本轮没有改变灵台自命名的持久化策略。
 
-CI检查：daemon e48b168b 的pre-commit与Python3.11/3.12均通过；Web与server CI仍在等待完成，不能称为三仓全部CI通过。
+CI检查：daemon e48b168b 的pre-commit与Python3.11/3.12均通过；Web CI出现3项失败，server剩一项检查在运行；不能称为三仓全部CI通过。
+
+部署顺序约束（Boris seq199053源码复核）：先部署Server #370，再部署daemon #349。旧Server会忽略display_name:null但仍返回成功，新daemon因此缓存已发布，无法保证清空生效。当前没有自动兼容协商替代此顺序。Web #955 的 CI 发现3项失败：Boris确认2项billing在基线上同样失败；新增重试测试存在等待失败态不足的问题，已补等待失败态，CreateAgentModal整文件21项通过；推送后继续检查CI。
