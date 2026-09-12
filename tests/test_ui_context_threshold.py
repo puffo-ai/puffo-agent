@@ -343,3 +343,24 @@ def test_save_rejects_oversized_utf8_fields(
 
     assert warnings
     assert message in warnings[0][-1]
+
+
+def test_lingtai_editor_cannot_persist_a_ghost_name(qapp, agent_home, monkeypatch):
+    """Desktop UI and its save handler both reject source-owned profile edits."""
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.harness = "acp"
+    cfg.runtime.harness_command = ["/bin/lingtai-agent", "acp", "--profile", "puffo-v1"]
+    cfg.save()
+    view = agent_detail.AgentDetail()
+    view.bind(cfg.id)
+    assert view._display_name.isReadOnly()
+    assert view._role.isReadOnly()
+    assert view._soul.isReadOnly()
+    view._display_name.setText("Ghost")
+    view._check_dirty()
+    assert not view._save_btn.isEnabled()
+    warnings = []
+    monkeypatch.setattr(agent_detail.QMessageBox, "warning", lambda *args: warnings.append(args))
+    view._on_save()
+    assert warnings
+    assert AgentConfig.load(cfg.id).display_name == cfg.display_name

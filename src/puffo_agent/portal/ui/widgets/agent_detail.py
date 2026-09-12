@@ -426,6 +426,11 @@ class AgentDetail(QWidget):
         self._owner_slug.setText(
             f"{owner_name} ({owner_slug})" if owner_name and owner_name != owner_slug else owner_slug
         )
+        from ...control.lingtai_profile import is_lingtai_runtime
+        managed_profile = is_lingtai_runtime(cfg.runtime)
+        for field in (self._display_name, self._role, self._role_short, self._soul):
+            field.setReadOnly(managed_profile)
+            field.setToolTip("Managed in LingTai; edit the source there." if managed_profile else "")
         self._display_name.setText(cfg.display_name)
         self._role.setText(cfg.role)
         self._role_short.setText(cfg.role_short)
@@ -492,7 +497,10 @@ class AgentDetail(QWidget):
             self._initial_snapshot is not None
             and self._snapshot() != self._initial_snapshot
         )
-        self._save_btn.setEnabled(dirty)
+        from ...control.lingtai_profile import is_lingtai_runtime
+        managed = self._cfg is not None and is_lingtai_runtime(self._cfg.runtime)
+        self._save_btn.setEnabled(dirty and not managed)
+        self._save_btn.setToolTip("Edit this profile and runtime in LingTai." if managed else "")
         self._revert_btn.setEnabled(dirty)
 
     def _update_action_buttons(self) -> None:
@@ -886,6 +894,10 @@ class AgentDetail(QWidget):
         if not self._cfg or not self._agent_id:
             return
         cfg = self._cfg
+        from ...control.lingtai_profile import is_lingtai_runtime
+        if is_lingtai_runtime(cfg.runtime):
+            QMessageBox.warning(self, "Save", "This profile and runtime are managed in LingTai; edit them there.")
+            return
 
         previous_context_config = (
             cfg.runtime.kind,

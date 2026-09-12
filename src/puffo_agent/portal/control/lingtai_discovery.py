@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
 from .lingtai_profile import read_source_profile
 
 import asyncio
@@ -178,9 +176,12 @@ def _normalize(row: object, root: Path) -> dict:
     # Keep drifted registrations visible even when their workspace is missing.
     if status == "available" and not workspace_path.is_dir():
         raise ValueError("LingTai discovery returned a missing working folder")
+    source = read_source_profile(directory)
     return {
         "source_dir_name": directory.name, "agent_dir": str(directory),
-        **asdict(read_source_profile(directory)),
+        "agent_name": source.agent_name, "name_source_file": source.name_source_file,
+        "profile_read_error": source.profile_read_error,
+        "import_display_name": source.import_display_name,
         "description": None, "profile_source": "lingtai",
         "workspace": str(workspace_path), "status": status,
         "runtime_id": row.get("runtime_id"),

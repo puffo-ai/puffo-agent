@@ -588,6 +588,12 @@ async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields
     ])
     cfg.display_name = "Old"
     cfg.save()
+    import argparse
+    from puffo_agent.portal.cli import cmd_agent_rename, cmd_agent_profile
+    before_config = cfg.display_name
+    assert cmd_agent_rename(argparse.Namespace(id=cfg.id, display_name="Ghost")) == 2
+    assert cmd_agent_profile(argparse.Namespace(id=cfg.id, display_name="Ghost", role=None, role_short=None)) == 2
+    assert AgentConfig.load(cfg.id).display_name == before_config
     posted = []
     fail = True
     async def patch_profile(config, patch):
@@ -612,6 +618,13 @@ async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields
     manifest.write_text('broken')
     await monitor.sync_one(cfg)
     assert len(posted) == 2
+    manifest.unlink()
+    (source / "init.json").write_text('{"manifest":{"agent_name":null}}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # Missing current manifest must not clear a self-chosen name.
+    manifest.write_text('{}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # A missing field is not an explicit clear either.
     manifest.write_text('{"agent_name":null}')
     await monitor.sync_one(cfg)
     assert posted[-1] == {"display_name": None}

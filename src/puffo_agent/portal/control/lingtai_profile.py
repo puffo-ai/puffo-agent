@@ -19,6 +19,7 @@ class SourceProfile:
     name_source_file: str | None
     profile_read_error: str | None
     import_display_name: str | None
+    name_is_explicit_null: bool = False
 
 
 def _read_source_object(path: Path) -> dict:
@@ -61,7 +62,7 @@ def read_source_profile(directory: Path) -> SourceProfile:
                 raise ValueError("agent_name is not a safe display name")
             if not name.strip():
                 name = None
-        return SourceProfile(name, source, None, name or "")
+        return SourceProfile(name, source, None, name or "", "agent_name" in metadata and metadata["agent_name"] is None)
     except FileNotFoundError:
         return SourceProfile(None, None, "source_unreadable", None)
     except (OSError, ValueError, RecursionError):
