@@ -368,6 +368,19 @@ def _make_keychain_backend(home: Path) -> cr.KeychainBackend:
     return cr.KeychainBackend(home=home, cache=cache)
 
 
+def _passwd_home() -> Path:
+    """The login account's home, read independently of the code under test.
+
+    Deliberately NOT ``Path.home()``: every Puffo agent runs with an
+    overridden ``$HOME``, so ``Path.home()`` is a sandbox path here.
+    Asserting against it would compare the production helper to itself
+    and pass no matter which home the daemon actually used.
+    """
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
 def test_keychain_backend_bootstrap_reads_keychain(monkeypatch, tmp_path):
     """``bootstrap`` should populate the cache from Keychain. The
     refresher calls this once on daemon-loop entry."""
@@ -493,11 +506,20 @@ def test_keychain_backend_refresh_uses_real_home(monkeypatch, tmp_path):
     backend = _make_keychain_backend(tmp_path)
     backend.cache.write(_BLOB)
 
+    # Run under an overridden $HOME — the daemon's normal condition (every
+    # agent, and any staging instance, sets its own HOME). Without this the
+    # assertions below would compare Path.home() to itself and could never
+    # fail, which is how the sandbox-HOME regression got in.
+    sandbox_home = tmp_path / "sandbox-home"
+    sandbox_home.mkdir()
+    monkeypatch.setenv("HOME", str(sandbox_home))
+
     outcome = asyncio.run(backend.refresh())
     assert outcome == cr.RefreshOutcome.REFRESHED
-    # HOME = real user HOME, not a sandbox tempdir.
-    assert spawned["env"]["HOME"] == str(Path.home())
-    assert spawned["cwd"] == str(Path.home())
+    # HOME = real login HOME, not the sandbox one we just set.
+    assert spawned["env"]["HOME"] == str(_passwd_home())
+    assert spawned["cwd"] == str(_passwd_home())
+    assert spawned["env"]["HOME"] != str(sandbox_home)
     # Sentinel against #37512 regression — must never set this env var.
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spawned["env"]
     # Cache is now synced to the rotated blob (read straight from Keychain).
@@ -732,7 +754,7 @@ def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
     assert spawned, "backend.refresh should have run claude --print"
     # Refresh uses real HOME — same model as FileBackend.
     env = spawned[0]
-    assert env["HOME"] == str(Path.home())
+    assert env["HOME"] == str(_passwd_home())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -957,3 +979,65 @@ def test_poll_external_rotation_detects_disk_rotation_when_keychain_dead(
     assert rotated is True
     assert backend._last_propagated_blob == _REFRESHED_BLOB
     assert backend.cache.read() == _REFRESHED_BLOB
+
+
+def test_keychain_lock_path_ignores_home_override(monkeypatch, tmp_path):
+    """Two daemons running as one user must reach the same host lock.
+
+    The Keychain entry they both refresh is keyed on UID, not HOME, so a
+    staging daemon started with its own ``HOME`` (the normal way to stand
+    one up) must not get its own lock file — that would silently drop the
+    mutual exclusion this lock exists to provide.
+
+    Regression for the anchor mismatch: ``refresh_lock_path`` used
+    ``Path.home()``, which follows ``$HOME``.
+    """
+    prod_home = tmp_path / "prod"
+    staging_home = tmp_path / "staging" / "hosthome"
+    login_home = tmp_path / "login"
+    for h in (prod_home, staging_home, login_home):
+        h.mkdir(parents=True)
+
+    monkeypatch.setattr(cr, "_login_home", lambda: login_home)
+
+    monkeypatch.setenv("HOME", str(prod_home))
+    prod_lock = _make_keychain_backend(prod_home).refresh_lock_path
+
+    monkeypatch.setenv("HOME", str(staging_home))
+    staging_lock = _make_keychain_backend(staging_home).refresh_lock_path
+
+    # Same UID, different HOME (and different PUFFO_AGENT_HOME) => one lock.
+    assert prod_lock == staging_lock
+    # And it is anchored on the login account, not on either $HOME.
+    assert prod_lock == login_home / ".claude" / ".puffo-refresh.lock"
+    assert prod_home not in prod_lock.parents
+    assert staging_home not in staging_lock.parents
+
+
+def test_login_home_ignores_home_env():
+    """``_login_home`` reads the passwd record, so ``$HOME`` can't move it."""
+    import pwd
+
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    before = cr._login_home()
+    os.environ["HOME"] = "/tmp/definitely-not-the-login-home"
+    try:
+        assert cr._login_home() == real
+        assert cr._login_home() == before
+        # Guard the premise: Path.home() *does* move, which is the bug.
+        assert Path.home() != real
+    finally:
+        os.environ["HOME"] = str(real)
+
+
+def test_file_backend_still_follows_home(tmp_path):
+    """FileBackend must NOT be UID-anchored.
+
+    On Linux / Windows the canonical store *is* ``$HOME/.claude``, so a
+    distinct HOME is a genuinely distinct credential that should keep its
+    own lock. Guards against over-applying the Keychain fix.
+    """
+    a = cr.FileBackend(host_home=tmp_path / "a")
+    b = cr.FileBackend(host_home=tmp_path / "b")
+    assert a.refresh_lock_path != b.refresh_lock_path
+    assert a.refresh_lock_path == tmp_path / "a" / ".claude" / ".puffo-refresh.lock"
