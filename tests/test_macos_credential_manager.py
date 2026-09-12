@@ -16,6 +16,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -43,6 +46,21 @@ _REFRESHED_BLOB = json.dumps({
         "expiresAt": 9_999_999_500,
     },
 })
+
+
+@pytest.fixture(autouse=True)
+def login_account(monkeypatch, tmp_path):
+    """Keep mocked Keychain tests away from real credentials on every OS."""
+    login = tmp_path / "login"
+    login.mkdir()
+    monkeypatch.setenv("HOME", str(login))
+    monkeypatch.setenv("USERPROFILE", str(login))
+    monkeypatch.setitem(sys.modules, "pwd", SimpleNamespace(
+        getpwuid=lambda uid: SimpleNamespace(pw_dir=str(login)),
+    ))
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    return login
 
 
 def _view(blob: str) -> str:
@@ -470,12 +488,14 @@ def _stub_keychain_sequence(monkeypatch, blobs):
     monkeypatch.setattr(cm, "read_keychain_blob", fake_read)
 
 
-def test_keychain_backend_refresh_uses_real_home(monkeypatch, tmp_path):
+def test_keychain_backend_refresh_uses_real_home(monkeypatch, tmp_path, login_account):
     """KeychainBackend.refresh must spawn ``claude --print`` with the
     user's real HOME (NOT a sandbox HOME) — mirrors FileBackend so
     claude's own OAuth path writes Keychain directly the same way the
     user's interactive ``claude`` invocation does."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setenv("HOME", str(tmp_path / "staging"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "staging"))
 
     spawned = {}
 
@@ -496,8 +516,8 @@ def test_keychain_backend_refresh_uses_real_home(monkeypatch, tmp_path):
     outcome = asyncio.run(backend.refresh())
     assert outcome == cr.RefreshOutcome.REFRESHED
     # HOME = real user HOME, not a sandbox tempdir.
-    assert spawned["env"]["HOME"] == str(Path.home())
-    assert spawned["cwd"] == str(Path.home())
+    assert spawned["env"]["HOME"] == str(login_account)
+    assert spawned["cwd"] == str(login_account)
     # Sentinel against #37512 regression — must never set this env var.
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spawned["env"]
     # Cache is now synced to the rotated blob (read straight from Keychain).
@@ -743,7 +763,16 @@ def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
 
 
 def _patch_disk_blob(monkeypatch, blob):
-    monkeypatch.setattr(cr, "_read_disk_credentials_blob", lambda _home: blob)
+    login_home = Path(sys.modules["pwd"].getpwuid(os.getuid()).pw_dir)
+    monkeypatch.setenv("HOME", str(login_home / "daemon-home"))
+    monkeypatch.setenv("USERPROFILE", str(login_home / "daemon-home"))
+
+    def read_disk(home):
+        # Disk fallback must read the account refreshed under the shared lock.
+        assert home == login_home
+        return blob
+
+    monkeypatch.setattr(cr, "_read_disk_credentials_blob", read_disk)
 
 
 def _patch_disk_expires(monkeypatch, expires_in_seconds):
@@ -957,3 +986,48 @@ def test_poll_external_rotation_detects_disk_rotation_when_keychain_dead(
     assert rotated is True
     assert backend._last_propagated_blob == _REFRESHED_BLOB
     assert backend.cache.read() == _REFRESHED_BLOB
+
+
+@pytest.mark.parametrize("home_set", [True, False])
+def test_keychain_lock_ignores_daemon_home(monkeypatch, tmp_path, login_account, home_set):
+    """Same login credential must have one lock across daemon HOME values."""
+    before = os.environ.get("HOME")
+    prod = _make_keychain_backend(tmp_path / "prod")
+    staging = _make_keychain_backend(tmp_path / "staging")
+    prod_lock = prod.refresh_lock_path
+    with monkeypatch.context() as env:
+        if home_set:
+            env.setenv("HOME", str(tmp_path / "override"))
+        else:
+            env.delenv("HOME", raising=False)
+        env.setenv("USERPROFILE", str(tmp_path / "override"))
+        assert staging.refresh_lock_path == prod_lock
+        assert staging.refresh_lock_path == login_account / ".claude" / ".puffo-refresh.lock"
+    assert os.environ.get("HOME") == before
+
+
+def test_keychain_account_lookup_failure_stops_before_refresh(monkeypatch, tmp_path):
+    """A passwd failure must not restore split locks or spawn an unlocked refresh."""
+    def unavailable(uid):
+        raise KeyError(uid)
+
+    monkeypatch.setattr(sys.modules["pwd"], "getpwuid", unavailable)
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
+    r = cr.CredentialRefresher(backend=backend)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("refresh spawned without a stable login lock")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    with pytest.raises(RuntimeError, match="login home"):
+        asyncio.run(r._refresh_now(expires_in=-1, by_agent=True))
+
+
+def test_file_credentials_keep_separate_locks(tmp_path):
+    """Different file credentials are distinct resources and must not share a lock."""
+    prod = cr.FileBackend(host_home=tmp_path / "prod")
+    staging = cr.FileBackend(host_home=tmp_path / "staging")
+    assert prod.refresh_lock_path != staging.refresh_lock_path
+    assert prod.refresh_lock_path.parent == tmp_path / "prod" / ".claude"
+    assert staging.refresh_lock_path.parent == tmp_path / "staging" / ".claude"

@@ -247,3 +247,51 @@ async def test_docker_preflight_reuses_container_probe(monkeypatch):
         RuntimeConfig(kind="cli-docker", harness="claude-code"),
         agent_id="docker-agent",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('harness', ['pi', 'opencode'])
+@pytest.mark.parametrize('model,default', [('', 'unavailable'), ('explicit', 'unavailable'), ('', '')])
+async def test_preflight_checks_same_effective_model_as_preparer(
+    monkeypatch, tmp_path, harness, model, default,
+):
+    """An unavailable daemon default must fail before identity materialization."""
+    from types import SimpleNamespace
+    from puffo_agent.portal.state import DaemonConfig
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
+
+    cfg = DaemonConfig()
+    cfg.anthropic.model = default
+    monkeypatch.setattr(DaemonConfig, 'load', classmethod(lambda cls: cfg))
+    monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(preflight, 'resolve_pi_bin', lambda: 'synthetic-pi')
+    monkeypatch.setattr(preflight, 'resolve_opencode_bin', lambda: 'synthetic-opencode')
+    seen = []
+
+    def opencode_status(executable, selected):
+        seen.append(selected)
+        return 'model_not_available' if selected == 'unavailable' else 'ready'
+
+    def pi_status(executable, **kwargs):
+        seen.append(kwargs['model'])
+        return PiAuthResult(
+            status='not_ready' if kwargs['model'] == 'unavailable' else 'ready',
+            provider='anthropic',
+        )
+
+    monkeypatch.setattr(preflight, 'opencode_model_status', opencode_status)
+    monkeypatch.setattr(preflight, 'check_pi_auth', pi_status)
+    runtime = _runtime(harness=harness, model=model)
+    preparer = object.__new__(LocalRuntimePreparer)
+    preparer.agent_cfg = SimpleNamespace(runtime=runtime)
+    preparer.daemon_cfg = cfg
+    preparer.provider = 'anthropic'
+    preparer.harness_name = harness
+    expected = preparer._resolve_model()
+    if expected == 'unavailable':
+        with pytest.raises(ProvisionError):
+            await preflight.preflight_runtime(runtime)
+    else:
+        await preflight.preflight_runtime(runtime)
+    assert seen == [expected]
+    assert runtime.model == model

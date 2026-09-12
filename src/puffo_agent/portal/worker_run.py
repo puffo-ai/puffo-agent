@@ -921,7 +921,11 @@ class StandardWorkerRun:
         worker: Worker, agent_id: str, outcome: str, error_text: str | None
     ) -> None:
         try:
-            if outcome == "succeeded":
+            if outcome == "recovery_required":
+                worker.runtime.health = "provider_error"
+                worker.runtime.error = error_text or "Operator recovery required"
+                worker.runtime.save(agent_id)
+            elif outcome == "succeeded":
                 worker._resolve_health_after_success(agent_id)
             elif outcome == "no_progress":
                 worker._note_no_progress_turn(agent_id)

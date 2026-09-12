@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ...cli_bin import normalize_launch_argv
 from ...provider_failures import classify_provider_failure
 from ..driver import (
     HarnessEvent,
@@ -78,7 +79,7 @@ def build_pi_launch_command(spec: RuntimeSpec) -> tuple[str, ...]:
     ``switch_session`` resume impossible, so a driver declaring
     ``session_resume=True`` must never pass it.
     """
-    command = [spec.executable or "pi", "--mode", "rpc"]
+    command = [*normalize_launch_argv(spec.executable or "pi"), "--mode", "rpc"]
     if spec.model:
         command.extend(("--model", spec.model))
     command.extend(spec.launch_args)

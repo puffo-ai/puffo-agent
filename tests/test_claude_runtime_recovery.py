@@ -48,8 +48,9 @@ async def test_context_query_discovers_pre_turn_compaction_capability():
     assert adapter.context_limits() == (1_000_000, 967_000)
 
 
+@pytest.mark.parametrize("is_error", [False, True])
 @pytest.mark.asyncio
-async def test_invalid_resume_result_has_stable_error_code():
+async def test_invalid_resume_result_has_stable_error_code(is_error):
     driver = ClaudeCodeCliDriver()
     driver._session_ref = SessionRef("native")
     driver._native_session_id = "missing-session"
@@ -58,6 +59,7 @@ async def test_invalid_resume_result_has_stable_error_code():
     await driver._handle_result({
         "type": "result",
         "subtype": "error_during_execution",
+        "is_error": is_error,
         "errors": [
             "No conversation found with session ID: missing-session"
         ],

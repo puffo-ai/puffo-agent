@@ -44,6 +44,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .._proc import no_window_kwargs
+
 from .state import home_dir
 
 LAUNCHD_LABEL = "ai.puffo.agent"
@@ -107,7 +109,9 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, **no_window_kwargs()
+        )
     except FileNotFoundError:
         # No launchctl/systemctl on this box (e.g. a non-systemd distro):
         # report it like any failed call instead of tracebacking.

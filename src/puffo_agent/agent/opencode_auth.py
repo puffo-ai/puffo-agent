@@ -16,6 +16,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Literal
 
+from .._proc import no_window_kwargs
+
+from .cli_bin import normalize_launch_argv
 from .harness.support.child_env import build_child_environment
 
 
@@ -46,7 +49,7 @@ def _run_opencode_models(
     verbose: bool,
     timeout_seconds: float,
 ) -> str:
-    command = [executable, "models"]
+    command = [*normalize_launch_argv(executable), "models"]
     if provider:
         command.append(provider)
     if verbose:
@@ -59,6 +62,7 @@ def _run_opencode_models(
             text=True,
             env=build_child_environment(),
             timeout=timeout_seconds,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OpenCodeProbeError("OpenCode model check could not complete") from exc

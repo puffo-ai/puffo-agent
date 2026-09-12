@@ -32,13 +32,13 @@ def attach_cleanup_error(
 def attach_suppressed_primary_error(
     cancellation: BaseException, primary: BaseException
 ) -> None:
-    """Preserve a real failure displaced by the raw cancellation contract."""
+    """Preserve an earlier failure, including cleanup, displaced by cancellation."""
     value = getattr(cancellation, _SUPPRESSED_ERRORS_ATTR, ())
     if not isinstance(value, tuple):
         raise TypeError("malformed structured suppressed-error evidence")
     setattr(cancellation, _SUPPRESSED_ERRORS_ATTR, (*value, primary))
     cancellation.add_note(
-        "puffo primary failure suppressed by cancellation: "
+        "puffo failure suppressed by cancellation: "
         f"{type(primary).__name__}: {primary}"
     )
 
@@ -64,7 +64,11 @@ def cleanup_errors(error: BaseException) -> tuple[BaseException, ...]:
 def suppressed_primary_errors(
     error: BaseException,
 ) -> tuple[BaseException, ...]:
-    """Return real failures displaced by cancellation, if any."""
+    """Return failures preceding cancellation, including close-only cleanup.
+
+    The historical name describes the storage protocol, not the failures'
+    role: an earlier failure need not come from a primary operation.
+    """
     value = getattr(error, _SUPPRESSED_ERRORS_ATTR, ())
     if not isinstance(value, tuple) or not all(
         isinstance(item, BaseException) for item in value
@@ -169,10 +173,16 @@ def raise_collected_errors(
 ) -> None:
     """Raise ordered failures without grouping or replacing cancellation.
 
-    Callers append a primary operation failure first, then failures from
-    cleanup operations in execution order.  Entries before cancellation are
-    therefore classified as suppressed primary failures; entries after it
-    are classified as cleanup failures.
+    Callers append failures in execution order. Some start with an operation
+    failure; close-only callers (such as ACP/OpenCode close) collect only
+    cleanup failures. Position before cancellation does not identify a
+    failure as a primary operation failure.
+
+    Preserve the existing evidence protocol: entries before the first
+    cancellation are exposed by ``suppressed_primary_errors``; later
+    non-cancellation entries by ``cleanup_errors``. These are positional
+    buckets, not a classification of operation versus cleanup. The original
+    cancellation is raised directly.
     """
     if not errors:
         return

@@ -15,6 +15,7 @@ suppress it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 
@@ -233,3 +234,241 @@ def test_cancel_leaves_other_resolutions_alone(streak, health_after_turn, expect
     w = SimpleNamespace(runtime=rt, _no_progress_turns=streak)
     StandardWorkerRun._settle_process_health(w, "agent-b", "cancelled", None)
     assert rt.health == expected
+
+
+# ── Re-arm cadence after a no-progress turn ──────────────────────────────
+# The guard above names the turn; this half bounds how fast it repeats.
+# ``_wake_remaining_pending`` re-arms at ZERO delay whenever rows stay pending,
+# so a turn that can never admit its batch re-runs as fast as it can fail. On
+# staging 2026-09-09 one agent behind a capped LLM gateway turned that into 354
+# rejected requests in two minutes (~1 turn/s, 3 gateway calls each) until the
+# streak guard cancelled it. (PUF-382)
+
+
+class _Coalescer:
+    def __init__(self):
+        self.delays: list[float] = []
+
+    def notify(self, *, delay_seconds=None):
+        self.delays.append(delay_seconds)
+
+
+class _Store:
+    def __init__(self, *, pending=True, candidates=True):
+        self._pending, self._candidates = pending, candidates
+
+    async def get_pending(self, limit=1):
+        return [object()] if self._pending else []
+
+    async def get_notice_candidates(self, session_id):
+        return [object()] if self._candidates else []
+
+
+def _rearm_runtime(**store_kw):
+    """A runtime with only what ``_wake_remaining_pending`` touches."""
+    rt = GlobalInboxRuntime.__new__(GlobalInboxRuntime)
+    rt._init_recovery_gates(None)
+    rt.store = _Store(**store_kw)
+    rt.adapter = SimpleNamespace(get_provider_session_id=lambda: "session")
+    rt.coalescer = _Coalescer()
+    rt.notified = 0
+
+    def _notify():
+        rt.notified += 1
+
+    rt.notify = _notify
+    return rt
+
+
+def test_a_single_no_progress_turn_still_re_arms_immediately():
+    """One deferral is legitimate — today's immediate follow-up is kept, so
+    the common case is not slowed by the bound below."""
+    rt = _rearm_runtime()
+    rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    assert (rt.notified, rt.coalescer.delays) == (1, [])
+
+
+def test_repeated_no_progress_backs_off_instead_of_spinning():
+    """The second and later re-arms go through the coalescer with a delay.
+    Without this the loop is bounded only by how fast the provider fails."""
+    rt = _rearm_runtime()
+    for _ in range(2):
+        rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    assert rt.coalescer.delays == [5.0]
+    assert rt.notified == 0, "notify() would pin the delay back to zero"
+
+    rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    assert rt.coalescer.delays == [5.0, 10.0, 20.0]
+
+
+def test_the_backoff_is_bounded():
+    rt = _rearm_runtime()
+    for _ in range(1100):
+        rt.note_no_progress_turn()
+    assert rt.next_no_progress_rearm_delay() == 300.0
+
+
+def test_a_turn_that_admits_its_batch_clears_the_backoff():
+    rt = _rearm_runtime()
+    for _ in range(5):
+        rt.note_no_progress_turn()
+    assert rt.next_no_progress_rearm_delay() > 0.0
+    rt._clear_no_progress_rearm_backoff()  # what a `succeeded` settle does
+    rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    assert (rt.notified, rt.coalescer.delays) == (1, [])
+
+
+def test_nothing_re_arms_when_there_is_no_pending_work():
+    """The bound must not invent a wake: an empty pending set or no notice
+    candidate still re-arms nothing at all."""
+    for kw in ({"pending": False}, {"candidates": False}):
+        rt = _rearm_runtime(**kw)
+        for _ in range(3):
+            rt.note_no_progress_turn()
+        asyncio.run(rt._wake_remaining_pending())
+        assert (rt.notified, rt.coalescer.delays) == (0, []), kw
+
+
+def test_a_degraded_runtime_still_owns_its_own_backoff():
+    rt = _rearm_runtime()
+    rt._degraded = True
+    for _ in range(3):
+        rt.note_no_progress_turn()
+    asyncio.run(rt._wake_remaining_pending())
+    assert (rt.notified, rt.coalescer.delays) == (0, [])
+
+
+@pytest.mark.asyncio
+async def test_real_ingress_cuts_through_a_backed_off_re_arm():
+    """A message arriving mid-backoff must not wait it out. The runtime's own
+    re-arm is a deadline like any other, and the coalescer only ever lets a
+    deadline move EARLIER — the same guarantee proved for the degraded backoff
+    in ``test_coalescer_pulls_a_pending_long_deadline_into_the_normal_window``.
+    """
+    from puffo_agent.agent.inbox_scheduler import InboxCoalescer
+
+    now = 100.0
+    sleeps: list[float] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def monotonic():
+        return now
+
+    async def sleep(delay):
+        nonlocal now
+        sleeps.append(delay)
+        entered.set()
+        await release.wait()
+        now += delay
+
+    coalescer = InboxCoalescer(sleep=sleep, monotonic=monotonic)
+    rt = _rearm_runtime()
+    rt.coalescer = coalescer
+    for _ in range(6):  # attempts 1..6 → 0, 5, 10, 20, 40, 80
+        rt.note_no_progress_turn()
+    await rt._wake_remaining_pending()
+    assert coalescer._deadlines[0] == pytest.approx(now + 80.0)
+
+    waiter = asyncio.create_task(coalescer.wait_for_burst())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    entered.clear()
+    coalescer.notify(delay_seconds=0.0)  # a message arrives
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert sleeps[0] == pytest.approx(80.0) and sleeps[1] == pytest.approx(0.0)
+    release.set()
+    await asyncio.wait_for(waiter, timeout=1)
+
+
+def test_the_escalation_ladder_is_explicit():
+    """Pinned by value: 0 s for the first, then doubling from 5 s to a 300 s
+    ceiling. A silent change here changes how long a wedged agent sleeps."""
+    rt = _rearm_runtime()
+    ladder = []
+    for _ in range(9):
+        rt.note_no_progress_turn()
+        ladder.append(rt.next_no_progress_rearm_delay())
+    assert ladder == [0.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0]
+
+
+# ── The loop itself ──────────────────────────────────────────────────────
+# The tests above pin the helpers. This one drives the real ``process_once``
+# so the *wiring* is covered too: deleting the counter call or the reset in
+# the settle block must fail a test, not just look wrong in review.
+
+
+def _loop_runtime(outcomes, workspace):
+    """A runtime whose turns settle as ``outcomes`` says, with the real
+    ``process_once`` / ``_wake_remaining_pending`` bodies and everything else
+    stubbed to the shortest thing that lets the turn reach its settle."""
+    from puffo_agent.agent.global_inbox_types import RuntimeHealth
+
+    rt = _rearm_runtime()
+    rt.workspace = workspace
+    rt.health = RuntimeHealth()
+    rt._boundary = asyncio.Lock()
+    rt._turn_state_lock = asyncio.Lock()
+    rt._autonomous_settle_pending = None
+    rt._autonomous_turn_id = ""
+    rt.process_outcome = None
+    rt.attempts = SimpleNamespace(reset=lambda: None)
+    rt.active = SimpleNamespace(turn_id="turn-1", provider_session_id="s", provider_turn_id="t")
+    rt.adapter = SimpleNamespace(
+        get_provider_session_id=lambda: "session",
+        register_admission_callback=lambda *a, **k: None,
+    )
+    planned = SimpleNamespace(
+        turn_id="turn-1", notice_message_ids=("m1",), targets=(), notice_generation=0,
+        planning_cycle_key="cycle",
+    )
+    settled = iter(outcomes)
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _true(*a, **k):
+        return True
+
+    rt._replay_deferred_autonomous_start = _noop
+    rt.plan_pending = lambda: _immediate(planned)
+    rt._resolve_context_plan = lambda p: _immediate(p)
+    rt._notice_is_current = _true
+    rt._start_notice_unless_autonomous = _true
+    rt._invoke_turn_with_retries = _noop
+    rt._health_outcome_for_turn = lambda p: next(settled)
+    rt._mark_active_processed = _noop
+    rt._notify_status_terminal = _noop
+    rt._finalize_process = lambda *a, **k: None
+    return rt
+
+
+def _immediate(value):
+    async def _run():
+        return value
+    return _run()
+
+
+def test_a_wedged_turn_stops_spinning_after_the_first_repeat(tmp_path):
+    """The storm, reproduced: every turn settles ``no_progress`` and the rows
+    stay pending. Before the bound, each pass re-armed at zero delay and the
+    loop ran as fast as the provider could fail."""
+    rt = _loop_runtime(["no_progress"] * 4, tmp_path)
+    for _ in range(4):
+        assert asyncio.run(rt.process_once()) is True
+    assert rt.notified == 1, "only the first repeat re-arms immediately"
+    assert rt.coalescer.delays == [5.0, 10.0, 20.0]
+
+
+def test_a_turn_that_makes_progress_clears_the_bound(tmp_path):
+    """A recovered provider must not stay throttled: the next wedged turn
+    starts the ladder again from immediate."""
+    rt = _loop_runtime(["no_progress", "no_progress", "succeeded", "no_progress"], tmp_path)
+    for _ in range(4):
+        asyncio.run(rt.process_once())
+    assert rt.coalescer.delays == [5.0], "one backed-off re-arm, before the success"
+    assert rt.notified == 3, "first repeat, the success, and the fresh streak"

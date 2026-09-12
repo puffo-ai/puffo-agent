@@ -11,7 +11,10 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import replace
 from typing import Any
+
+from .turn_recovery import read_recovery, write_recovery, recovery_required
 
 from ._logging import log_runtime_event
 from .global_inbox_types import PlannedTurn, RuntimeHealth
@@ -46,6 +49,18 @@ class AutonomousTurnLifecycleMixin:
 
     async def _handle_autonomous_event_locked(self, event: Any) -> None:
         event_type = getattr(event.type, "value", event.type)
+        if event_type == "turn.recovery_required":
+            record = read_recovery(self.workspace)
+            if record is not None and self._autonomous_turn_id:
+                write_recovery(self.workspace, replace(record, durable_turn_id=self._autonomous_turn_id))
+            self._report_recovery_required()
+            return
+        if event_type == "turn.recovery_retry":
+            await self._retry_quarantined_turn()
+            return
+        if recovery_required(self.workspace):
+            self._report_recovery_required()
+            return
         if event_type == "turn.autonomous_started":
             if not self._autonomous_ready or self.active.turn_id:
                 self._defer_autonomous_start(
@@ -61,7 +76,18 @@ class AutonomousTurnLifecycleMixin:
                 self._deferred_autonomous_start = event
             return
 
+        session = getattr(event, "native_session_id", "")
+        turn = getattr(event, "native_turn_id", "")
+        if self._autonomous_turn_id and (
+            (session and session != self.active.provider_session_id)
+            or (turn and turn != self.active.provider_turn_id)
+        ):
+            return
         if self._deferred_autonomous_start is not None:
+            deferred = self._deferred_autonomous_start
+            if ((session and session != getattr(deferred, "native_session_id", ""))
+                    or (turn and turn != getattr(deferred, "native_turn_id", ""))):
+                return
             # The provider run ended before the daemon released ownership. Its
             # held start must not be replayed into a turn with no future terminal.
             self._deferred_autonomous_start = None
@@ -118,7 +144,7 @@ class AutonomousTurnLifecycleMixin:
     ) -> bool:
         """Bind a durable daemon turn to a provider-owned run."""
         async with self._turn_state_lock:
-            if self.active.turn_id:
+            if self.active.turn_id or recovery_required(self.workspace):
                 return False
             turn_id = f"turn_{uuid.uuid4().hex}"
             try:
@@ -213,6 +239,9 @@ class AutonomousTurnLifecycleMixin:
     async def finish_autonomous_turn(self, *, outcome: str = "succeeded") -> bool:
         """Settle and release the turn opened for an autonomous provider run."""
         async with self._turn_state_lock:
+            if recovery_required(self.workspace):
+                self._report_recovery_required()
+                return False
             turn_id = self._autonomous_turn_id
             if not turn_id:
                 return False
@@ -396,3 +425,52 @@ class AutonomousTurnLifecycleMixin:
         self.active.clear()
         self.attempts.reset()
         self.health = RuntimeHealth()
+
+
+    def _report_recovery_required(self) -> None:
+        record = read_recovery(self.workspace)
+        reference = f" session_ref={record.session_ref} turn_ref={record.turn_ref}" if record else ""
+        diagnostic = "Operator recovery required: original actions may have external effects; use inspect_recovery before explicit retry." + reference
+        self.health = RuntimeHealth("degraded", diagnostic)
+        if self.process_outcome is not None:
+            self.process_outcome("recovery_required", diagnostic)
+
+    async def _retry_quarantined_turn(self) -> None:
+        async with self._turn_state_lock:
+            record = read_recovery(self.workspace)
+            if record is None or record.resolved:
+                return
+            if not record.stopped or not record.retry_requested:
+                raise RuntimeError("operator retry was not authorized")
+            turn_id = record.durable_turn_id
+            if not turn_id:
+                candidates = [run for run in await self.store.get_active_turn_runs()
+                              if (run.provider_session_id or "") == record.provider_session_id]
+                if len(candidates) != 1:
+                    raise RuntimeError("recovery record has no unique durable Inbox binding")
+                turn_id = candidates[0].turn_id
+                record = replace(record, durable_turn_id=turn_id)
+                write_recovery(self.workspace, record)
+            run = await self.store.get_turn_run(turn_id)
+            if run is None or (run.provider_session_id or "") != record.provider_session_id:
+                raise RuntimeError("recovery Inbox identity mismatch")
+            if run.state == "in_turn":
+                if run.message_ids:
+                    await self.store.requeue_messages(run.message_ids, turn_id=turn_id)
+                else:
+                    await self.store.finalize_empty_turn(turn_id=turn_id, state="requeued")
+            elif run.state != "requeued":
+                raise RuntimeError("recovery turn already settled unexpectedly")
+            await self.store.release_notice_delivery(run.provider_session_id)
+            await self._settle_recovered_status(
+                turn_id=turn_id, message_ids=run.message_ids, succeeded=False,
+                error_text="Operator explicitly retried a turn with unknown effects",
+            )
+            self._autonomous_turn_id = ""
+            self._autonomous_planned = None
+            self._autonomous_settle_pending = None
+            self._deferred_autonomous_start = None
+            self._clear_terminal_turn()
+            write_recovery(self.workspace, replace(record, resolved=True))
+            self.health = RuntimeHealth()
+        self.notify()

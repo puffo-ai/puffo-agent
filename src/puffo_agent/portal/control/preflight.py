@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from ...agent.cli_bin import resolve_docker_bin, resolve_opencode_bin, resolve_pi_bin
@@ -14,7 +15,7 @@ from ..runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ..state import RuntimeConfig, agent_dir, select_pi_auth_home
+from ..state import DaemonConfig, RuntimeConfig, agent_dir, select_pi_auth_home
 from .provision import ProvisionError
 
 _MAX_NATIVE_REASON_CHARS = 200
@@ -63,7 +64,10 @@ def _docker_not_ready(reason: str) -> ProvisionError:
     )
 
 
-async def preflight_runtime(runtime: RuntimeConfig, *, agent_id: str = "") -> None:
+async def preflight_runtime(
+    runtime: RuntimeConfig, *, agent_id: str = "",
+    resolve_model: Callable[..., str] | None = None,
+) -> None:
     """Reject an unusable runtime before identity materialization."""
     if runtime.kind == RUNTIME_CLI_DOCKER:
         docker_bin = resolve_docker_bin()
@@ -87,12 +91,17 @@ async def preflight_runtime(runtime: RuntimeConfig, *, agent_id: str = "") -> No
     if runtime.kind != RUNTIME_CLI_LOCAL or harness not in {"pi", "opencode"}:
         return
 
+    model = runtime.model
+    if not model:
+        resolver = resolve_model or DaemonConfig.load().resolve_model
+        model = resolver(model=model, provider=provider, harness=harness)
+
     if harness == "opencode":
         executable = resolve_opencode_bin()
         if not executable:
             raise _not_ready("opencode", "not_installed")
         try:
-            model_status = opencode_model_status(executable, runtime.model)
+            model_status = opencode_model_status(executable, model)
         except OpenCodeProbeError as exc:
             raise _not_ready("opencode", "credential_check_error") from exc
         if model_status != "ready":
@@ -102,7 +111,7 @@ async def preflight_runtime(runtime: RuntimeConfig, *, agent_id: str = "") -> No
     executable = resolve_pi_bin()
     if not executable:
         raise _not_ready("pi", "not_installed")
-    auth_provider, auth_model = pi_auth_target(provider, runtime.model)
+    auth_provider, auth_model = pi_auth_target(provider, model)
     host_home = Path.home()
     config_dir = host_home / ".pi" / "agent"
     if agent_id:

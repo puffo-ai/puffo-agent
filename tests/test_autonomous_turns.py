@@ -610,3 +610,301 @@ async def test_orphan_settle_keeps_the_owner_on_unexpected_row_state(tmp_path):
     run = await store.get_turn_run(orphan_id)
     assert run is not None and run.state == "requeued"
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_autonomous_effects_survive_restart_and_retry_once(tmp_path, monkeypatch):
+    """Timeout, late success, and restart must preserve the exact admitted rows
+    until an operator explicitly accepts the risk of repeating external work."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec
+    from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager, RuntimeManagerAdapter
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _ControllableDriver
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = RuntimeManager(_ControllableDriver(), RuntimeSpec(str(tmp_path), task_timeout_seconds=5), native_session_id="provider-session")
+    adapter = RuntimeManagerAdapter(manager)
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(store=store, adapter=adapter, run_turn=lambda _: None, workspace=tmp_path)
+    runtime.register_autonomous_adoption()
+    runtime._autonomous_ready = True
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_started", driver="claude-code", session_ref="provider-session",
+        turn_ref="provider-turn", native_turn_id="native-turn", native_session_id="provider-session",
+    ))
+    await receipt(store, "uncertain-action", 1)
+    rows = await store.get_pending()
+    await runtime._admit_inbox_page(
+        SimpleNamespace(selected=rows, remaining_count=0), snapshot_generation=0,
+        requesting_turn_id=runtime.active.turn_id,
+        requesting_provider_session_id="provider-session", requesting_provider_turn_id="native-turn",
+    )
+    await asyncio.sleep(0)
+    now[0] += 6
+    await manager._autonomous_watchdog
+    record = read_recovery(tmp_path)
+    assert record is not None and record.stopped
+    assert record.durable_turn_id == runtime.active.turn_id
+    await runtime._on_autonomous_event(SimpleNamespace(type="turn.autonomous_completed", data={"outcome": "succeeded"}))
+    assert (await store.get_message_by_envelope("uncertain-action")).processing_state == "in_turn"
+    await manager.close()
+    manager = RuntimeManager(_ControllableDriver(), RuntimeSpec(str(tmp_path)), native_session_id="provider-session")
+    adapter = RuntimeManagerAdapter(manager)
+    await adapter.warm("")
+    assert manager.driver.open_calls == 0
+    restarted = GlobalInboxRuntime(store=store, adapter=adapter, run_turn=lambda _: None, workspace=tmp_path)
+    restarted.register_autonomous_adoption()
+    assert await restarted.recover_current_turn() is False
+    assert await restarted.recover_orphaned_turns() == 0
+    assert await restarted.process_once() is False
+    result = await manager.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="retry")
+    assert result["completed"]
+    assert (await store.get_message_by_envelope("uncertain-action")).processing_state == "pending"
+    # A duplicate command cannot turn a subsequently completed row back into pending.
+    duplicate = await manager.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="retry")
+    assert duplicate["already_resolved"]
+    assert read_recovery(tmp_path).resolved
+    assert await restarted.adopt_autonomous_turn(provider_session_id="new-session", provider_turn_id="new-turn")
+    successor = restarted.active.turn_id
+    await restarted._on_autonomous_event(SimpleNamespace(
+        type="turn.autonomous_completed", data={"outcome": "succeeded"},
+        native_session_id="provider-session", native_turn_id="native-turn",
+    ))
+    assert restarted.active.turn_id == successor
+    await restarted.finish_autonomous_turn()
+    await manager.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_cannot_retry_when_provider_stop_failed(tmp_path, monkeypatch):
+    """A failed close is not proof the provider stopped, including after restart."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import RuntimeSpec
+    from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager, RuntimeStateError
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _ControllableDriver, _start_autonomous
+
+    class RefusesClose(_ControllableDriver):
+        async def close(self):
+            raise RuntimeError("provider still alive")
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = RuntimeManager(RefusesClose(), RuntimeSpec(str(tmp_path), task_timeout_seconds=5))
+    await _start_autonomous(manager, [])
+    watchdog = manager._autonomous_watchdog
+    await asyncio.sleep(0)
+    now[0] += 6
+    with pytest.raises(RuntimeError, match="provider still alive"):
+        await watchdog
+    record = read_recovery(tmp_path)
+    assert record is not None and not record.stopped
+    with pytest.raises(RuntimeStateError, match="stop unconfirmed"):
+        await manager.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="stop")
+    for owner in (manager, RuntimeManager(_ControllableDriver(), manager.spec)):
+        with pytest.raises(RuntimeStateError, match="stop must be confirmed"):
+            await owner.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="retry")
+    with pytest.raises(RuntimeStateError, match="stop unconfirmed"):
+        await owner.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="stop")
+
+
+@pytest.mark.asyncio
+async def test_long_autonomous_tool_is_visible_and_not_silently_killed(tmp_path, monkeypatch):
+    """Silence inside an admitted tool isn't proof of a dead provider; expose
+    recovery controls without terminating a legitimate long-running tool."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec, TurnRef
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _autonomous_manager, _start_autonomous
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path), task_timeout_seconds=5)
+    reported = []
+    await _start_autonomous(manager, reported)
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.tool_started", driver="claude-code", session_ref="native",
+        turn_ref=TurnRef("driver-turn"), data={"tool_call_ref": "long-tool"},
+    ))
+    await asyncio.sleep(0)
+    now[0] += 6
+    for _ in range(12):
+        await asyncio.sleep(0)
+    assert manager.driver.close_calls == 0
+    assert reported[-1][0] == "turn.recovery_required"
+    record = read_recovery(tmp_path)
+    assert record is not None and not record.stopped
+    await manager.recover_turn(session_ref=record.session_ref, turn_ref=record.turn_ref, action="stop")
+    assert read_recovery(tmp_path).stopped
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantined_tool_late_terminal_cannot_replace_recovery(tmp_path, monkeypatch):
+    """A late terminal followed by another provider start must preserve the
+    quarantined Inbox binding, including beyond the new turn's idle deadline."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec
+    from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager, RuntimeManagerAdapter
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _ControllableDriver
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = RuntimeManager(_ControllableDriver(), RuntimeSpec(str(tmp_path), task_timeout_seconds=5), native_session_id="provider-session")
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(store=store, adapter=RuntimeManagerAdapter(manager), run_turn=lambda _: None, workspace=tmp_path)
+    runtime.register_autonomous_adoption()
+    runtime._autonomous_ready = True
+
+    async def emit(kind, turn="provider-turn", data=None):
+        await manager._consume_event_locked(HarnessEvent(
+            type=kind, driver="claude-code", session_ref="provider-session",
+            turn_ref=turn, native_turn_id=turn, native_session_id="provider-session",
+            data=data or {},
+        ))
+
+    try:
+        await emit("turn.autonomous_started")
+        await receipt(store, "uncertain-tool", 1)
+        await runtime._admit_inbox_page(
+            SimpleNamespace(selected=await store.get_pending(), remaining_count=0),
+            snapshot_generation=0, requesting_turn_id=runtime.active.turn_id,
+            requesting_provider_session_id="provider-session", requesting_provider_turn_id="provider-turn",
+        )
+        await emit("turn.tool_started", data={"tool_call_ref": "long-tool"})
+        watchdog = manager._autonomous_watchdog
+        await asyncio.sleep(0)
+        now[0] += 6
+        await watchdog
+        original = read_recovery(tmp_path)
+        assert original is not None and not original.stopped
+        assert original.durable_turn_id == runtime.active.turn_id
+        await emit("turn.autonomous_completed", data={"outcome": "succeeded"})
+        assert manager.active_turn_ref is None
+        await emit("turn.autonomous_started", turn="successor")
+        accepted = manager.active_turn_ref
+        await asyncio.sleep(0)
+        now[0] += 6
+        for _ in range(12):
+            await asyncio.sleep(0)
+        assert read_recovery(tmp_path) == original
+        assert accepted is None
+        assert manager._autonomous_watchdog is None
+        assert runtime.active.turn_id == original.durable_turn_id
+        assert (await store.get_message_by_envelope("uncertain-tool")).processing_state == "in_turn"
+        assert manager.driver.close_calls == 0
+    finally:
+        await manager.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_supervisor_preserves_an_existing_recovery_record(tmp_path, monkeypatch):
+    """A watchdog already armed before quarantine must not overwrite another
+    failure path's durable record when its deadline fires."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import RuntimeSpec
+    from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
+    from tests.test_runtime_manager_failures import _autonomous_manager, _start_autonomous
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path), task_timeout_seconds=5)
+    try:
+        await _start_autonomous(manager, [])
+        watchdog = manager._autonomous_watchdog
+        original = TurnRecovery(
+            session_ref="original-session", turn_ref="original-turn",
+            provider_session_id="native-session", provider_turn_id="native-turn",
+            owner="original-owner", reason="terminal delivery failed", durable_turn_id="durable-original",
+        )
+        write_recovery(tmp_path, original)
+        await asyncio.sleep(0)
+        now[0] += 6
+        await watchdog
+        assert read_recovery(tmp_path) == original
+        assert manager.driver.close_calls == 0
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_activity_renews_deadline_and_late_timer_cannot_stop_next_turn(tmp_path, monkeypatch):
+    """Progress beyond the original deadline keeps the turn alive; its old
+    watchdog cannot cancel a successor after the first terminal arrives."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec, TurnRef
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _autonomous_manager, _start_autonomous
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path), task_timeout_seconds=5)
+    await _start_autonomous(manager, [])
+    await asyncio.sleep(0)
+    for _ in range(3):
+        now[0] += 4
+        await manager._consume_event_locked(HarnessEvent(
+            type="turn.assistant_delta", driver="claude-code", session_ref="native",
+            turn_ref=TurnRef("driver-turn"), data={"text": "working"},
+        ))
+        await asyncio.sleep(0)
+    assert read_recovery(tmp_path) is None
+    old_watchdog = manager._autonomous_watchdog
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_completed", driver="claude-code", session_ref="native",
+        turn_ref=TurnRef("driver-turn"), data={"outcome": "succeeded"},
+    ))
+    await asyncio.gather(old_watchdog, return_exceptions=True)
+    await _start_autonomous(manager, [])
+    await asyncio.sleep(0)
+    now[0] += 2
+    await asyncio.sleep(0)
+    assert manager.driver.close_calls == 0
+    assert read_recovery(tmp_path) is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_failure_is_not_silently_dropped(tmp_path):
+    """A real provider terminal does not help if its Inbox callback throws:
+    persist quarantine so restart cannot silently replay the stranded rows."""
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec, TurnRef
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _autonomous_manager, _start_autonomous
+
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path))
+    await _start_autonomous(manager, [])
+    notifications = []
+
+    async def failing_terminal(event):
+        kind = getattr(event.type, "value", event.type)
+        if kind == "turn.autonomous_completed":
+            raise RuntimeError("Inbox callback unavailable")
+        notifications.append(kind)
+
+    manager.autonomous_callback = failing_terminal
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_completed", driver="claude-code", session_ref="native",
+        turn_ref=TurnRef("driver-turn"), native_turn_id="native-turn-1",
+        data={"outcome": "succeeded"},
+    ))
+    record = read_recovery(tmp_path)
+    assert record is not None and record.stopped
+    assert record.reason == "autonomous terminal delivery failed"
+    assert notifications == ["turn.recovery_required"]
+    await manager.close()

@@ -246,7 +246,9 @@ class Daemon:
         )
         from .control.client import ControlManager
 
-        runtime.control_manager = ControlManager()
+        runtime.control_manager = ControlManager(
+            resolve_model=self.daemon_cfg.resolve_model,
+        )
         runtime.runtime_tasks.append(
             spawn(runtime.control_manager.run(), name="control_manager.run")
         )

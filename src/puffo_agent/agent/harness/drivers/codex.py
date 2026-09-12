@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ...._proc import no_window_kwargs
+from ...cli_bin import normalize_launch_argv
 from ...errors import AgentAPIError, ProviderFailureError
 from ...provider_failures import (
     classify_provider_failure,
@@ -361,7 +362,7 @@ class CodexAppServerDriver(Driver):
             executable = spec.executable or "codex"
             env = dict(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
-                executable,
+                *normalize_launch_argv(executable),
                 *spec.launch_args,
                 "app-server",
                 stdin=asyncio.subprocess.PIPE,

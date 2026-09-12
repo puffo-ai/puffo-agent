@@ -1508,7 +1508,8 @@ def test_litellm_budget_caps_are_drained_not_rate_limited():
         assert looks_like_usage_limit(text) is True, text
         is_auth, is_drained, _label = _classify_api_error(text)
         assert (is_auth, is_drained) == (False, True), text
-        assert classify_provider_failure(status=429, diagnostic=text) == "plan_drained"
+        assert classify_provider_failure(status=429, diagnostic=text) == "budget_exceeded"
+        assert classify_provider_failure(status=402, diagnostic=text) == "budget_exceeded"
         assert failure_outcome(AgentAPIError(text, is_drained=True)) == "drained"
 
 
@@ -1743,3 +1744,60 @@ def test_plan_drain_failure_keeps_the_untimed_park(monkeypatch):
     assert rt._parked_drained is True
     assert rt._drained_park_until is None
     assert rt.coalescer.delays == []
+
+
+def test_budget_exceeded_code_is_drained_everywhere_the_text_is_not():
+    """The runtime raises a ProviderFailureError whose text is the registry
+    message, not the gateway's — so the outcome, the timed hold and the
+    worker's cap flag must all follow the *code*."""
+    from puffo_agent.agent.provider_failures import provider_failure_message
+    from puffo_agent.agent._usage_markers import looks_like_budget_cap
+
+    exc = ProviderFailureError(
+        provider_failure_message("budget_exceeded"), error_code="budget_exceeded"
+    )
+    assert failure_outcome(exc) == "drained"
+    assert crash_resume_terminal(exc) == (str(exc), "drained")
+    # The registry text repeats the gateway wording on purpose, so the
+    # text-keyed settle path agrees with the code-keyed runtime path.
+    assert looks_like_budget_cap(str(exc)) is True
+
+
+def test_budget_exceeded_code_parks_on_the_timed_hold(monkeypatch):
+    from puffo_agent.agent.provider_failures import provider_failure_message
+
+    now = [100.0]
+    rt = _failure_runtime(monkeypatch, now)
+    exc = ProviderFailureError(
+        provider_failure_message("budget_exceeded"), error_code="budget_exceeded"
+    )
+    terminal, outcome, _text = asyncio.run(rt._handle_process_failure(_planned(), 0.0, exc))
+    assert (terminal, outcome) == (True, "drained")
+    assert rt._drained_park_until == 400.0
+
+
+def test_settle_marks_a_registry_budget_message_as_a_cap():
+    from puffo_agent.agent.provider_failures import provider_failure_message
+
+    entered = []
+
+    class _EnterRecorder:
+        def _enter_drained(self, agent_id, resets_at=None, *, budget_cap=False):
+            entered.append((agent_id, resets_at, budget_cap))
+
+    StandardWorkerRun._settle_process_health(
+        _EnterRecorder(), "agent-1", "drained", provider_failure_message("budget_exceeded"),
+    )
+    assert entered == [("agent-1", None, True)]
+
+
+def test_budget_exceeded_code_holds_even_without_the_gateway_wording(monkeypatch):
+    """The hold must follow the error *code*: a registry message that stops
+    repeating the gateway wording must not silently demote a cap to the
+    untimed park that a sandbox can never leave."""
+    now = [100.0]
+    rt = _failure_runtime(monkeypatch, now)
+    exc = ProviderFailureError("gateway refused the turn", error_code="budget_exceeded")
+    asyncio.run(rt._handle_process_failure(_planned(), 0.0, exc))
+    assert rt._parked_drained is True
+    assert rt._drained_park_until == 400.0
