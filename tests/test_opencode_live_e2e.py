@@ -57,10 +57,20 @@ def _isolated_opencode_environment(tmp_path: Path) -> dict[str, str]:
 
 
 @pytest.mark.skipif(shutil.which("opencode") is None, reason="OpenCode absent")
-def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
+@pytest.mark.parametrize("symlink_workspace", [False, True])
+def test_desired_skill_is_discoverable_by_real_opencode_cli(
+    tmp_path: Path, symlink_workspace: bool, monkeypatch,
+):
     """User-selected skill survives the full Puffo install -> CLI discovery path."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    if symlink_workspace:
+        alias = tmp_path / "workspace-alias"
+        try:
+            alias.symlink_to(workspace, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        workspace = alias
 
     asyncio.run(
         install_desired(
@@ -74,6 +84,15 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
         )
     )
 
+    # Check both real CLI invocations at the process boundary. A rebuilt env
+    # silently drops PWD even on OpenCode versions that only consult cwd.
+    run = subprocess.run
+
+    def run_in_workspace(*args, **kwargs):
+        assert kwargs["env"]["PWD"] == str(kwargs["cwd"])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run_in_workspace)
     environment = _isolated_opencode_environment(tmp_path)
     # OpenCode consults PWD while resolving project-local skills.  Keep it
     # consistent with cwd so the test cannot accidentally discover skills
@@ -82,7 +101,7 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
     result = subprocess.run(
         [shutil.which("opencode") or "opencode", "debug", "skill"],
         cwd=workspace,
-        env=_isolated_opencode_environment(tmp_path),
+        env=environment,
         check=True,
         capture_output=True,
         text=True,
@@ -91,12 +110,12 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
     skills = json.loads(result.stdout)
     sentinel = next(item for item in skills if item["name"] == "puffo-e2e")
 
-    assert sentinel["location"] == str(
+    assert Path(sentinel["location"]).samefile(
         workspace / ".agents" / "skills" / "puffo-e2e" / "SKILL.md"
     )
     assert "SENTINEL-OPENCODE-SKILL" in sentinel["content"]
 
-    disabled_environment = _isolated_opencode_environment(tmp_path)
+    disabled_environment = dict(environment)
     disabled_environment["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
     disabled = subprocess.run(
         [shutil.which("opencode") or "opencode", "debug", "skill"],
