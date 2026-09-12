@@ -19,7 +19,11 @@ NO_TURN_WARNING_AFTER_S = 300.0
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def reported_runtime_health(
@@ -54,8 +58,9 @@ def reported_runtime_health(
             return "runtime_unresponsive"
         snapshot_path = directory / ".status.json"
         snapshot = _read_source_object(snapshot_path)
-        snapshot_age = clock - snapshot_path.lstat().st_mtime
-        if not 0 <= snapshot_age <= HEARTBEAT_MAX_AGE_S:
+        snapshot_stamp = snapshot_path.lstat().st_mtime
+        snapshot_age = clock - snapshot_stamp
+        if snapshot_stamp < worker_started_at or not 0 <= snapshot_age <= HEARTBEAT_MAX_AGE_S:
             return current_health
         source = snapshot.get("runtime")
         if not isinstance(source, dict):

@@ -87,6 +87,8 @@ def test_invalid_or_stale_snapshots_are_not_a_stall_diagnosis(source):
     directory, _, _, snapshot, health = source
     snapshot("stuck", changed=float("nan"))
     assert health() == "ok"
+    snapshot(progress=10 ** 500)
+    assert health() == "ok"
     snapshot("stuck", changed=800)
     os.utime(directory / ".status.json", (800, 800))
     assert health() == "ok"
@@ -127,3 +129,11 @@ def test_graceful_exit_missing_heartbeat_does_not_reuse_a_healthy_snapshot(sourc
     assert health() == "runtime_unresponsive"
     (directory / ".status.json").unlink()
     assert health() == "ok"  # no evidence from an older unsupported runtime
+
+
+def test_fresh_heartbeat_does_not_validate_a_previous_workers_snapshot(source):
+    directory, _, runtime, snapshot, _ = source
+    snapshot("stuck", changed=800)
+    os.utime(directory / ".status.json", (994, 994))
+    assert reported_runtime_health(runtime=runtime, current_health="ok", worker_status="running",
+        worker_started_at=995, now=1000) == "ok"
