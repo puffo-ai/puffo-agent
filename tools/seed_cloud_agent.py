@@ -520,7 +520,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Set it in the create dialog's PROFILE field, or PUT /agents/{slug}.")
         return 0
 
-    agent_dir = agents[0]
+    return _seed_one(args, agents[0])
+
+
+def _seed_one(args: argparse.Namespace, agent_dir: Path) -> int:
+    """Profile (opt-in) → upload → deliver (opt-in), reporting each step."""
     try:
         files, summary = collect_memory(agent_dir)
         _report([summary])
@@ -542,11 +546,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("Stored, not delivered: a running agent keeps the memory it has.")
         print("Memory is seeded into a sandbox only on a FRESH boot — add --deliver to seed it now.")
-    if summary["profile_bytes"]:
+    if summary["profile_bytes"] and not args.profile:
         print(
             f"\nprofile.md ({summary['profile_bytes']}B) was NOT uploaded — the agent "
-            "store owns it.\nPaste it into the create dialog's PROFILE field, or "
-            "PUT /agents/{slug}."
+            "store owns it.\nRe-run with --profile, paste it into the create dialog's "
+            "PROFILE field, or PUT /agents/{slug}."
         )
     return 0
 
