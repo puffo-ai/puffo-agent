@@ -1796,3 +1796,28 @@ async def test_autonomous_turn_supports_held_send_admission():
     assert manager.native_turn_id == ""
     assert not manager._continuation_admissions
     del adapter
+
+
+@pytest.mark.asyncio
+async def test_silent_autonomous_turn_has_a_runtime_supervisor(monkeypatch, tmp_path):
+    """Losing the provider terminal must not leave an adopted turn unbounded.
+
+    Advance only the event-loop clock: no probabilistic sleep or real provider.
+    The supervisor must stop the old provider before any replacement can run.
+    """
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path), task_timeout_seconds=5)
+    reported = []
+    try:
+        await _start_autonomous(manager, reported)
+        # Let the owning watchdog start before advancing its deadline.
+        await asyncio.sleep(0)
+        now[0] += manager.spec.task_timeout_seconds + 1
+        for _ in range(12):
+            await asyncio.sleep(0)
+        assert manager.driver.close_calls == 1
+    finally:
+        await manager.close()

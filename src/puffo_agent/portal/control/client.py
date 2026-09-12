@@ -295,7 +295,10 @@ async def execute_command(
     ``create`` additionally finalizes the pending identity with puffo-server
     and therefore needs the operator pairing context.
     """
-    if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
+    if op in {
+        "runtime.cancel_turn", "runtime.resolve_permission",
+        "runtime.inspect_recovery", "runtime.stop_recovery", "runtime.retry_recovery",
+    }:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():

@@ -31,6 +31,7 @@ from .context_controller import (
     ToolResultAdmission,
 )
 from .errors import AgentAPIError
+from .turn_recovery import read_recovery, recovery_required
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
@@ -62,8 +63,6 @@ from .provider_failures import operator_failure_text
 from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
-
-
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
@@ -456,6 +455,9 @@ class GlobalInboxRuntime(
 
     async def recover_orphaned_turns(self) -> int:
         """Requeue active DB Turns left without a resumable crash join."""
+        if recovery_required(self.workspace):
+            self._report_recovery_required()
+            return 0
         recovered = 0
         for run in await self.store.get_active_turn_runs():
             if run.message_ids:
@@ -1381,6 +1383,9 @@ class GlobalInboxRuntime(
         return terminal, process_outcome, terminal_error
 
     async def process_once(self) -> bool:
+        if recovery_required(self.workspace):
+            self._report_recovery_required()
+            return False
         if not self._drained_park_allows_processing():
             return False
         if not self._try_degraded_recovery():
@@ -1888,6 +1893,13 @@ class GlobalInboxRuntime(
 
     async def recover_current_turn(self) -> bool:
         """Finish or unwind a durable crash join before normal planning."""
+        if recovery_required(self.workspace):
+            record = read_recovery(self.workspace)
+            if record is not None and record.retry_requested and record.stopped:
+                await self._retry_quarantined_turn()
+            else:
+                self._report_recovery_required()
+            return False
         recovery_started = time.monotonic()
         try:
             raw: Any = json.loads(self.current_turn_path.read_text(encoding="utf-8"))

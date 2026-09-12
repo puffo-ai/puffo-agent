@@ -9,7 +9,7 @@ import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -55,6 +55,9 @@ from ..driver import (
     UnsupportedCapability,
 )
 from ....tasks import spawn
+from ...turn_recovery import (
+    TurnRecovery, read_recovery, write_recovery, recovery_required,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +204,11 @@ class RuntimeManager:
         ) = None
         # Logical turn of a provider run the driver opened on its own.
         self._autonomous_turn: TurnRef | None = None
+        self._autonomous_watchdog: asyncio.Task | None = None
+        self._autonomous_timeout: asyncio.Timeout | None = None
+        self._autonomous_deadline = 0.0
+        self._autonomous_tools: set[str] = set()
+        self._recovery_owner = uuid.uuid4().hex
         self.before_start = before_start
         self.session_ref = session_ref or SessionRef(
             f"session_{uuid.uuid4().hex}"
@@ -239,6 +247,11 @@ class RuntimeManager:
     async def _open_locked(self, *, resume: bool = True) -> RuntimeOpened:
         if self._closed:
             raise RuntimeStateError("runtime is closed")
+        record = read_recovery(self.spec.workspace_dir)
+        if record is not None and not record.resolved:
+            raise RuntimeStateError("operator recovery required; provider remains isolated")
+        if record is not None and self.native_session_id == record.provider_session_id:
+            self._clear_native_session()
         if self.opened is not None:
             return self.opened
         native_resume = (
@@ -308,6 +321,8 @@ class RuntimeManager:
         async with self._command_lock:
             if self._closed:
                 raise RuntimeStateError("runtime is closed")
+            if recovery_required(self.spec.workspace_dir):
+                raise RuntimeStateError("operator recovery required; original effects unknown")
             if self.opened is None:
                 await self._open_locked()
             if self.active_turn_ref is not None:
@@ -767,6 +782,7 @@ class RuntimeManager:
         event = replace(
             native, session_ref=self.session_ref, turn_ref=logical_turn
         )
+        self._observe_autonomous_activity(event)
         await self._admit_matching_tool_result(native)
         if event.type in {
             HarnessEventType.PERMISSION_REQUESTED,
@@ -904,6 +920,140 @@ class RuntimeManager:
         self._terminal[logical] = (
             asyncio.get_running_loop().create_future()
         )
+        self._autonomous_tools.clear()
+        self._autonomous_deadline = asyncio.get_running_loop().time() + self.spec.task_timeout_seconds
+        self._autonomous_watchdog = spawn(
+            self._supervise_autonomous(logical), name="autonomous.supervisor"
+        )
+
+    def _observe_autonomous_activity(self, event: HarnessEvent) -> None:
+        if event.turn_ref != self._autonomous_turn or self._autonomous_turn is None:
+            return
+        kind = getattr(event.type, "value", event.type)
+        tool = str(event.data.get("tool_call_ref") or "unknown")
+        if kind == "turn.tool_started":
+            self._autonomous_tools.add(tool)
+        elif kind == "turn.tool_completed":
+            self._autonomous_tools.discard(tool)
+        timeout = self._autonomous_timeout
+        if kind in _TURN_ACTIVITY_EVENTS:
+            self._autonomous_deadline = asyncio.get_running_loop().time() + self.spec.task_timeout_seconds
+            if timeout is not None and not timeout.expired():
+                timeout.reschedule(self._autonomous_deadline)
+
+    async def _supervise_autonomous(self, turn: TurnRef) -> None:
+        try:
+            while self._autonomous_turn == turn:
+                timeout = asyncio.timeout_at(self._autonomous_deadline)
+                self._autonomous_timeout = timeout
+                try:
+                    async with timeout:
+                        await asyncio.shield(self._terminal[turn])
+                    return
+                except TimeoutError:
+                    async with self._command_lock:
+                        if self._autonomous_turn != turn:
+                            return
+                        # Activity can win the command lock after the timer fires.
+                        if self._autonomous_deadline > asyncio.get_running_loop().time():
+                            continue
+                        waiting = bool(self._autonomous_tools or self._permission_refs)
+                        reason = (
+                            "silent tool or permission; operator inspection required"
+                            if waiting else "autonomous idle timeout"
+                        )
+                        record = TurnRecovery(
+                            session_ref=str(self.session_ref), turn_ref=str(turn),
+                            provider_session_id=self.native_session_id,
+                            provider_turn_id=self.native_turn_id, owner=self._recovery_owner,
+                            reason=reason,
+                        )
+                        write_recovery(self.spec.workspace_dir, record)
+                        await self._announce_recovery(record)
+                        if not waiting:
+                            await self._stop_recovery_provider(record)
+                        return
+        finally:
+            if self._autonomous_watchdog is asyncio.current_task():
+                self._autonomous_watchdog = None
+                self._autonomous_timeout = None
+
+    async def _announce_recovery(self, record: TurnRecovery) -> None:
+        await self._notify_autonomous(HarnessEvent(
+            type="turn.recovery_required", driver=self.driver_name,
+            session_ref=SessionRef(record.session_ref), turn_ref=TurnRef(record.turn_ref),
+            native_session_id=record.provider_session_id,
+            native_turn_id=record.provider_turn_id,
+            data={"reason": record.reason},
+        ))
+
+    async def _stop_recovery_provider(self, record: TurnRecovery) -> None:
+        if record.stopped:
+            return
+        if record.owner != self._recovery_owner or record.stop_attempted:
+            raise RuntimeStateError("previous provider stop unconfirmed; remain isolated")
+        current = read_recovery(self.spec.workspace_dir)
+        assert current is not None
+        write_recovery(self.spec.workspace_dir, replace(current, stop_attempted=True))
+        try:
+            await asyncio.wait_for(self.driver.close(), timeout=CLEANUP_TIMEOUT_SECONDS)
+            if self._reader is not asyncio.current_task():
+                await self._stop_reader()
+        except Exception:
+            logger.exception("provider stop unconfirmed; operator recovery remains required")
+            raise
+        self.opened = None
+        current = read_recovery(self.spec.workspace_dir)
+        assert current is not None
+        write_recovery(self.spec.workspace_dir, replace(current, stopped=True))
+        turn = TurnRef(record.turn_ref)
+        if self.active_turn_ref == turn:
+            await self._publish_terminal_locked(HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED, driver=self.driver_name,
+                session_ref=SessionRef(record.session_ref), turn_ref=turn,
+                native_session_id=record.provider_session_id, native_turn_id=record.provider_turn_id,
+                data={"outcome": "abandoned", "error_code": "operator_recovery_required", "retryable": False},
+            ), turn)
+
+    async def recover_turn(
+        self, *, session_ref: str, turn_ref: str, action: str,
+    ) -> dict[str, Any]:
+        """Operator-only control: inspect, stop, or explicitly retry unknown work."""
+        async with self._command_lock:
+            record = read_recovery(self.spec.workspace_dir)
+            if record is None:
+                raise RuntimeStateError("no recovery record")
+            if (record.session_ref, record.turn_ref) != (session_ref, turn_ref):
+                raise RuntimeStateError("stale recovery reference")
+            warning = "Original actions may have external effects. Explicit retry does not guarantee deduplication."
+            if action == "inspect":
+                return {"ok": True, "recovery": asdict(record), "warning": warning}
+            if record.resolved:
+                return {"ok": True, "completed": True, "already_resolved": True}
+            if action == "stop":
+                await self._stop_recovery_provider(record)
+                return {"ok": True, "completed": True, "warning": warning}
+            if action != "retry" or not record.stopped:
+                raise RuntimeStateError("provider stop must be confirmed before retry")
+            callback = self.autonomous_callback
+            if callback is None:
+                raise RuntimeStateError("Inbox recovery consumer unavailable")
+            write_recovery(self.spec.workspace_dir, replace(record, retry_requested=True))
+            await callback(HarnessEvent(
+                type="turn.recovery_retry", driver=self.driver_name,
+                session_ref=SessionRef(record.session_ref), turn_ref=TurnRef(record.turn_ref),
+                native_session_id=record.provider_session_id, native_turn_id=record.provider_turn_id,
+            ))
+            final = read_recovery(self.spec.workspace_dir)
+            if final is None or not final.resolved:
+                raise RuntimeStateError("Inbox recovery did not settle")
+            self._autonomous_turn = None
+            self.active_turn_ref = None
+            self._active_driver_turn_ref = None
+            self.native_turn_id = ""
+            self._turn_refs.clear()
+            self._clear_native_session()
+            return {"ok": True, "completed": True, "warning": warning}
 
     async def _notify_autonomous(self, event: HarnessEvent) -> None:
         """Hand an unbound provider turn to the daemon. Best-effort: a
@@ -919,6 +1069,18 @@ class RuntimeManager:
                 self.agent_id or "<agent>",
                 exc_info=True,
             )
+            kind = getattr(event.type, "value", event.type)
+            if kind in {"turn.completed", "turn.abandoned", "turn.autonomous_completed"}:
+                if not recovery_required(self.spec.workspace_dir):
+                    record = TurnRecovery(
+                        session_ref=str(event.session_ref), turn_ref=str(event.turn_ref),
+                        provider_session_id=event.native_session_id or "",
+                        provider_turn_id=event.native_turn_id or "",
+                        owner=self._recovery_owner, reason="autonomous terminal delivery failed",
+                    )
+                    write_recovery(self.spec.workspace_dir, record)
+                    await self._announce_recovery(record)
+                    await self._stop_recovery_provider(record)
 
     async def _retire_invalid_resume_locked(
         self, event: HarnessEvent, logical_turn: TurnRef
@@ -980,6 +1142,9 @@ class RuntimeManager:
                 # consumer saw: if persistence turned this into an abandon,
                 # it requeues rather than marking Inbox rows processed.
                 self._autonomous_turn = None
+                watchdog = self._autonomous_watchdog
+                if watchdog is not None and watchdog is not asyncio.current_task():
+                    watchdog.cancel()
                 await self._notify_autonomous(delivered)
         if persistence_error is not None:
             raise persistence_error
@@ -1298,6 +1463,7 @@ class RuntimeManagerAdapter(Adapter):
     def register_autonomous_callback(self, callback) -> bool:
         """Route unbound provider turns to the daemon (see base adapter)."""
         self.manager.autonomous_callback = callback
+        register_runtime_manager(self.manager.agent_id, self.manager)
         return True
 
     async def _announce_admission(self, started) -> None:
@@ -1536,6 +1702,9 @@ class RuntimeManagerAdapter(Adapter):
         )
 
     async def warm(self, system_prompt: str) -> None:
+        if recovery_required(self.manager.spec.workspace_dir):
+            register_runtime_manager(self.manager.agent_id, self.manager)
+            return
         await self.manager.open()
 
     async def reload(
