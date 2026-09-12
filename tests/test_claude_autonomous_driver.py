@@ -68,3 +68,59 @@ async def test_daemon_turn_is_refused_while_an_autonomous_run_is_active():
 
 async def _noop_write(frame):
     del frame
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+@pytest.mark.asyncio
+async def test_completed_daemon_assistant_ids_do_not_leak_into_successor(lifecycle):
+    """All completed-turn frame IDs, not just its first ID, are stale."""
+    driver = ClaudeCodeCliDriver()
+    driver._native_session_id = "native"
+    driver._session_ref = SessionRef("native")
+    driver._message_lifecycle_v1 = lifecycle
+    driver._write = _noop_write
+    await driver.start_turn(TurnInput("first", client_correlation_id="command"))
+    frames = [
+        {"type": "assistant", "uuid": identity,
+         "message": {"content": [{"type": "text", "text": identity}]}}
+        for identity in ("first-output", "last-output")
+    ]
+    for frame in frames:
+        await driver._handle(frame)
+    await driver._handle({
+        "type": "result", "subtype": "success", "user_message_uuid": "command",
+    })
+    if lifecycle:
+        await driver._handle({
+            "type": "command_lifecycle", "command_uuid": "command", "state": "completed",
+        })
+    assert not driver._active.value
+    await driver.start_turn(TurnInput("second", client_correlation_id="next-command"))
+    successor = driver._active
+    while not driver._events.empty():
+        driver._events.get_nowait()
+    for frame in frames:
+        await driver._handle(frame)
+    assert driver._events.empty()
+    assert driver._active == successor
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_assistant_identity_is_scoped_to_native_session():
+    """Reopening the same session retains dedup; a new session may reuse IDs."""
+    driver = ClaudeCodeCliDriver()
+    driver._native_session_id = "original"
+    driver._session_ref = SessionRef("original")
+    frame = {"type": "assistant", "uuid": "same-id", "message": {"content": []}}
+    await driver._handle(frame)
+    await driver._handle({"type": "result", "subtype": "success"})
+    await driver.close()
+    driver._prepare_reopen()
+    await driver._handle(frame)
+    assert not driver._active.value
+    driver._native_session_id = "different"
+    driver._session_ref = SessionRef("different")
+    await driver._handle(frame)
+    assert driver._active.value
+    await driver.close()
