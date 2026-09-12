@@ -136,6 +136,10 @@ class ClaudeCodeCliDriver(Driver):
         self._message_lifecycle_v1 = False
         self._owned_commands: set[str] = set()
         self._terminal_commands: set[str] = set()
+        self._active_assistant_ids: set[tuple[str, str]] = set()
+        # Keep completed identities across process reopen/resume. UUIDs are
+        # scoped to the native session, not to a local driver turn reference.
+        self._completed_assistant_ids: set[tuple[str, str]] = set()
         self._gated_command_id = ""
         self._gated_ack: asyncio.Future[_InputAckOutcome] | None = None
         self._result_input_tokens = 0
@@ -552,6 +556,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
 
     def _reset_turn_tracking(self, primary_command_id: str = "") -> None:
+        self._active_assistant_ids.clear()
         self._settle_gated_ack(_InputAckOutcome.REJECTED)
         self._gated_command_id = ""
         self._active_provider_error = None
@@ -781,6 +786,12 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _handle_assistant(self, frame: dict[str, Any]) -> None:
+        frame_uuid = str(frame.get("uuid") or "")
+        if frame_uuid:
+            identity = (self._native_session_id, frame_uuid)
+            if identity in self._completed_assistant_ids:
+                return
+            self._active_assistant_ids.add(identity)
         if not self._active.value:
             # No daemon-started turn is open, yet the CLI is producing
             # assistant output: a background task woke the model after the
@@ -953,6 +964,7 @@ class ClaudeCodeCliDriver(Driver):
         await self._finish_turn(self._last_result_payload or native_payload)
 
     async def _finish_turn(self, native_payload: dict[str, Any]) -> None:
+        self._completed_assistant_ids.update(self._active_assistant_ids)
         outcome = "failed" if self._result_error_code else "succeeded"
         data: dict[str, Any] = {
             "outcome": outcome,

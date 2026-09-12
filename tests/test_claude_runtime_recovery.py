@@ -67,3 +67,60 @@ async def test_invalid_resume_result_has_stable_error_code(is_error):
 
     completed = await driver._events.get()
     assert completed.data["error_code"] == "invalid_resume"
+
+
+@pytest.mark.asyncio
+async def test_completed_assistant_replay_cannot_arm_watchdog(monkeypatch, tmp_path):
+    """Replaying a completed raw frame must not quarantine an idle session."""
+    import asyncio
+
+    from test_runtime_manager_failures import _ControllableDriver
+    from puffo_agent.agent.turn_recovery import read_recovery
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    decoder = ClaudeCodeCliDriver()
+    decoder._session_ref = SessionRef("native-session")
+    decoder._native_session_id = "native-session"
+    manager = RuntimeManager(
+        _ControllableDriver(), RuntimeSpec(str(tmp_path), task_timeout_seconds=5),
+        native_session_id="native-session",
+    )
+    reported = []
+
+    async def callback(event):
+        reported.append(event)
+
+    manager.autonomous_callback = callback
+
+    async def feed(frame):
+        await decoder._handle(frame)
+        while not decoder._events.empty():
+            await manager._consume_event_locked(decoder._events.get_nowait())
+
+    assistant = {
+        "type": "assistant", "uuid": "completed-assistant",
+        "message": {"content": [{"type": "text", "text": "done"}]},
+    }
+    result = {"type": "result", "subtype": "success", "is_error": False}
+    try:
+        await feed(assistant)
+        await feed(result)
+        completed_events = len(reported)
+        await feed(assistant)
+        await asyncio.sleep(0)
+        now[0] += 6
+        for _ in range(12):
+            await asyncio.sleep(0)
+        assert manager.driver.close_calls == 0
+        assert read_recovery(str(tmp_path)) is None
+        assert manager.active_turn_ref is None
+        assert len(reported) == completed_events
+        # Genuine background work must still be adopted and completed.
+        await feed({**assistant, "uuid": "new-assistant"})
+        assert manager.active_turn_ref is not None
+        await feed(result)
+        assert manager.active_turn_ref is None
+    finally:
+        await manager.close()
