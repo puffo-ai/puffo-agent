@@ -1590,6 +1590,7 @@ class Worker:
 
     def _build_status_reporter(self, client) -> StatusReporter:
         from ..agent.processing_receipts import ProcessingReportDispatcher
+        from .lingtai_health import reported_runtime_health
 
         bridge = getattr(client, "_bridge", None)
         processing_reports = None
@@ -1615,7 +1616,12 @@ class Worker:
 
         reporter = StatusReporter(
             client.http,
-            runtime_health_provider=lambda: self.runtime.health,
+            runtime_health_provider=lambda: reported_runtime_health(
+                runtime=self.agent_cfg.runtime,
+                current_health=self.runtime.health,
+                worker_status=self.runtime.status,
+                worker_started_at=self.runtime.started_at,
+            ),
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,
