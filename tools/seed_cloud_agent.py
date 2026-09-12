@@ -385,7 +385,14 @@ UNSET = object()
 
 def verify(slug: str, *, expected_template: str = "", expected_auth_mode: str = "") -> int:
     """Find the sandbox running ``slug`` and report its readiness."""
-    from puffo_agent.agent.cloud_verify import evaluate, summarize
+    try:
+        from puffo_agent.agent.cloud_verify import evaluate, summarize
+    except ModuleNotFoundError:
+        # A fresh checkout has not `pip install -e .`'d and has no PYTHONPATH.
+        # The tool lives at tools/, the package at src/ — locate it ourselves
+        # rather than hand a new user a traceback for a path they never set.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from puffo_agent.agent.cloud_verify import evaluate, summarize
 
     Sandbox = _require_e2b()
     from e2b import SandboxQuery, SandboxState  # noqa: PLC0415
