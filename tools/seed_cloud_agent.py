@@ -221,6 +221,21 @@ def _control(path: str, payload: dict, method: str = "PUT") -> dict:
         raise SeedError(f"could not reach {base}: {exc.reason}") from None
 
 
+def set_profile(cloud_slug: str, agent_dir: Path) -> int:
+    """PUT the local agent's ``profile.md`` as the cloud agent's store-owned profile.
+
+    The Hub's PROFILE field expects a *Soul body*; pasting a whole profile.md
+    there gets wrapped under the Hub's own ``# Soul`` and the extractor keeps
+    only the first three lines — the briefing then has no real persona. Sending
+    the file verbatim through ``PUT /agents/{slug}`` (which replaces profile.md,
+    pushes it, and reloads the worker) makes the cloud profile byte-identical
+    to the local one and the regenerated briefing carries the full Soul.
+    """
+    text = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    _control(f"/agents/{cloud_slug}", {"soul": text}, method="PUT")
+    return len(text.encode())
+
+
 def deliver(cloud_slug: str) -> dict:
     """Push the STORED memory into the agent's RUNNING sandbox — once, if empty.
 
@@ -439,6 +454,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--to", metavar="CLOUD_SLUG", help="cloud agent to upload the memory to")
     ap.add_argument("--dry-run", action="store_true", help="report, write nothing")
     ap.add_argument(
+        "--profile",
+        action="store_true",
+        help="also set the cloud agent's profile to the local profile.md, verbatim "
+        "(PUT /agents/{slug}); makes the persona byte-identical to local",
+    )
+    ap.add_argument(
         "--deliver",
         action="store_true",
         help="after upload (or alone with --to), seed the RUNNING sandbox from the store "
@@ -503,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         files, summary = collect_memory(agent_dir)
         _report([summary])
+        if args.profile:
+            print(f"profile set from local profile.md ({set_profile(args.to, agent_dir)} bytes)")
         n = upload(args.to, files)
     except SeedError as exc:
         print(f"error: {exc}", file=sys.stderr)

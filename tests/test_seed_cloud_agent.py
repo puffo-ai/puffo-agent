@@ -29,6 +29,7 @@ from seed_cloud_agent import (  # noqa: E402
     soul_body,
     collect_memory,
     deliver,
+    set_profile,
     upload,
 )
 
@@ -358,3 +359,20 @@ class TestDeliver:
         )
         assert seed_cloud_agent.main(["--deliver", "--to", "a1"]) == 0
         assert "delivered 3" in capsys.readouterr().out
+
+
+
+class TestSetProfile:
+    """The Hub's PROFILE field wants a Soul body; a whole profile.md pasted there
+    loses its persona in the briefing. PUT /agents/{slug} with the file verbatim
+    makes the cloud profile byte-identical to local."""
+
+    def test_it_puts_the_local_profile_verbatim(self, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(seed_cloud_agent, "_control",
+                            lambda path, payload, method="PUT": seen.update(path=path, method=method, payload=payload) or {"updated": True})
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="**Role:** x\n\n# Soul\n\nrigorous\n")
+        n = set_profile("desk-cloud-2779", src)
+        assert seen["path"] == "/agents/desk-cloud-2779" and seen["method"] == "PUT"
+        assert seen["payload"]["soul"] == "**Role:** x\n\n# Soul\n\nrigorous\n"
+        assert n == len(seen["payload"]["soul"].encode())

@@ -16,6 +16,19 @@ the platform-managed `briefing/profile.md` — that file names the *source* agen
 and the platform regenerates it, so seeding it hands the new agent a stale
 identity. The profile itself is set in the Hub's create dialog; the store owns it.
 
+## Inputs — two handles, ask for whichever is missing
+
+| handle | what it is | where it comes from |
+|---|---|---|
+| **local agent prefix** | the directory name under `~/.puffo-agent/agents/`, e.g. `optionexpe` (a prefix is enough; ambiguous → the tool refuses) | the user names it; `ls ~/.puffo-agent/agents/` lists candidates |
+| **cloud slug** | the target's id, e.g. `optionexpe-7146-d57f9ef1` | the Hub profile URL `/chat/agents/<slug>/profile`, or `./aim -e staging status` in cloud-infra |
+
+If the request names neither, **ask for both** before running anything. If it
+names the local agent but not the target, look the slug up (`aim status`) and
+**confirm it with the user when more than one candidate exists** — never guess a
+target for a write. The cloud agent must already exist (the Hub creates it; no
+CLI can).
+
 ## The workflow — one command after the Hub
 
 ```bash
@@ -23,8 +36,10 @@ identity. The profile itself is set in the Hub's create dialog; the store owns i
 #    the URL is /chat/agents/<slug>/profile, or `./aim -e staging status` in cloud-infra.
 
 # 2. seed AND deliver in one go (dry-run first if unsure what will be sent)
+#    --profile also sets the cloud profile to the local profile.md verbatim —
+#    use it unless you pasted a Soul BODY (not a whole profile.md) in the Hub.
 python3 tools/seed_cloud_agent.py --from <local-agent-prefix> --dry-run
-python3 tools/seed_cloud_agent.py --from <local-agent-prefix> --to <cloud-slug> --deliver
+python3 tools/seed_cloud_agent.py --from <local-agent-prefix> --to <cloud-slug> --profile --deliver
 
 # 3. check it can serve — ten checks
 python3 tools/seed_cloud_agent.py --verify <cloud-slug> --expect-auth-mode subscription
