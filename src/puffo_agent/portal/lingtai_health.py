@@ -35,7 +35,16 @@ def reported_runtime_health(
         return current_health
     clock = time.time() if now is None else now
     try:
-        heartbeat = (directory / ".agent.heartbeat").lstat()
+        try:
+            heartbeat = (directory / ".agent.heartbeat").lstat()
+        except FileNotFoundError:
+            # A supported current process can leave its last healthy snapshot
+            # behind after graceful exit. Missing heartbeat then is evidence;
+            # an old/unsupported source with no snapshot is not.
+            snapshot = (directory / ".status.json").lstat()
+            if stat.S_ISREG(snapshot.st_mode) and worker_started_at <= snapshot.st_mtime <= clock:
+                return "runtime_unresponsive"
+            return current_health
         if not stat.S_ISREG(heartbeat.st_mode) or heartbeat.st_mtime < worker_started_at:
             return current_health
         age = clock - heartbeat.st_mtime

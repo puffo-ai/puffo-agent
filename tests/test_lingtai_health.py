@@ -118,3 +118,12 @@ async def test_worker_projects_health_on_wire_and_clears_after_recovery(source, 
     await reporter.report_current_status()
     assert http.calls[-1][1]["health"] == "ok"
     assert worker.runtime.health == "ok"  # projection never overwrites the lifecycle owner
+
+
+def test_graceful_exit_missing_heartbeat_does_not_reuse_a_healthy_snapshot(source):
+    directory, _, _, snapshot, health = source
+    snapshot("asleep")
+    (directory / ".agent.heartbeat").unlink()
+    assert health() == "runtime_unresponsive"
+    (directory / ".status.json").unlink()
+    assert health() == "ok"  # no evidence from an older unsupported runtime
