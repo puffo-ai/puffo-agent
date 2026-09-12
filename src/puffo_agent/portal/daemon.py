@@ -221,6 +221,11 @@ class Daemon:
                 spawn(self.codex_refresher.run_loop(self._stop), name="codex_refresher.run_loop"),
             )
         )
+        from .lingtai_profile_sync import LingtaiProfileSync
+
+        runtime.runtime_tasks.append(
+            spawn(LingtaiProfileSync().run_loop(self._stop), name="lingtai_profile_sync")
+        )
         from .control.client import ControlManager
 
         runtime.control_manager = ControlManager()

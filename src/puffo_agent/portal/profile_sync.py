@@ -226,6 +226,12 @@ async def sync_full_profile(cfg: AgentConfig) -> None:
     ``# Soul`` section extracted from profile.md. Soul is omitted
     when profile.md is missing OR has no soul-like heading — the
     server's stored value is preserved rather than clobbered."""
+    from .control.lingtai_profile import is_lingtai_runtime
+
+    # LingTai names have one daemon-owned publisher. Startup/warm snapshots
+    # must never race it by restoring an old imported name or local persona.
+    if is_lingtai_runtime(cfg.runtime):
+        return
     # Repair a stale on-disk role_short BEFORE syncing, so a restart fixes
     # the chip instead of pushing the stale value back to the server.
     if cfg.role:
