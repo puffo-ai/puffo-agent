@@ -12,6 +12,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .._proc import no_window_kwargs
+
 from .harness.support.child_env import build_child_environment
 
 
@@ -71,6 +73,7 @@ def check_pi_auth(
             text=True,
             env=env,
             timeout=timeout_seconds,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PiAuthProbeError("Pi auth check could not complete") from exc
@@ -146,6 +149,7 @@ def list_pi_models(
             text=True,
             env=env,
             timeout=timeout_seconds,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PiAuthProbeError("Pi model list could not complete") from exc

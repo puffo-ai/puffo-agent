@@ -37,6 +37,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from .._proc import no_window_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +83,7 @@ def _clone(remote: str, into: Path) -> None:
         check=True,
         capture_output=True,
         timeout=_CLONE_TIMEOUT_S,
+        **no_window_kwargs(),
     )
 
 

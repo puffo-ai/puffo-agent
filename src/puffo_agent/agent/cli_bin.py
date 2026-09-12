@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .._proc import no_window_kwargs
+
 # Resolved-path caches: in-memory for this daemon's lifetime, plus a
 # last-resort JSON fallback for installs that later disappear from PATH.
 _resolve_memcache: dict[str, str] = {}
@@ -299,7 +301,9 @@ def _login_shell_path() -> str:
 
 def _run_capture(cmd: list[str]) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=8, **no_window_kwargs()
+        )
         return r.stdout.strip()
     except Exception:
         return ""
