@@ -1330,22 +1330,6 @@ class GlobalInboxRuntime(
         if self.health.state == "in_progress":
             self.health = RuntimeHealth()
 
-    async def _wake_remaining_pending(self) -> None:
-        if self._degraded or not await self.store.get_pending(limit=1):
-            return
-        if await self.store.get_notice_candidates(
-            self.adapter.get_provider_session_id()
-        ):
-            delay = self.next_no_progress_rearm_delay()
-            if delay <= 0.0:
-                self.notify()
-                return
-            # Backed-off self re-arm. Deliberately NOT self.notify(): that
-            # clears the degraded backoff and pins the delay to 0 whenever no
-            # turn is active, which is exactly the spin being bounded here.
-            # Real ingress still calls notify() and still cuts through.
-            self.coalescer.notify(delay_seconds=delay)
-
     async def _handle_process_failure(
         self, planned: PlannedTurn, process_started: float, exc: Exception
     ) -> tuple[bool, str, str]:
