@@ -26,11 +26,13 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
 
+from ..agent.event_kinds import EventKind
+from ..agent.events import random_nonce, sign_event
 from ..crypto.certs import create_subkey_cert
 from ..crypto.encoding import base64url_encode
 from ..crypto.http_auth import sign_request
@@ -61,6 +63,15 @@ def _remote_http_session(server_url: str) -> aiohttp.ClientSession:
 
 class ImportError(Exception):
     pass
+
+
+class HttpStatusError(ImportError):
+    """Carries the response status so callers can tell a retryable blip
+    from a permanent rejection."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -392,7 +403,31 @@ async def _signed_post(
     ) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise ImportError(f"{path} {resp.status}: {text}")
+            raise HttpStatusError(f"{path} {resp.status}: {text}", resp.status)
+
+
+async def _signed_get(
+    session: aiohttp.ClientSession,
+    *,
+    server_url: str,
+    path: str,
+    signer_key: Ed25519KeyPair,
+    signer_id: str,
+    slug: str,
+) -> dict:
+    headers = sign_request(
+        signing_key=signer_key,
+        slug=slug,
+        signer_id=signer_id,
+        method="GET",
+        path=path,
+        body=b"",
+    ).to_dict()
+    async with session.get(f"{server_url.rstrip('/')}{path}", headers=headers) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise HttpStatusError(f"{path} {resp.status}: {text}", resp.status)
+        return await resp.json()
 
 
 async def _register_subkey_via_device(
@@ -634,6 +669,24 @@ async def self_revoke_device(
         )
 
 
+def _fresh_session_subkey(
+    keystore: KeyStore, slug: str
+) -> tuple[Ed25519KeyPair, dict] | None:
+    """Reuse a still-valid session subkey from disk to skip a redundant
+    ``/devices/subkeys`` POST. ``None`` when absent or due for rotation."""
+    try:
+        from ..crypto.certs import needs_rotation
+        sess = keystore.load_session(slug)
+    except FileNotFoundError:
+        return None
+    if needs_rotation(sess.expires_at):
+        return None
+    return (
+        Ed25519KeyPair.from_secret_bytes(decode_secret(sess.subkey_secret_key)),
+        {"subkey_id": sess.subkey_id},
+    )
+
+
 async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
     keystore = KeyStore(archived_dir / "keys")
     identity = keystore.load_identity(slug)
@@ -643,21 +696,7 @@ async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
     device_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.device_signing_secret_key)
     )
-    # Reuse a fresh session subkey if one's already on disk to skip a
-    # redundant /devices/subkeys POST.
-    preregistered: tuple[Ed25519KeyPair, dict] | None = None
-    try:
-        from ..crypto.certs import needs_rotation
-        sess = keystore.load_session(slug)
-        if not needs_rotation(sess.expires_at):
-            preregistered = (
-                Ed25519KeyPair.from_secret_bytes(
-                    decode_secret(sess.subkey_secret_key)
-                ),
-                {"subkey_id": sess.subkey_id},
-            )
-    except FileNotFoundError:
-        pass
+    preregistered = _fresh_session_subkey(keystore, slug)
     await self_revoke_device(
         server_url=identity.server_url,
         slug=identity.slug,
@@ -696,6 +735,162 @@ def write_archived_pending_revoke(
         ),
         encoding="utf-8",
     )
+
+
+OWNER_LEAVE_REJECTION = "owner must transfer ownership before leaving"
+
+
+@dataclass
+class LeaveSpacesResult:
+    """Outcome of the on-archive space-leave fanout. ``failed`` is the
+    only retryable bucket; both skip buckets are permanent and must never
+    hold up the revoke, since retrying them would never converge.
+
+    ``skipped_owner`` needs a human to transfer the space first.
+    ``skipped_permanent`` is a non-403 4xx — a rejection the server will
+    repeat identically on every retry."""
+
+    left: list[str]
+    skipped_owner: list[str]
+    failed: list[str]
+    skipped_permanent: list[str] = field(default_factory=list)
+    last_error: str = ""
+
+
+def _is_permanent_leave_rejection(exc: Exception) -> bool:
+    """Per AC #4: a 4xx other than 403 is the server telling us this
+    request is wrong, not that it's busy — retrying can't fix it. 403 is
+    excluded because a non-owner 403 can be a transient auth blip, and
+    429 is a rate-limit, i.e. explicitly retryable."""
+    status = getattr(exc, "status", 0)
+    return 400 <= status < 500 and status not in (403, 429)
+
+
+def archived_pending_leave_path(archived_agent_dir: Path) -> Path:
+    return archived_agent_dir / ".puffo-agent" / "pending_leave_memberships.json"
+
+
+def write_archived_pending_leave(
+    archived_agent_dir: Path,
+    *,
+    slug: str,
+    space_ids: list[str],
+    last_error: str,
+) -> None:
+    """Marker for the startup sweep. ``space_ids`` is what failed on this
+    pass — informational only; the retry re-queries ``GET /spaces`` so it
+    converges on server-authoritative state rather than a stale list."""
+    path = archived_pending_leave_path(archived_agent_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "archive_leave_spaces",
+                "slug": slug,
+                "space_ids": space_ids,
+                "last_error": last_error,
+                "attempted_at": int(time.time() * 1000),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+async def leave_all_spaces(archived_dir: Path, *, slug: str) -> LeaveSpacesResult:
+    """Sign a ``LeaveSpace`` for every space the agent still belongs to,
+    so an archived agent stops showing up in channel rosters and the
+    @-mention picker (PUF-430).
+
+    MUST run before ``revoke_archived_device`` — once the device is
+    revoked its subkeys are 401'd and nothing can be signed. Spaces are
+    enumerated from ``GET /spaces`` (server-authoritative; local state
+    can be stale) and the server cascades each ``LeaveSpace`` to every
+    channel in that space, so per-space is enough.
+
+    Raises on pre-flight failure (keystore, subkey, or the enumerate
+    GET); per-space failures are collected into the result instead.
+    """
+    keystore = KeyStore(archived_dir / "keys")
+    identity = keystore.load_identity(slug)
+    device_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.device_signing_secret_key)
+    )
+    server_url = identity.server_url
+    result = LeaveSpacesResult(left=[], skipped_owner=[], failed=[])
+    async with _remote_http_session(server_url) as session:
+        preregistered = _fresh_session_subkey(keystore, slug)
+        if preregistered is not None:
+            subkey, cert = preregistered
+        else:
+            subkey, cert = await _register_subkey_via_device(
+                session,
+                server_url=server_url,
+                slug=slug,
+                device_id=identity.device_id,
+                device_signing_key=device_signing,
+            )
+        subkey_id = cert["subkey_id"]
+        data = await _signed_get(
+            session,
+            server_url=server_url,
+            path="/spaces",
+            signer_key=subkey,
+            signer_id=subkey_id,
+            slug=slug,
+        )
+        for entry in data.get("spaces") or []:
+            space_id = (entry.get("space_id") or "").strip()
+            if not space_id:
+                continue
+            # The server rejects an owner's LeaveSpace outright; skip it
+            # here so we don't spend a round-trip to be told so.
+            if (entry.get("role") or "") == "owner":
+                result.skipped_owner.append(space_id)
+                continue
+            event = sign_event(
+                kind=EventKind.LEAVE_SPACE,
+                payload={
+                    "space_id": space_id,
+                    "effective_from": int(time.time() * 1000),
+                    "nonce": random_nonce(),
+                },
+                signer_slug=slug,
+                signer_device_id=identity.device_id,
+                signer_subkey_id=subkey_id,
+                signing_key=subkey,
+            )
+            try:
+                await _signed_post(
+                    session,
+                    server_url=server_url,
+                    path="/spaces/events",
+                    signer_key=subkey,
+                    signer_id=subkey_id,
+                    slug=slug,
+                    body_dict={"space_id": space_id, "events": [event]},
+                )
+            except Exception as exc:  # noqa: BLE001
+                if OWNER_LEAVE_REJECTION in str(exc):
+                    result.skipped_owner.append(space_id)
+                    continue
+                if _is_permanent_leave_rejection(exc):
+                    result.skipped_permanent.append(space_id)
+                    logger.warning(
+                        "archive leave: space %s permanently rejected for %s "
+                        "(%s); not retrying",
+                        space_id, slug, exc,
+                    )
+                    continue
+                result.failed.append(space_id)
+                result.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "archive leave: space %s failed for %s: %s",
+                    space_id, slug, exc,
+                )
+            else:
+                result.left.append(space_id)
+    return result
 
 
 class _RetryOutcome(enum.Enum):
@@ -758,6 +953,55 @@ async def _retry_archived_pending_revoke(
     return _RetryOutcome.SUCCEEDED
 
 
+async def _retry_archived_pending_leave(archived_path: Path) -> bool:
+    """Retry the space-leave fanout for one archived dir. Returns whether
+    the revoke may proceed this pass — ``False`` only for a transient
+    leave failure, because revoking now would 401 every future retry."""
+    marker = archived_pending_leave_path(archived_path)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        slug = payload["slug"]
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(
+            "pending leave at %s is unparseable (%s); renaming to .broken",
+            marker, exc,
+        )
+        _mark_pending_revoke_broken(marker, str(exc))
+        return True
+    try:
+        result = await leave_all_spaces(archived_path, slug=slug)
+    except FileNotFoundError as exc:
+        logger.warning(
+            "pending leave at %s: keystore missing (%s); renaming to .broken",
+            marker, exc,
+        )
+        _mark_pending_revoke_broken(marker, f"keystore missing: {exc}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pending leave retry for %s failed: %s; will try again",
+            archived_path.name, exc,
+        )
+        return False
+    if result.failed:
+        write_archived_pending_leave(
+            archived_path,
+            slug=slug,
+            space_ids=result.failed,
+            last_error=result.last_error,
+        )
+        return False
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    logger.info(
+        "pending leave retry for %s ok (left %d, owner-skipped %d)",
+        archived_path.name, len(result.left), len(result.skipped_owner),
+    )
+    return True
+
+
 def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:
     # Rename so the next sweep doesn't keep warning; left on disk for
     # operator inspection.
@@ -783,7 +1027,16 @@ async def sweep_archived_pending_revokes() -> int:
     for entry in root.iterdir():
         if not entry.is_dir():
             continue
-        if not archived_pending_revoke_path(entry).exists():
+        has_leave = archived_pending_leave_path(entry).exists()
+        has_revoke = archived_pending_revoke_path(entry).exists()
+        if not (has_leave or has_revoke):
+            continue
+        # Leave first, always: the revoke kills the credential that signs
+        # the leave, so a revoke that lands early strands the memberships
+        # forever (PUF-430).
+        if has_leave and not await _retry_archived_pending_leave(entry):
+            continue
+        if not has_revoke:
             continue
         outcome = await _retry_archived_pending_revoke(entry)
         if outcome is _RetryOutcome.SUCCEEDED:
