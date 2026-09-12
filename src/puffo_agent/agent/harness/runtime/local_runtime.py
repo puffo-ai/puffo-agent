@@ -399,13 +399,11 @@ class LocalRuntimePreparer:
         return self._prepare_generic_spec(system_prompt)
 
     def _resolve_model(self) -> str:
-        runtime = self.agent_cfg.runtime
-        if self.harness_name == "codex":
-            return runtime.model or self.daemon_cfg.openai.model or ""
-        if self.harness_name == "claude-code":
-            return runtime.model or self.daemon_cfg.anthropic.model or ""
-        provider_cfg = getattr(self.daemon_cfg, self.provider, None)
-        return runtime.model or getattr(provider_cfg, "model", "") or ""
+        return self.daemon_cfg.resolve_model(
+            model=self.agent_cfg.runtime.model,
+            provider=self.provider,
+            harness=self.harness_name,
+        )
 
     def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
         if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:

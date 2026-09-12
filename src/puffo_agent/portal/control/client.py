@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import aiohttp
@@ -174,7 +175,8 @@ async def _materialize_slug_binding(
 
 
 async def _create_agent_command(
-    params: dict, server_url: str | None, paired_root_pubkey: str | None
+    params: dict, server_url: str | None, paired_root_pubkey: str | None,
+    *, resolve_model: Callable[..., str] | None = None,
 ) -> dict:
     """Agent Portal remote create: materialize the pending identity, then write
     the agent dir. Order is verify → materialize → write, so a verify failure
@@ -201,7 +203,10 @@ async def _create_agent_command(
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
 
     async def _preflight(context: dict) -> None:
-        await preflight_runtime(context["runtime"], agent_id=context["agent_id"])
+        await preflight_runtime(
+            context["runtime"], agent_id=context["agent_id"],
+            resolve_model=resolve_model,
+        )
 
     try:
         result = await provision_agent_from_bundle(
@@ -289,6 +294,7 @@ async def execute_command(
     server_url: str | None = None,
     paired_root_pubkey: str | None = None,
     command_id: str | None = None,
+    resolve_model: Callable[..., str] | None = None,
 ) -> dict:
     """Apply a decrypted command to local agent state for the reconciler.
 
@@ -338,7 +344,9 @@ async def execute_command(
         )
         return {"ok": True, "posted": posted}
     if op == "create":
-        return await _create_agent_command(params, server_url, paired_root_pubkey)
+        return await _create_agent_command(
+            params, server_url, paired_root_pubkey, resolve_model=resolve_model,
+        )
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
@@ -629,8 +637,9 @@ class MachineControlClient:
     """Holds the single control WS; verifies each command against the pinned
     operator root named in the frame, executes it, and acks."""
 
-    def __init__(self, machine) -> None:
+    def __init__(self, machine, *, resolve_model: Callable[..., str] | None = None) -> None:
         self.machine = machine
+        self._resolve_model = resolve_model
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
         self._command_tasks: set[asyncio.Future] = set()
         self._inflight_command_ids: set[str] = set()
@@ -851,6 +860,7 @@ class MachineControlClient:
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
                 command_id=str(command_id or ""),
+                resolve_model=self._resolve_model,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
@@ -930,7 +940,8 @@ class ControlManager:
     ``server_url``. Multiple operators on that same server are served; a
     machine paired across two different servers only serves the first."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, resolve_model: Callable[..., str] | None = None) -> None:
+        self._resolve_model = resolve_model
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -944,7 +955,7 @@ class ControlManager:
                 if pairings and machine is None:
                     machine = load_or_create_machine()
                 if pairings and ws_task is None:
-                    client = MachineControlClient(machine)
+                    client = MachineControlClient(machine, resolve_model=self._resolve_model)
                     ws_task = spawn(client.run(self._stop), name="client.run")
                     me_task = spawn(self._me_loop(machine), name="me_loop")
                     usage_task = spawn(self._usage_loop(machine), name="usage_loop")

@@ -373,6 +373,21 @@ class DaemonConfig:
         default_factory=lambda: RpcServiceConfig(),
     )
 
+    def resolve_model(self, *, model: str, provider: str, harness: str) -> str:
+        """Resolve local runtime model hints with explicit selections first."""
+        if model:
+            return model
+        if harness == "codex":
+            provider = "openai"
+        elif harness == "claude-code":
+            provider = "anthropic"
+        defaults = {
+            "anthropic": self.anthropic.model,
+            "openai": self.openai.model,
+            "google": self.google.model,
+        }
+        return defaults.get(provider, "") or ""
+
     @classmethod
     def load(cls) -> DaemonConfig:
         path = daemon_yml_path()

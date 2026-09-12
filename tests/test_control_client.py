@@ -782,8 +782,8 @@ def _wire_run(monkeypatch, mgr, *, pairing_seq, stop_after):
     monkeypatch.setattr(cc, "load_or_create_machine", lambda: types.SimpleNamespace(machine_id="mac_1"))
 
     class _FakeClient:
-        def __init__(self, machine):
-            pass
+        def __init__(self, machine, *, resolve_model):
+            assert resolve_model is mgr._resolve_model
 
         def run(self, stop):
             return aio.sleep(3600)
@@ -1009,3 +1009,52 @@ async def test_concurrent_identical_env_edits_are_idempotent(home):
     assert AgentConfig.load("scout").env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('harness', ['pi', 'opencode'])
+async def test_create_uses_running_daemon_model_not_changed_disk(home, monkeypatch, harness):
+    """Control create must preflight the same default the live worker will use."""
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.control import preflight as checks
+    from puffo_agent.agent.pi_auth import PiAuthResult
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
+
+    live = DaemonConfig()
+    live.anthropic.model = 'unavailable'
+    disk = DaemonConfig()
+    disk.anthropic.model = 'disk-available'
+    monkeypatch.setattr(DaemonConfig, 'load', classmethod(lambda cls: disk))
+    runtime = RuntimeConfig(kind='cli-local', provider='anthropic', harness=harness)
+    seen = []
+
+    def opencode_status(executable, model):
+        seen.append(model)
+        return 'model_not_available' if model == 'unavailable' else 'ready'
+
+    def pi_status(executable, **kwargs):
+        seen.append(kwargs['model'])
+        return PiAuthResult(status='not_ready' if kwargs['model'] == 'unavailable' else 'ready', provider='anthropic')
+
+    monkeypatch.setattr(checks, 'resolve_pi_bin', lambda: 'synthetic-pi')
+    monkeypatch.setattr(checks, 'resolve_opencode_bin', lambda: 'synthetic-opencode')
+    monkeypatch.setattr(checks, 'opencode_model_status', opencode_status)
+    monkeypatch.setattr(checks, 'check_pi_auth', pi_status)
+
+    async def provision(params, operator_key, *, preflight, materialize):
+        await preflight({'runtime': runtime, 'agent_id': ''})
+        pytest.fail('Unavailable live default must be rejected before materialization')
+
+    monkeypatch.setattr('puffo_agent.portal.control.provision.provision_agent_from_bundle', provision)
+    client = MachineControlClient(object(), resolve_model=live.resolve_model)
+    await client._execute_and_ack(None, 'model-check', {
+        'op': 'create', 'agent_slug': None,
+        'params': {'pending_token': 'synthetic', 'identity_bundle': {'slug_binding': {}}},
+    }, types.SimpleNamespace(server_url='https://synthetic.invalid', operator_root_pubkey='synthetic'), nonce=None)
+    preparer = object.__new__(LocalRuntimePreparer)
+    preparer.agent_cfg = types.SimpleNamespace(runtime=runtime)
+    preparer.daemon_cfg = live
+    preparer.provider = 'anthropic'
+    preparer.harness_name = harness
+    assert seen == [preparer._resolve_model()] == ['unavailable']
+    assert client._completed_results['model-check']['error_code'] == 'harness_not_ready'
