@@ -747,6 +747,99 @@ async def test_long_autonomous_tool_is_visible_and_not_silently_killed(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_quarantined_tool_late_terminal_cannot_replace_recovery(tmp_path, monkeypatch):
+    """A late terminal followed by another provider start must preserve the
+    quarantined Inbox binding, including beyond the new turn's idle deadline."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec
+    from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager, RuntimeManagerAdapter
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _ControllableDriver
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = RuntimeManager(_ControllableDriver(), RuntimeSpec(str(tmp_path), task_timeout_seconds=5), native_session_id="provider-session")
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(store=store, adapter=RuntimeManagerAdapter(manager), run_turn=lambda _: None, workspace=tmp_path)
+    runtime.register_autonomous_adoption()
+    runtime._autonomous_ready = True
+
+    async def emit(kind, turn="provider-turn", data=None):
+        await manager._consume_event_locked(HarnessEvent(
+            type=kind, driver="claude-code", session_ref="provider-session",
+            turn_ref=turn, native_turn_id=turn, native_session_id="provider-session",
+            data=data or {},
+        ))
+
+    try:
+        await emit("turn.autonomous_started")
+        await receipt(store, "uncertain-tool", 1)
+        await runtime._admit_inbox_page(
+            SimpleNamespace(selected=await store.get_pending(), remaining_count=0),
+            snapshot_generation=0, requesting_turn_id=runtime.active.turn_id,
+            requesting_provider_session_id="provider-session", requesting_provider_turn_id="provider-turn",
+        )
+        await emit("turn.tool_started", data={"tool_call_ref": "long-tool"})
+        watchdog = manager._autonomous_watchdog
+        await asyncio.sleep(0)
+        now[0] += 6
+        await watchdog
+        original = read_recovery(tmp_path)
+        assert original is not None and not original.stopped
+        assert original.durable_turn_id == runtime.active.turn_id
+        await emit("turn.autonomous_completed", data={"outcome": "succeeded"})
+        assert manager.active_turn_ref is None
+        await emit("turn.autonomous_started", turn="successor")
+        accepted = manager.active_turn_ref
+        await asyncio.sleep(0)
+        now[0] += 6
+        for _ in range(12):
+            await asyncio.sleep(0)
+        assert read_recovery(tmp_path) == original
+        assert accepted is None
+        assert manager._autonomous_watchdog is None
+        assert runtime.active.turn_id == original.durable_turn_id
+        assert (await store.get_message_by_envelope("uncertain-tool")).processing_state == "in_turn"
+        assert manager.driver.close_calls == 0
+    finally:
+        await manager.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_supervisor_preserves_an_existing_recovery_record(tmp_path, monkeypatch):
+    """A watchdog already armed before quarantine must not overwrite another
+    failure path's durable record when its deadline fires."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import RuntimeSpec
+    from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
+    from tests.test_runtime_manager_failures import _autonomous_manager, _start_autonomous
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = _autonomous_manager()
+    manager.spec = RuntimeSpec(str(tmp_path), task_timeout_seconds=5)
+    try:
+        await _start_autonomous(manager, [])
+        watchdog = manager._autonomous_watchdog
+        original = TurnRecovery(
+            session_ref="original-session", turn_ref="original-turn",
+            provider_session_id="native-session", provider_turn_id="native-turn",
+            owner="original-owner", reason="terminal delivery failed", durable_turn_id="durable-original",
+        )
+        write_recovery(tmp_path, original)
+        await asyncio.sleep(0)
+        now[0] += 6
+        await watchdog
+        assert read_recovery(tmp_path) == original
+        assert manager.driver.close_calls == 0
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_autonomous_activity_renews_deadline_and_late_timer_cannot_stop_next_turn(tmp_path, monkeypatch):
     """Progress beyond the original deadline keeps the turn alive; its old
     watchdog cannot cancel a successor after the first terminal arrives."""

@@ -773,7 +773,8 @@ class RuntimeManager:
         if native.type in {
             HarnessEventType.AUTONOMOUS_STARTED, "turn.autonomous_started",
         }:
-            self._adopt_driver_turn_locked(native)
+            if not self._adopt_driver_turn_locked(native):
+                return False
         logical_turn = (
             self._turn_refs.get(native.turn_ref)
             if native.turn_ref is not None
@@ -899,7 +900,7 @@ class RuntimeManager:
             )
         raise_collected_errors("runtime exit handling failed", errors)
 
-    def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
+    def _adopt_driver_turn_locked(self, native: HarnessEvent) -> bool:
         """Track a provider turn the driver opened on its own.
 
         Held-send admission and tool-result correlation both key off
@@ -907,7 +908,11 @@ class RuntimeManager:
         turn would be visible in the event stream but unusable by them.
         """
         if native.turn_ref is None or self.active_turn_ref is not None:
-            return
+            return False
+        # A late terminal can clear the in-memory owner without settling the
+        # durable quarantine. Do not admit or announce a replacement turn.
+        if recovery_required(self.spec.workspace_dir):
+            return False
         logical = TurnRef(f"turn_{uuid.uuid4().hex}")
         self.active_turn_ref = logical
         self._autonomous_turn = logical
@@ -925,6 +930,7 @@ class RuntimeManager:
         self._autonomous_watchdog = spawn(
             self._supervise_autonomous(logical), name="autonomous.supervisor"
         )
+        return True
 
     def _observe_autonomous_activity(self, event: HarnessEvent) -> None:
         if event.turn_ref != self._autonomous_turn or self._autonomous_turn is None:
@@ -957,6 +963,10 @@ class RuntimeManager:
                         # Activity can win the command lock after the timer fires.
                         if self._autonomous_deadline > asyncio.get_running_loop().time():
                             continue
+                        # Another failure path may have quarantined the turn
+                        # after this watchdog was armed. Preserve its binding.
+                        if recovery_required(self.spec.workspace_dir):
+                            return
                         waiting = bool(self._autonomous_tools or self._permission_refs)
                         reason = (
                             "silent tool or permission; operator inspection required"
