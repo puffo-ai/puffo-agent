@@ -138,17 +138,18 @@ class TestCollectingMemory:
         assert out["profile_bytes"] > 0
         assert not any("profile" in k for k in files)
 
-    def test_the_platform_managed_briefing_is_not_seeded(self, tmp_path):
-        """It names the SOURCE agent and the platform regenerates it from the
-        store-owned profile. The live demo agent read a seeded copy and
-        concluded it was `optionexpe-9840-…` instead of itself."""
-        managed = "<!-- puffo:managed-profile -->\n# OptionExpert\nYou are OptionExpert (agent optionexpe-9840-999e4666).\n"
+    def test_the_managed_briefing_is_carried_and_the_runtime_owns_its_identity(self, tmp_path):
+        """Seeded byte-for-byte, source id and all. Correct: the worker rewrites
+        the managed block for the NEW agent at start and keeps user text outside
+        the markers, so this is how briefing notes travel. Excluding it (an
+        earlier version) threw away user-authored text."""
+        managed = "<!-- puffo:managed-profile -->\nYou are OptionExpert (agent optionexpe-9840-999e4666).\n<!-- /puffo:managed-profile -->\n\nMy own standing note.\n"
         src = _agent(tmp_path / "fleet", "optionexpe-9840-999e4666", profile="# Soul\nx\n",
                      notes=[("briefing/profile.md", managed), ("notes/lesson.md", "keep me")])
         files, out = collect_memory(src)
-        assert set(files) == {"notes/lesson.md"}
-        assert b"optionexpe-9840" not in b"".join(files.values())
-        assert out["memory_files"] == 1
+        assert set(files) == {"briefing/profile.md", "notes/lesson.md"}
+        assert b"My own standing note." in files["briefing/profile.md"]
+        assert out["memory_files"] == 2
 
     def test_a_hand_written_briefing_is_still_seeded(self, tmp_path):
         """Only the managed file is excluded; a user's own briefing note is content."""
