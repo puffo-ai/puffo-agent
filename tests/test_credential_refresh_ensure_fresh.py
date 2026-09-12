@@ -68,13 +68,14 @@ async def test_ensure_fresh_drives_refresh_when_near_expiry(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ensure_fresh_returns_false_when_refresh_fails_and_token_is_expired(tmp_path):
-    # Token already expired (-10s) — refresh attempt fails → return False.
+@pytest.mark.parametrize("outcome", [RefreshOutcome.FAILED, RefreshOutcome.UNCHANGED])
+async def test_ensure_fresh_does_not_accept_an_expired_unchanged_token(tmp_path, outcome):
+    # No rotation cannot extend an expired token, even after a successful probe.
     _write_creds(tmp_path, expires_in_seconds=-10)
     r = CredentialRefresher(host_home=tmp_path)
 
     async def _fake_refresh() -> RefreshOutcome:
-        return RefreshOutcome.FAILED
+        return outcome
 
     r.backend.refresh = _fake_refresh  # type: ignore[assignment]
     assert await r.ensure_fresh() is False

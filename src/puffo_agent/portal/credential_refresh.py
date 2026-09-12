@@ -1286,6 +1286,11 @@ class CredentialRefresher:
         self._propagate_outcome(outcome)
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
+        if outcome is RefreshOutcome.UNCHANGED:
+            # No rotation is not a failed refresh, but it does not prove
+            # recovery either. Preserve real failures and existing health;
+            # ensure_fresh still checks expiry before allowing delivery.
+            return
         if outcome is RefreshOutcome.REFRESHED:
             if self._consecutive_non_success > 0:
                 logger.info(
