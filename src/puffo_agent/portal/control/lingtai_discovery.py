@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from ..state import AgentConfig, discover_agents, home_dir
@@ -94,6 +95,42 @@ def _executable_paths(known: list[Path]) -> list[str]:
     return result
 
 
+def _search_executable_folder(value: object) -> dict:
+    root = _absolute(value, "executable_root")
+    if not root.is_dir():
+        raise ValueError("LingTai executable search location must be a directory")
+    result = {"ok": True, "executables": [], "executable": None, "agents": [],
+              "roots": [], "warnings": [], "searched_executable_root": str(root)}
+    deadline = time.monotonic() + 3
+    pending = [(root, 0)]
+    visited = 0
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > 10000 or time.monotonic() >= deadline:
+                        result["warnings"].append("results_truncated")
+                        return _bounded_result(result)
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in {".git", "node_modules", "__pycache__"}:
+                            continue
+                        if depth < 8:
+                            pending.append((Path(entry.path), depth + 1))
+                        else:
+                            result["warnings"].append("results_truncated")
+                    elif entry.name in {"lingtai-agent", "lingtai-agent.exe"}:
+                        if entry.is_file() and os.access(entry.path, os.X_OK):
+                            result["executables"].append(entry.path)
+                            if len(result["executables"]) >= 8:
+                                result["warnings"].append("results_truncated")
+                                return _bounded_result(result)
+        except OSError:
+            result["warnings"].append("search_unreadable")
+    return _bounded_result(result)
+
+
 async def _query(executable: str, root: Path, registry: Path) -> list[dict]:
     process = await asyncio.create_subprocess_exec(
         executable, "puffo-v0", "discover", "--root", str(root),
@@ -161,6 +198,8 @@ async def discover_lingtai(params: dict, *, operator: str | None) -> dict:
 
 
 async def _discover(params: dict, operator: str) -> dict:
+    if "executable_root" in params:
+        return await asyncio.to_thread(_search_executable_folder, params["executable_root"])
     known, default_roots, warnings = await asyncio.to_thread(_known_paths, operator)
     executables = await asyncio.to_thread(_executable_paths, known)
     if params.get("executable"):

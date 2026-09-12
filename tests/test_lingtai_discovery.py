@@ -227,3 +227,27 @@ def test_corrupt_marker_prevents_only_absent_primary_fallback(tmp_path, primary_
     assert row["agent_name"] == ("Recovered" if primary_present else None)
     assert row["profile_read_error"] == (None if primary_present else "source_unreadable")
     assert row["import_display_name"] == ("Recovered" if primary_present else None)
+
+
+@pytest.mark.asyncio
+async def test_executable_folder_search_is_scoped_and_does_not_run_candidates(tmp_path, monkeypatch):
+    """The executable field must search its folder, never run discoveries or follow directory links."""
+    root = tmp_path / "selected"
+    binary = root / ".venv" / "bin" / "lingtai-agent"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "lingtai-agent").write_text("#!/bin/sh\nexit 99\n")
+    (outside / "lingtai-agent").chmod(0o700)
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: ["/unrelated/lingtai-agent"])
+    async def forbidden(*args):
+        pytest.fail("binary search ran the candidate")
+    monkeypatch.setattr(discovery, "_query", forbidden)
+    result = await discovery.discover_lingtai({"executable_root": str(root)}, operator="owner")
+    assert result["ok"] and result["executables"] == [str(binary)]
+    assert result["searched_executable_root"] == str(root)
+    assert result["agents"] == []
