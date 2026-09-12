@@ -151,9 +151,19 @@ def collect_memory(agent_dir: Path) -> tuple[dict[str, bytes], dict]:
     files: dict[str, bytes] = {}
     mem = agent_dir / "memory"
     if mem.is_dir():
+        root = mem.resolve()
         for f in sorted(mem.rglob("*")):
-            if not f.is_file():
+            # Symlinks are refused, not followed. `is_file()` is true for a link
+            # to a file, and `read_bytes()` would read the TARGET — so a link
+            # under memory/ pointing at ~/.ssh/id_ed25519 would upload the key
+            # as a "note". The resolve check also catches a symlinked parent
+            # directory, which rglob may have descended into.
+            if f.is_symlink() or not f.is_file():
                 continue
+            try:
+                f.resolve().relative_to(root)
+            except ValueError:
+                continue  # resolves outside the memory tree
             rel = f.relative_to(mem)
             if any(part in _NOT_CONTENT for part in rel.parts) or f.name.startswith("._"):
                 continue
@@ -217,7 +227,17 @@ def upload(cloud_slug: str, files: dict[str, bytes]) -> int:
         return 0
     body = {"files": {k: base64.b64encode(v).decode() for k, v in files.items()}}
     ack = _control(f"/agents/{cloud_slug}/memory", body)
-    return int(ack.get("files", 0))
+    stored = int(ack.get("files", 0))
+    if stored != len(files):
+        # The server reports what it actually wrote. Reporting that number as
+        # success while it differs from what was sent turns a partial upload
+        # into a green run — the agent boots with a subset of its brain and
+        # nothing says so.
+        raise SeedError(
+            f"server stored {stored} of {len(files)} memory files — upload incomplete, "
+            "nothing to rely on; re-run after checking the server log"
+        )
+    return stored
 
 
 def _report(results: list[dict]) -> None:

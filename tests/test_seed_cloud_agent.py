@@ -174,6 +174,30 @@ class TestCollectingMemory:
         assert out["warnings"] == ["profile has no soul-like heading"]
 
 
+    def test_a_symlink_out_of_the_tree_is_not_followed(self, tmp_path):
+        """`is_file()` is true for a link to a file and `read_bytes()` reads the
+        TARGET — a link under memory/ at ~/.ssh/id_ed25519 would upload the key
+        as a note. Refused, not followed."""
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("real.md", "fine")])
+        secret = tmp_path / "outside" / "id_ed25519"
+        secret.parent.mkdir(); secret.write_text("PRIVATE KEY")
+        (src / "memory" / "leak.md").symlink_to(secret)
+        files, out = collect_memory(src)
+        assert set(files) == {"real.md"}
+        assert b"PRIVATE KEY" not in b"".join(files.values())
+        assert out["memory_files"] == 1
+
+    def test_a_symlinked_directory_is_not_descended(self, tmp_path):
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("real.md", "fine")])
+        outside = tmp_path / "outside"; outside.mkdir()
+        (outside / "creds.md").write_text("SECRET")
+        (src / "memory" / "linked").symlink_to(outside, target_is_directory=True)
+        files, _ = collect_memory(src)
+        assert b"SECRET" not in b"".join(files.values())
+
+
 class TestUpload:
     """Upload goes through the control API, never to S3 directly — handing an
     agent's owner S3 access would hand them a key to the bucket every other
@@ -205,6 +229,17 @@ class TestUpload:
         )
         upload("a1", {"odd.bin": raw})
         assert base64.b64decode(captured["files"]["odd.bin"]) == raw
+
+    def test_a_short_ack_is_an_error_not_a_success(self, monkeypatch):
+        """The server reports what it actually wrote; the client used to report
+        that number as success without comparing it to what it sent."""
+        monkeypatch.setattr(seed_cloud_agent, "_control", lambda p, b: {"files": 2})
+        with pytest.raises(SeedError, match="stored 2 of 3"):
+            upload("a1", {"a.md": b"1", "b.md": b"2", "c.md": b"3"})
+
+    def test_a_full_ack_returns_the_count(self, monkeypatch):
+        monkeypatch.setattr(seed_cloud_agent, "_control", lambda p, b: {"files": 3})
+        assert upload("a1", {"a.md": b"1", "b.md": b"2", "c.md": b"3"}) == 3
 
     def test_nothing_to_upload_makes_no_call(self, monkeypatch):
         monkeypatch.setattr(
