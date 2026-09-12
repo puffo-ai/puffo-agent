@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .._proc import no_window_kwargs
 
+from .cli_bin import normalize_launch_argv
 from .harness.support.child_env import build_child_environment
 
 
@@ -56,7 +57,7 @@ def check_pi_auth(
     if not provider and not model:
         raise PiAuthProbeError("Pi auth check requires a provider or model")
 
-    command = [executable, "auth", "check"]
+    command = [*normalize_launch_argv(executable), "auth", "check"]
     if provider:
         command.extend(("--provider", provider))
     if model:
@@ -143,7 +144,7 @@ def list_pi_models(
     )
     try:
         completed = subprocess.run(
-            [executable, "--list-models"],
+            [*normalize_launch_argv(executable), "--list-models"],
             check=False,
             capture_output=True,
             text=True,

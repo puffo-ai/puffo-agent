@@ -18,6 +18,7 @@ from typing import Literal
 
 from .._proc import no_window_kwargs
 
+from .cli_bin import normalize_launch_argv
 from .harness.support.child_env import build_child_environment
 
 
@@ -48,7 +49,7 @@ def _run_opencode_models(
     verbose: bool,
     timeout_seconds: float,
 ) -> str:
-    command = [executable, "models"]
+    command = [*normalize_launch_argv(executable), "models"]
     if provider:
         command.append(provider)
     if verbose:
