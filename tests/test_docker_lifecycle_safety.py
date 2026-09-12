@@ -59,3 +59,27 @@ def test_docker_child_is_killed_and_reaped(cancel):
         assert proc.reaped is True
 
     asyncio.run(scenario())
+
+
+def test_puffo_agent_pkg_dir_is_the_package_not_site_packages():
+    """Mount the package itself, never its parent.
+
+    Under a non-editable install the parent IS site-packages; mounting it puts
+    the host's platform-specific builds (pydantic_core, cryptography, PIL) ahead
+    of the image's own on PYTHONPATH. On a macOS/Windows host those are the
+    wrong ABI, the in-container MCP server dies at import, and every agent
+    silently loses send_message while still reporting healthy.
+    """
+    from pathlib import Path
+
+    import puffo_agent
+    from puffo_agent.agent.harness.runtime.docker_support import (
+        puffo_agent_pkg_dir,
+    )
+
+    pkg_dir = puffo_agent_pkg_dir()
+    assert pkg_dir.name == "puffo_agent"
+    assert (pkg_dir / "__init__.py").is_file()
+    assert pkg_dir == Path(puffo_agent.__file__).resolve().parent
+    # site-packages would contain sibling distributions; the package must not.
+    assert not (pkg_dir / "pydantic_core").exists()
