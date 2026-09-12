@@ -11,6 +11,7 @@ slug shapes are in use.
 
 from __future__ import annotations
 
+import base64
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ from seed_cloud_agent import (  # noqa: E402
     resolve_one,
     agent_name,
     soul_body,
-    stage,
+    collect_memory,
+    upload,
 )
 
 
@@ -111,41 +113,49 @@ def test_agent_name_handles_both_slug_shapes(slug, expected):
     assert agent_name(slug) == expected
 
 
-class TestStaging:
-    def test_copies_profile_and_memory(self, tmp_path):
+class TestCollectingMemory:
+    """What goes up is memory and only memory. `profile.md` is read for the
+    report but never uploaded: the agent store owns the persona and restores its
+    copy on resume, so a profile written anywhere else is reverted on first idle."""
+
+    def test_memory_is_collected_with_relative_paths(self, tmp_path):
         src = _agent(
             tmp_path / "fleet",
             "desk-6332-b73d5e96",
             profile="# Desk\n\n# Soul\n\nfront of house\n",
             notes=[("notes/a.md", "one"), ("briefing/b.md", "two")],
         )
-        out = stage(src, tmp_path / "repo" / "desk")
+        files, out = collect_memory(src)
+        assert set(files) == {"notes/a.md", "briefing/b.md"}
+        assert files["notes/a.md"] == b"one"
         assert out["memory_files"] == 2
         assert out["soul_chars"] == len("front of house")
-        assert (tmp_path / "repo" / "desk" / "memory" / "notes" / "a.md").read_text() == "one"
 
-    def test_agent_with_no_memory_still_imports(self, tmp_path):
-        """30 of the surveyed fleet have no memory dir — that is not a failure."""
+    def test_the_profile_is_reported_but_not_collected(self, tmp_path):
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n")
+        files, out = collect_memory(src)
+        assert out["profile_bytes"] > 0
+        assert not any("profile" in k for k in files)
+
+    def test_agent_with_no_memory_is_not_a_failure(self, tmp_path):
+        """30 of the surveyed fleet have no memory dir."""
         src = _agent(tmp_path / "fleet", "grist-1-aaaaaaaa", profile="# Soul\nx\n")
-        out = stage(src, tmp_path / "repo" / "grist")
-        assert out["memory_files"] == 0
-        assert (tmp_path / "repo" / "grist" / "memory").is_dir()
+        files, out = collect_memory(src)
+        assert files == {} and out["memory_files"] == 0
 
     def test_identity_and_bulk_are_left_behind(self, tmp_path):
         """Carrying keys/ would make this a migration; workspace/ is 100MB of
-        reproducible checkout."""
+        reproducible checkout. Only the memory tree is ever read."""
         src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n")
         (src / "keys").mkdir()
         (src / "keys" / "k.json").write_text("SECRET")
         (src / "workspace").mkdir()
         (src / "workspace" / "big.bin").write_text("x" * 1000)
         (src / "messages.db").write_text("db")
-        dest = tmp_path / "repo" / "desk"
-        stage(src, dest)
-        assert not (dest / "keys").exists()
-        assert not (dest / "workspace").exists()
-        assert not (dest / "messages.db").exists()
-        assert {p.name for p in dest.iterdir()} == {"profile.md", "memory"}
+        files, _ = collect_memory(src)
+        blob = b"".join(files.values())
+        assert b"SECRET" not in blob
+        assert not any(k.startswith(("keys", "workspace")) or "messages.db" in k for k in files)
 
     def test_agent_local_git_dir_is_not_carried(self, tmp_path):
         """~/memory is itself a git repo; its .git is scaffolding, not content."""
@@ -155,14 +165,60 @@ class TestStaging:
             profile="# Soul\nx\n",
             notes=[("notes/a.md", "one"), (".git/config", "[core]")],
         )
-        out = stage(src, tmp_path / "repo" / "desk")
-        assert out["memory_files"] == 1
-        assert not (tmp_path / "repo" / "desk" / "memory" / ".git").exists()
+        files, out = collect_memory(src)
+        assert set(files) == {"notes/a.md"} and out["memory_files"] == 1
 
     def test_missing_soul_is_warned_not_fatal(self, tmp_path):
         src = _agent(tmp_path / "fleet", "x-1-aaaaaaaa", profile="# Agent\nprose\n")
-        out = stage(src, tmp_path / "repo" / "x")
+        _, out = collect_memory(src)
         assert out["warnings"] == ["profile has no soul-like heading"]
+
+
+class TestUpload:
+    """Upload goes through the control API, never to S3 directly — handing an
+    agent's owner S3 access would hand them a key to the bucket every other
+    agent's config lives in."""
+
+    def test_it_puts_base64_to_the_agents_memory_route(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_control(path, payload):
+            seen["path"] = path
+            seen["payload"] = payload
+            return {"files": len(payload["files"]), "delivered": False}
+
+        monkeypatch.setattr(seed_cloud_agent, "_control", fake_control)
+        n = upload("desk-cloud-2779", {"notes/a.md": b"one"})
+        assert n == 1
+        assert seen["path"] == "/agents/desk-cloud-2779/memory"
+        assert base64.b64decode(seen["payload"]["files"]["notes/a.md"]) == b"one"
+
+    def test_non_utf8_notes_survive_the_round_trip(self, tmp_path, monkeypatch):
+        """Base64 is why: JSON cannot carry raw bytes, and a note is not
+        guaranteed to be text."""
+        raw = b"\xff\xfe\x00binary"
+        captured = {}
+        monkeypatch.setattr(
+            seed_cloud_agent,
+            "_control",
+            lambda p, payload: captured.update(payload) or {"files": 1},
+        )
+        upload("a1", {"odd.bin": raw})
+        assert base64.b64decode(captured["files"]["odd.bin"]) == raw
+
+    def test_nothing_to_upload_makes_no_call(self, monkeypatch):
+        monkeypatch.setattr(
+            seed_cloud_agent,
+            "_control",
+            lambda p, b: pytest.fail("should not call the API with no files"),
+        )
+        assert upload("a1", {}) == 0
+
+    def test_missing_credentials_is_a_clear_error(self, monkeypatch):
+        monkeypatch.delenv("AIM_CONTROL_URL", raising=False)
+        monkeypatch.delenv("AIM_CONTROL_TOKEN", raising=False)
+        with pytest.raises(SeedError, match="AIM_CONTROL_URL"):
+            seed_cloud_agent._control("/agents/a1/memory", {"files": {}})
 
 
 class TestTheProbeExtractsTheRelayHost:

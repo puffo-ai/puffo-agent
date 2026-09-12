@@ -1,39 +1,41 @@
 #!/usr/bin/env python3
-"""Seed a cloud agent from a local one — persona and memory, nothing else.
+"""Seed a cloud agent's memory from a local one.
 
-**This is not a migration.** It moves no identity: nothing is exported,
-rotated, or revoked, and the local agent is only ever read. The tool that does
-migrate is ``puffo_agent.portal.import_agents``, and it is a different, harder
-operation guarded by a different decision.
+**This is not a migration.** It moves no identity: nothing is exported, rotated,
+or revoked, and the local agent is only ever read. The tool that does migrate is
+``puffo_agent.portal.import_agents``, and it is a different, harder operation
+guarded by a different decision.
 
-What this does is publish a local agent's `profile.md` and `memory/` into the
-fleet memory repo, under the name a human uses::
+Memory is uploaded into the **agent store** (S3), on a prefix of its own::
 
-    <repo>/<name>/profile.md
-    <repo>/<name>/memory/…
+    agents/<cloud-slug>/memory/…
 
-A cloud agent whose config carries ``memory_remote`` clones the **memory** on
-its first boot (see ``agent/memory_seed.py``). `profile.md` is published here
-too, but the agent does **not** pick it up from the remote: the agent store owns
-the profile and restores its copy on resume. Set a profile where the store keeps
-it — the create dialog's PROFILE field (it takes an uploaded ``.md``), or
-``PUT /agents/{slug}``. The copy in the remote is the record of what a local
-agent's persona was, and what to paste when creating its cloud counterpart.
+via ``PUT /agents/{slug}/memory`` on the AIM control API — not to S3 directly.
+Handing an agent's owner S3 access would be handing them a key to the bucket
+every other agent's config lives in.
 
 The usual flow is:
 
     1. create the cloud agent in the Hub, choosing its billing mode
-    2. ./tools/seed_cloud_agent.py --from desk --repo <fleet> --push
-    3. ./tools/seed_cloud_agent.py --verify <cloud-slug>
+    2. ./tools/seed_cloud_agent.py --from desk --dry-run
+    3. ./tools/seed_cloud_agent.py --from desk --to <cloud-slug>
+    4. ./tools/seed_cloud_agent.py --verify <cloud-slug>
 
-``--verify`` answers "is this agent actually able to serve?" with ten checks,
-each of which failed at least once during the subscription build-out. It needs
-the E2B SDK and ``E2B_API_KEY`` — install with ``pip install 'puffo-agent[cloud]'``
-or run it from an environment that already has them. Everything else here is
-stdlib and works anywhere.
+**Memory only.** ``profile.md`` is read for the report but never uploaded: the
+agent store owns the persona and ``_deliver_pending_config`` restores its copy
+on resume, so a profile written anywhere else is reverted the first time the
+agent idles. Set one where the store keeps it — the create dialog's PROFILE
+field, or ``PUT /agents/{slug}``.
 
-**Seed before the first message.** An unseeded agent answers from an empty
-brain, which reads like a memory bug rather than a missing step.
+**Stored, not delivered.** The upload lands in S3. A *running* agent keeps the
+memory it already has; the store is read only when an agent boots into a FRESH
+sandbox, and only when its memory tree is empty. Seed before the first message —
+an unseeded agent answers from an empty brain, which reads like a memory bug
+rather than a missing step. Re-uploading does not update a live agent.
+
+**Nothing writes memory back.** What an agent learns lives on the sandbox disk
+only; it is never returned to the store. A sandbox that is recreated comes back
+with what was uploaded and nothing since.
 
 Deliberately not carried: ``keys/`` (identity — carrying it would make this a
 migration), ``agent.yml`` (identity plus a gateway credential), ``workspace/``
@@ -42,9 +44,13 @@ migration), ``agent.yml`` (identity plus a gateway credential), ``workspace/``
 
 There is no ``--token``. The subscription credential is a property of the
 deployment, not of an agent: it reaches a sandbox as an environment variable set
-once by the provisioner. A per-agent flag would imply per-agent tokens — more
-copies of a credential, more places to revoke — and would have this CLI write a
-secret into a sandbox, which is worse than leaving it where it is.
+once by the provisioner.
+
+**Operator-only for now.** Uploading needs ``AIM_CONTROL_URL`` +
+``AIM_CONTROL_TOKEN``, and ``--verify`` needs ``E2B_API_KEY`` — both PLATFORM
+credentials. An agent's own owner cannot hold either. A user-facing upload has
+to go through puffo-server, which the user is already authenticated to; that
+route does not exist yet.
 
 Stdlib only.
 """
@@ -52,11 +58,13 @@ Stdlib only.
 from __future__ import annotations
 
 import argparse
+import base64
+import json
+import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 DEFAULT_FLEET = Path.home() / ".puffo-agent" / "agents"
@@ -131,34 +139,85 @@ def resolve_one(target: str, fleet: Path) -> Path:
     return matches[0]
 
 
-def stage(agent_dir: Path, dest: Path) -> dict:
-    """Copy the portable parts into ``dest``; return a summary."""
-    dest.mkdir(parents=True, exist_ok=True)
-    profile = (agent_dir / "profile.md").read_text(encoding="utf-8")
-    (dest / "profile.md").write_text(profile, encoding="utf-8")
+def collect_memory(agent_dir: Path) -> tuple[dict[str, bytes], dict]:
+    """The memory to upload, as ``{relative path: bytes}``, plus a summary.
 
-    mem_src, mem_dst = agent_dir / "memory", dest / "memory"
-    if mem_dst.exists():
-        shutil.rmtree(mem_dst)
-    notes = 0
-    if mem_src.is_dir():
-        shutil.copytree(
-            mem_src, mem_dst, ignore=shutil.ignore_patterns(*_NOT_CONTENT, "._*")
-        )
-        notes = sum(1 for f in mem_dst.rglob("*") if f.is_file())
-    else:
-        mem_dst.mkdir()
-        (mem_dst / ".gitkeep").touch()
+    Memory only. ``profile.md`` is read for the report but **not** uploaded: the
+    agent store owns the persona and restores its copy on resume, so a profile
+    has to be set where the store keeps it (the create dialog's PROFILE field or
+    ``PUT /agents/{slug}``). Writing it here would be reverted on the first idle.
+    """
+    profile = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    files: dict[str, bytes] = {}
+    mem = agent_dir / "memory"
+    if mem.is_dir():
+        for f in sorted(mem.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(mem)
+            if any(part in _NOT_CONTENT for part in rel.parts) or f.name.startswith("._"):
+                continue
+            files[rel.as_posix()] = f.read_bytes()
 
     body = soul_body(profile)
-    return {
-        "name": dest.name,
+    return files, {
+        "name": agent_name(agent_dir.name),
         "slug": agent_dir.name,
         "profile_bytes": len(profile.encode()),
         "soul_chars": len(body),
-        "memory_files": notes,
+        "memory_files": len(files),
         "warnings": [] if body else ["profile has no soul-like heading"],
     }
+
+
+def _control(path: str, payload: dict) -> dict:
+    """One authenticated call to the AIM control API. Stdlib only.
+
+    Needs ``AIM_CONTROL_URL`` + ``AIM_CONTROL_TOKEN``. That token is a PLATFORM
+    credential, not a per-user one, which is why this step is operator-only
+    today — the same limit ``--verify`` has with ``E2B_API_KEY``. A user-facing
+    upload has to go through puffo-server, which the user is already
+    authenticated to; that route does not exist yet.
+    """
+    base = os.environ.get("AIM_CONTROL_URL", "").strip().rstrip("/")
+    token = os.environ.get("AIM_CONTROL_TOKEN", "").strip()
+    if not base or not token:
+        raise SeedError(
+            "uploading needs AIM_CONTROL_URL and AIM_CONTROL_TOKEN in the environment"
+        )
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-Operator": os.environ.get("USER", "seed-cli"),
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = (exc.read() or b"").decode("utf-8", "replace")[:300]
+        raise SeedError(f"control API said {exc.code}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise SeedError(f"could not reach {base}: {exc.reason}") from None
+
+
+def upload(cloud_slug: str, files: dict[str, bytes]) -> int:
+    """PUT the memory into the agent store. Returns the count the server wrote.
+
+    Base64 because notes are not guaranteed UTF-8 and JSON cannot carry raw
+    bytes. The server stores it; it does **not** deliver it to a running agent —
+    memory is seeded into a sandbox only on a fresh boot.
+    """
+    if not files:
+        print("  nothing to upload (no memory files)")
+        return 0
+    body = {"files": {k: base64.b64encode(v).decode() for k, v in files.items()}}
+    ack = _control(f"/agents/{cloud_slug}/memory", body)
+    return int(ack.get("files", 0))
 
 
 def _report(results: list[dict]) -> None:
@@ -326,9 +385,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--from", dest="source", help="local agent slug prefix or path")
     ap.add_argument("--all", action="store_true", help="seed every agent found")
     ap.add_argument("--fleet", type=Path, default=DEFAULT_FLEET)
-    ap.add_argument("--repo", help="fleet memory repo (git URL or path)")
+    ap.add_argument("--to", metavar="CLOUD_SLUG", help="cloud agent to upload the memory to")
     ap.add_argument("--dry-run", action="store_true", help="report, write nothing")
-    ap.add_argument("--push", action="store_true", help="commit and push the result")
     ap.add_argument("--verify", metavar="CLOUD_SLUG", help="check a live cloud agent is ready to serve")
     ap.add_argument("--expect-template", default="", help="--verify: template id the agent should have booted")
     ap.add_argument("--expect-auth-mode", default="", help="--verify: api-gateway | subscription")
@@ -347,8 +405,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.all and not args.source:
         ap.error("give --from <agent>, --all, or --verify <cloud-slug>")
-    if not args.dry_run and not args.repo:
-        ap.error("--repo is required unless --dry-run")
+    if not args.dry_run and not args.to:
+        ap.error("--to <cloud-slug> is required unless --dry-run")
+    if args.all and args.to:
+        # One upload targets one cloud agent. `--all --to X` would pile every
+        # local agent's notes into X's memory, which reads as a bulk migration
+        # and is actually a merge.
+        ap.error("--all cannot be combined with --to; upload one agent at a time")
 
     try:
         agents = (
@@ -359,47 +422,32 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.dry_run:
-        print(f"would seed {len(agents)} agent(s) from {args.fleet}:")
+        print(f"would upload memory for {len(agents)} agent(s) from {args.fleet}:")
         for d in agents:
-            mem = d / "memory"
-            n = (
-                sum(
-                    1
-                    for f in mem.rglob("*")
-                    if f.is_file() and ".git" not in f.parts
-                )
-                if mem.is_dir()
-                else 0
-            )
-            print(f"  {agent_name(d.name):<16} {d.name:<30} memory={n} files")
+            _, summary = collect_memory(d)
+            _report([summary])
+        print("\nprofile.md is NOT uploaded — the agent store owns it.")
+        print("Set it in the create dialog's PROFILE field, or PUT /agents/{slug}.")
         return 0
 
-    work = Path(tempfile.mkdtemp(prefix="puffo-fleet-memory-"))
+    agent_dir = agents[0]
     try:
-        subprocess.run(
-            ["git", "clone", "-q", args.repo, str(work)], check=True, timeout=120
-        )
-        results = [stage(d, work / agent_name(d.name)) for d in agents]
-        _report(results)
-
-        if args.push:
-            names = ", ".join(r["name"] for r in results)
-            subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
-            subprocess.run(
-                ["git", "-C", str(work), "commit", "-q", "-m", f"seed: {names}"],
-                check=False,  # nothing to commit is success, not failure
-            )
-            subprocess.run(["git", "-C", str(work), "push", "-q"], check=True)
-            print(f"\npushed {len(results)} agent(s)")
-        else:
-            print(f"\nstaged in {work} (add --push to publish)")
-            return 0
-    except subprocess.CalledProcessError as exc:
-        print(f"error: git failed: {exc}", file=sys.stderr)
+        files, summary = collect_memory(agent_dir)
+        _report([summary])
+        n = upload(args.to, files)
+    except SeedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
-    finally:
-        if args.push:
-            shutil.rmtree(work, ignore_errors=True)
+
+    print(f"\nuploaded {n} memory file(s) to {args.to}")
+    print("Stored, not delivered: a running agent keeps the memory it has.")
+    print("Memory is seeded into a sandbox only on a FRESH boot.")
+    if summary["profile_bytes"]:
+        print(
+            f"\nprofile.md ({summary['profile_bytes']}B) was NOT uploaded — the agent "
+            "store owns it.\nPaste it into the create dialog's PROFILE field, or "
+            "PUT /agents/{slug}."
+        )
     return 0
 
 
