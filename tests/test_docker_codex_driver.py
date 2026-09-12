@@ -115,7 +115,7 @@ def _wire_driver_runtime(tmp_path, preparer):
 
 def _seed_local_to_docker_layout(preparer):
     preparer.agent_home.mkdir(parents=True)
-    (preparer.agent_home / ".docker-layout").write_text("22\n", encoding="utf-8")
+    (preparer.agent_home / ".docker-layout").write_text("23:codex\n", encoding="utf-8")
     assert (
         ensure_workspace_shared_link(preparer.workspace_dir, preparer.shared_fs_dir)
         == "created"

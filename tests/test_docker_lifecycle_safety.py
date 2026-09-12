@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import shutil
+import subprocess
+import sys
+from contextlib import ExitStack
 
 import pytest
 
@@ -83,3 +88,50 @@ def test_puffo_agent_pkg_dir_is_the_package_not_site_packages():
     assert pkg_dir == Path(puffo_agent.__file__).resolve().parent
     # site-packages would contain sibling distributions; the package must not.
     assert not (pkg_dir / "pydantic_core").exists()
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="local POSIX shell required for Docker probe replay")
+@pytest.mark.parametrize("broken_import", [False, True])
+@pytest.mark.asyncio
+async def test_container_probe_checks_importability(tmp_path, monkeypatch, broken_import):
+    """An existing MCP file whose dependencies cannot import must not pass
+    startup validation. Replay the real probe locally without running Docker."""
+    from tests.test_docker_codex_driver import _docker_patches, _preparer
+
+    package = tmp_path / "puffo_agent"
+    mcp = package / "mcp"
+    mcp.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (mcp / "__init__.py").write_text("")
+    (mcp / "puffo_core_server.py").write_text(
+        "raise ImportError('simulated incompatible native dependency')" if broken_import else ""
+    )
+
+    async def local_docker_exec(command, **kwargs):
+        assert command[0] == "/fake/docker"
+        if command[1] != "exec":
+            assert command[1] in {"stop", "rm", "run"}
+            return 0, b"", b""
+        shell_command = command[-1]
+        if shell_command.startswith("command -v "):
+            return 0, b"", b""  # Harness availability is a separate boundary.
+        shell_command = shell_command.replace("/opt/puffoagent-pkg", shlex.quote(str(tmp_path)))
+        shell_command = shell_command.replace("python3 -c", f"{shlex.quote(sys.executable)} -c")
+        result = subprocess.run(
+            [shutil.which("sh"), "-c", shell_command], cwd=tmp_path,
+            capture_output=True, timeout=5, check=False,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    preparer = _preparer(tmp_path, monkeypatch)
+    preparer._docker_bin = "/fake/docker"
+    preparer._write_layout_marker()
+    with ExitStack() as stack:
+        for boundary in _docker_patches(local_docker_exec):
+            stack.enter_context(boundary)
+        assert await preparer._probe_container() == (not broken_import, True)
+        if broken_import:
+            with pytest.raises(RuntimeError, match="does not provide the Puffo MCP"):
+                await preparer.ensure_container()
+        else:
+            await preparer.ensure_container()
