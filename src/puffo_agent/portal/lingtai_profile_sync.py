@@ -58,7 +58,9 @@ class LingtaiProfileSync:
             return
         # A lost current manifest can expose an unnamed bootstrap manifest;
         # that is not evidence of an intentional name clear after import.
-        if source.agent_name is None and (source.name_source_file != ".agent.json" or not source.name_is_explicit_null):
+        if source.name_source_file != ".agent.json":
+            return
+        if source.agent_name is None and not source.name_is_explicit_null:
             return
         snapshot = (cfg.puffo_core.server_url, cfg.puffo_core.slug,
                     tuple(cfg.runtime.harness_command), str(directory), source.agent_name)

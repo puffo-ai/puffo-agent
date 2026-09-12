@@ -622,6 +622,9 @@ async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields
     (source / "init.json").write_text('{"manifest":{"agent_name":null}}')
     await monitor.sync_one(cfg)
     assert len(posted) == 2  # Missing current manifest must not clear a self-chosen name.
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Stale bootstrap"}}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # Nor can a stale bootstrap name roll back the current one.
     manifest.write_text('{}')
     await monitor.sync_one(cfg)
     assert len(posted) == 2  # A missing field is not an explicit clear either.
