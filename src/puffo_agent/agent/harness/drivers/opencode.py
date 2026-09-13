@@ -220,6 +220,7 @@ class OpenCodeDriver(Driver):
         self._session_announced = False
         self._proc: Any = None
         self._temporary_children: dict[str, Any] = {}
+        self._child_spawns: dict[str, asyncio.Future[Any]] = {}
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._turn_generation = 0
@@ -342,12 +343,13 @@ class OpenCodeDriver(Driver):
                 # One call with the declared signature. Retrying on TypeError
                 # could create a second child when the factory itself failed.
                 proc = self.process_factory(command, spec)
-                proc = await proc if asyncio.iscoroutine(proc) else proc
+                proc = (await self._await_child_spawn(scratch, proc)
+                        if asyncio.iscoroutine(proc) else proc)
                 self._temporary_children[scratch] = proc
                 return proc
             executable, *arguments = command
             env = dict(spec.environment)
-            proc = await asyncio.create_subprocess_exec(
+            proc = await self._await_child_spawn(scratch, asyncio.create_subprocess_exec(
                 *normalize_launch_argv(executable),
                 *arguments,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -357,7 +359,7 @@ class OpenCodeDriver(Driver):
                 env=env,
                 limit=16 * 1024 * 1024,
                 **process_group_spawn_kwargs(),
-            )
+            ))
             self._temporary_children[scratch] = proc
             return proc
         finally:
@@ -409,7 +411,7 @@ class OpenCodeDriver(Driver):
         scratch = self._new_child_temp("oc-models-")
         try:
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await self._await_child_spawn(scratch, asyncio.create_subprocess_exec(
                     *normalize_launch_argv(spec.executable),
                     "models",
                     provider,
@@ -427,7 +429,7 @@ class OpenCodeDriver(Driver):
                     stderr=asyncio.subprocess.PIPE,
                     limit=16 * 1024 * 1024,
                     **process_group_spawn_kwargs(),
-                )
+                ))
                 self._temporary_children[scratch] = proc
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             except (OSError, asyncio.TimeoutError):
@@ -562,7 +564,8 @@ class OpenCodeDriver(Driver):
         import aiohttp
 
         password = uuid.uuid4().hex
-        proc = await asyncio.create_subprocess_exec(
+        scratch = spec.environment["TMPDIR"]
+        proc = await self._await_child_spawn(scratch, asyncio.create_subprocess_exec(
             *normalize_launch_argv(spec.executable),
             "serve",
             "--hostname",
@@ -576,7 +579,7 @@ class OpenCodeDriver(Driver):
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
             **process_group_spawn_kwargs(),
-        )
+        ))
         self._temporary_children[spec.environment["TMPDIR"]] = proc
         self._serve_proc = proc
         try:
@@ -679,6 +682,12 @@ class OpenCodeDriver(Driver):
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             self._compact_task = None
+        # Waiting on a shield keeps repeated close cancellation from reaching
+        # subprocess transport initialization. A later close can retry.
+        for task in tuple(self._child_spawns.values()):
+            await collect_cleanup_errors(
+                asyncio.shield(task), errors, timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
         # Failed or cancelled shutdowns retain both child and directory.
         for child in tuple(self._temporary_children.values()):
             if child is not None and child.returncode is None:
@@ -934,6 +943,40 @@ class OpenCodeDriver(Driver):
                 self._accepted = None
                 self._turn_task = None
 
+    async def _await_child_spawn(self, scratch: str, pending: Any) -> Any:
+        async def register():
+            try:
+                child = await pending
+            except (FileNotFoundError, PermissionError) as exc:
+                # OS exec/chdir refusal identifies the failed path and leaves
+                # no running child. Other initialization errors can come from
+                # failed transport cleanup: keep their directory and error.
+                if exc.filename is not None:
+                    self._child_spawns.pop(scratch, None)
+                    self._cleanup_child_temps(finished_spawn=scratch)
+                raise
+            self._temporary_children[scratch] = child
+            return child
+
+        task = spawn(register(), name="opencode.spawn")
+        self._child_spawns[scratch] = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            # If the handle already arrived, stop it here. Otherwise close
+            # will await the retained task and take ownership of its result.
+            errors: list[BaseException] = [exc]
+            child = self._temporary_children.get(scratch)
+            if child is not None:
+                await collect_cleanup_errors(
+                    shutdown_process_tree(
+                        child, waiter=None, timeout=_SHUTDOWN_GRACE_SECONDS,
+                        task_name="opencode.cancelled_spawn.wait",
+                    ),
+                    errors, timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+            raise_collected_errors("OpenCode spawn cancellation cleanup failed", errors)
+
     def _new_child_temp(self, prefix: str) -> str:
         self._cleanup_child_temps()
         if self._temporary_children:
@@ -946,12 +989,13 @@ class OpenCodeDriver(Driver):
 
     def _cleanup_child_temps(self, *, finished_spawn: str = "") -> None:
         for scratch, child in tuple(self._temporary_children.items()):
-            if child is None and scratch != finished_spawn:
+            if child is None and (scratch != finished_spawn or scratch in self._child_spawns):
                 continue
             if child is not None and child.returncode is None:
                 continue
             shutil.rmtree(scratch)
             del self._temporary_children[scratch]
+            self._child_spawns.pop(scratch, None)
 
     async def _settle_turn_task(self, proc: Any) -> None:
         task = self._turn_task

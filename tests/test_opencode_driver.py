@@ -874,3 +874,83 @@ async def test_second_cancel_during_shutdown_keeps_files_for_close(monkeypatch, 
     await driver.close()
     assert proc.returncode is not None
     assert not directories[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["turn", "context", "serve"])
+@pytest.mark.parametrize("spawn_result", ["handle", "error", "cancelled"])
+async def test_pending_spawn_survives_caller_and_close_cancellation(
+    monkeypatch, tmp_path, operation, spawn_result,
+):
+    """A child may exist before transport initialization hands us its handle."""
+    import shutil
+    from pathlib import Path
+    from puffo_agent.agent.harness.drivers import opencode
+
+    proc = _TurnProcess()
+    entered, release = asyncio.Event(), asyncio.Event()
+    directories = []
+    spawn_cancelled = False
+
+    async def create(*args, **kwargs):
+        nonlocal spawn_cancelled
+        directory = Path(kwargs["env"]["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").touch()
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            spawn_cancelled = True
+            raise
+        if spawn_result == "error":
+            raise OSError("transport initialization cleanup failed")
+        if spawn_result == "cancelled":
+            raise asyncio.CancelledError("spawn internally cancelled")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(opencode, "CLEANUP_TIMEOUT_SECONDS", 0.03)
+    driver = OpenCodeDriver()
+    spec = RuntimeSpec(str(tmp_path), executable="opencode")
+    await driver.open(spec)
+    work = (driver.start_turn(TurnInput("hello")) if operation == "turn" else
+            driver._resolve_context_window(spec) if operation == "context" else
+            driver._summarize_via_serve(spec, "session"))
+    task = asyncio.create_task(work)
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (directories[0] / "native.so").exists()
+    assert proc.returncode is None
+
+    # Repeated cancellation and the close deadline must not cancel spawn.
+    closing = asyncio.create_task(driver.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert not spawn_cancelled
+    assert (directories[0] / "native.so").exists()
+    with pytest.raises(RuntimeError, match="still running"):
+        await driver._spawn(spec, "second")
+
+    release.set()
+    try:
+        if spawn_result == "handle":
+            await driver.close()
+            assert proc.returncode is not None
+            assert not directories[0].exists()
+        else:
+            # An exception without a handle is not proof no child was born.
+            with pytest.raises(BaseException):
+                await driver.close()
+            assert proc.returncode is None
+            assert (directories[0] / "native.so").exists()
+    finally:
+        proc.exit()
+        proc.eof()
+        shutil.rmtree(directories[0], ignore_errors=True)
