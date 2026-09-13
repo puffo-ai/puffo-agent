@@ -372,3 +372,22 @@ async def test_lingtai_cancel_closes_inherited_child_pipes(
                 process.kill()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("name, rejected", [("a" * 60, False), ("a" * 61, True), ("名" * 20, False), ("名" * 21, True)])
+def test_source_name_matches_server_utf8_byte_limit(tmp_path, name, rejected):
+    """Discovery must not offer names that the profile PATCH will reject by byte length."""
+    import json
+    from puffo_agent.portal.control.lingtai_profile import validate_import_profile
+    (tmp_path / "init.json").write_text("{}")
+    (tmp_path / ".agent.json").write_text(json.dumps({"agent_name": name}))
+    row = discovery._normalize({"agent_dir": str(tmp_path), "status": "available"}, tmp_path)
+    assert row["profile_read_error"] == ("name_too_long" if rejected else None)
+    assert row["import_display_name"] == (None if rejected else name)
+    payload = {"runtime": {"lingtai": {"agent_name": name}}, "display_name": name,
+               "profile": f"# {name}\n"}
+    if rejected:
+        with pytest.raises(ValueError, match="60 UTF-8 bytes"):
+            validate_import_profile(payload, tmp_path)
+    else:
+        validate_import_profile(payload, tmp_path)

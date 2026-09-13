@@ -70,8 +70,10 @@ def read_source_profile(directory: Path) -> SourceProfile:
         if name is not None and not isinstance(name, str):
             raise ValueError("agent_name must be a string or null")
         if isinstance(name, str):
-            if len(name) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            if any(ord(char) < 32 or ord(char) == 127 for char in name):
                 raise ValueError("agent_name is not a safe display name")
+            if len(name.encode("utf-8")) > 60:
+                return SourceProfile(None, source, "name_too_long", None)
             if not name.strip():
                 name = None
         return SourceProfile(name, source, None, name or "", "agent_name" in metadata and metadata["agent_name"] is None)
@@ -89,6 +91,8 @@ def is_lingtai_runtime(runtime: RuntimeConfig) -> bool:
 
 def validate_import_profile(payload: dict, directory: Path) -> None:
     source = read_source_profile(directory)
+    if source.profile_read_error == "name_too_long":
+        raise ValueError("LingTai source name exceeds 60 UTF-8 bytes; shorten it in LingTai and retry")
     if source.profile_read_error:
         raise ValueError("LingTai source profile cannot be read; check its metadata files")
     name = source.import_display_name

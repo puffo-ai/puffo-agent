@@ -55,6 +55,9 @@ class LingtaiProfileSync:
             return
         source = read_source_profile(directory)
         if source.profile_read_error:
+            if source.profile_read_error == "name_too_long":
+                logger.warning("agent %s: LingTai source name exceeds 60 UTF-8 bytes; "
+                               "keeping last synced name; shorten it in LingTai", cfg.id)
             return
         # A lost current manifest can expose an unnamed bootstrap manifest;
         # that is not evidence of an intentional name clear after import.

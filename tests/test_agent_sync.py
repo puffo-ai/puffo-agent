@@ -663,7 +663,7 @@ async def test_control_edit_role_rewrites_profile_role_line(monkeypatch):
     assert "helper: old" not in text
 
 @pytest.mark.asyncio
-async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields(tmp_path, monkeypatch):
+async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields(tmp_path, monkeypatch, caplog):
     """A failed rename must retry; null clears, corrupt/revoked sources never overwrite."""
     import json
     from puffo_agent.portal.lingtai_profile_sync import LingtaiProfileSync
@@ -712,6 +712,11 @@ async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields
     await monitor.sync_one(AgentConfig.load(cfg.id))
     assert posted == [{"display_name": "New"}] * 2
     assert manifest.read_text() == '{"agent_name":"New", "system_prompt":"PRIVATE"}'
+    manifest.write_text(json.dumps({"agent_name": "名" * 21}))
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2
+    assert AgentConfig.load(cfg.id).display_name == "New"
+    assert "60 UTF-8 bytes" in caplog.text
     manifest.write_text('broken')
     await monitor.sync_one(cfg)
     assert len(posted) == 2
