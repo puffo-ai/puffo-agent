@@ -144,6 +144,9 @@ class Daemon:
         self.workers: dict[str, Worker] = {}
         # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
+        from .control.client import UsageRefresh
+
+        self._usage_refresh = UsageRefresh()
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
@@ -268,6 +271,7 @@ class Daemon:
 
         runtime.control_manager = ControlManager(
             resolve_model=self.daemon_cfg.resolve_model,
+            usage_refresh=self._usage_refresh,
         )
         runtime.runtime_tasks.append(
             spawn(runtime.control_manager.run(), name="control_manager.run")
@@ -650,6 +654,8 @@ class Daemon:
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
+            # Invalidate manual and periodic probes, even for healthy workers.
+            self._usage_refresh.invalidate()
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime,
                 agent_id,
@@ -667,7 +673,13 @@ class Daemon:
                     agent_cfg.resolve_workspace_dir()
                 )
                 flag.parent.mkdir(parents=True, exist_ok=True)
-                jitter_seconds = _provider_auth_reload_jitter_seconds()
+                recheck_quota = (
+                    worker.runtime.health == "drained"
+                    and not getattr(worker, "_drained_budget_cap", False)
+                )
+                # A fast healthy probe may wake the Inbox immediately. Make
+                # its turn-start reload eligible before it uses old credentials.
+                jitter_seconds = 0.0 if recheck_quota else _provider_auth_reload_jitter_seconds()
                 flag.write_text(
                     json.dumps({
                         "source": "credential_replaced",
@@ -679,6 +691,10 @@ class Daemon:
                     encoding="utf-8",
                 )
                 worker.notify_refresh()
+                # Token rotation is not proof of renewed quota. Ask the
+                # shared usage loop for fresh evidence before releasing work.
+                if recheck_quota:
+                    self._usage_refresh.event.set()
                 logger.info(
                     "agent %s: credential replaced — provider reload requested "
                     "with %.3fs jitter",

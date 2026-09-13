@@ -255,7 +255,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
 
         _register_with_refresher = daemon_module.Daemon._register_with_refresher
 
+    from puffo_agent.portal.control.client import UsageRefresh
+
     d = _StubDaemon()
+    d._usage_refresh = UsageRefresh()
     w = _StubWorker()
     w.runtime.health = health
     d._register_with_refresher(w.agent_cfg, w)

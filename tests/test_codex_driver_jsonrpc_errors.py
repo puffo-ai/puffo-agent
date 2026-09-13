@@ -280,3 +280,50 @@ async def test_reader_loop_survives_malformed_and_unroutable_frames():
     response = json.loads(proc.stdin.writes[-1])
     assert response["id"] == "srv-1"
     assert response["result"] == {"decision": "accept"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error,expected", [
+    ({"message": "You've hit your usage limit. Try again later.",
+      "codexErrorInfo": None}, "plan_drained"),
+    ({"message": "Limit reached", "codexErrorInfo": "usageLimitExceeded"},
+     "plan_drained"),
+    ({"message": "Usage limit reached; retry shortly", "codexErrorInfo": "rateLimitExceeded"},
+     "rate_limit"),
+    ({"message": "rate limit exceeded", "codexErrorInfo": None}, "rate_limit"),
+])
+async def test_completed_failure_preserves_provider_recovery_class(error, expected):
+    """Quota terminals must park Inbox work instead of entering generic retries."""
+    driver = CodexAppServerDriver()
+    await driver._notification({
+        "method": "turn/completed",
+        "params": {"threadId": "thread-1", "turn": {
+            "id": "turn-1", "items": [], "status": "failed", "error": error,
+        }},
+    })
+    terminal = _drain_events(driver)[-1]
+    assert terminal.data["outcome"] == "failed"
+    assert terminal.data.get("error_code") == expected
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_diagnostic_is_redacted_and_does_not_leak_to_next_turn(caplog):
+    """Provider diagnostics must neither expose tokens nor poison later success."""
+    driver = CodexAppServerDriver()
+    with caplog.at_level(logging.WARNING):
+        await driver._notification({
+            "method": "turn/completed", "params": {"turn": {
+                "status": "failed", "error": {
+                    "message": "You've hit your usage limit api_key=private-secret-value",
+                },
+            }},
+        })
+    assert "private-secret-value" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+    _drain_events(driver)
+    await driver._notification({
+        "method": "turn/completed", "params": {"turn": {
+            "status": "completed", "error": None,
+        }},
+    })
+    assert _drain_events(driver)[-1].data == {"outcome": "succeeded"}

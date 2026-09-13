@@ -203,7 +203,7 @@ async def test_collect_snapshot_codex_from_active_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_collect_snapshot_codex_falls_back_to_reporter_when_probe_fails(monkeypatch):
+async def test_failed_probe_cannot_recover_quota_from_stale_reporter(monkeypatch):
     from puffo_agent.portal.control import reporter as reporter_mod
 
     monkeypatch.setattr(us, "machine_harnesses", lambda: {"codex"})
@@ -219,7 +219,7 @@ async def test_collect_snapshot_codex_falls_back_to_reporter_when_probe_fails(mo
     )
     monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
     snap = await us.collect_usage_snapshot(Path("."))
-    assert snap == {"codex": {"weekly": {"used_pct": 9, "resets_at": 222}}}
+    assert snap is None  # cached headroom must not release a drained worker
 
 
 @pytest.mark.asyncio

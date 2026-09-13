@@ -1095,7 +1095,11 @@ def test_snapshot_clears_a_live_worker_without_rearming_the_dm(
 ):
     monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
     _stub_agents(monkeypatch, {"a-live": "claude-code"})
-    w = _drained_worker("a-live")
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    inbox = Mock()
+    w = _drained_worker("a-live", client=SimpleNamespace(global_runtime=inbox))
     w.runtime.health = "drained"
     w.runtime.error = "spent"
     w._drained_notification_sent = True
@@ -1106,6 +1110,7 @@ def test_snapshot_clears_a_live_worker_without_rearming_the_dm(
     assert w.runtime.health == "ok"
     # Only a successful turn re-arms; a budget blip must not buy a re-DM.
     assert w._drained_notification_sent is True
+    inbox.notify.assert_called_once_with()
 
 
 def test_snapshot_leaves_a_live_workers_other_reds_alone(tmp_path, monkeypatch):
@@ -1582,6 +1587,7 @@ def test_usage_snapshot_does_not_clear_a_budget_cap():
 
     class _PlanWorker(_Worker):
         _drained_budget_cap = False
+        _client = None
 
     _apply_to_live_worker(_PlanWorker(), "agent-2", (False, None))
     assert cleared == ["agent-2"]
@@ -1801,3 +1807,18 @@ def test_budget_exceeded_code_holds_even_without_the_gateway_wording(monkeypatch
     asyncio.run(rt._handle_process_failure(_planned(), 0.0, exc))
     assert rt._parked_drained is True
     assert rt._drained_park_until == 400.0
+
+
+@pytest.mark.parametrize("budgets", [
+    {}, {"session": {}}, {"session": {"used_pct": -1}},
+    {"session": {"used_pct": float("nan")}},
+])
+def test_unknown_snapshot_does_not_release_parked_work(tmp_path, monkeypatch, budgets):
+    """Missing or invalid headroom is not evidence of quota recovery."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    _stub_agents(monkeypatch, {"a-live": "codex"})
+    w = _drained_worker("a-live", harness="codex")
+    w.runtime.health = "drained"
+    _stub_live_workers(monkeypatch, {"a-live": w})
+    apply_drained_health({"codex": budgets})
+    assert w.runtime.health == "drained"

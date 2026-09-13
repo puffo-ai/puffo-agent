@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
@@ -51,6 +52,17 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 # command-expiry budget used by Runtime permission/cancel commands.
 AGENT_START_TIMEOUT_SECONDS = 10 * 60.0
 AGENT_START_POLL_SECONDS = 0.5
+
+
+@dataclass
+class UsageRefresh:
+    """Shared credential revision and coalesced usage-loop wakeup."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    generation: int = 0
+
+    def invalidate(self) -> None:
+        self.generation += 1
 
 
 class _DuplicateDelivery(ControlError):
@@ -264,12 +276,17 @@ async def _wait_for_agent_start(agent_id: str) -> dict | None:
     }
 
 
-async def post_usage_snapshot(machine, base: str) -> bool:
+async def post_usage_snapshot(
+    machine, base: str, *, usage_refresh: UsageRefresh | None = None,
+) -> bool:
     """Collect the machine's usage-budget snapshot and POST it to the server.
-    Returns True iff there was a snapshot to send. Shared by the periodic loop
+    Returns True iff a current snapshot was sent. Shared by the periodic loop
     and the on-demand ``refresh_usage`` command."""
+    generation = usage_refresh.generation if usage_refresh is not None else None
     snapshot = await collect_usage_snapshot(Path.home())
-    if not snapshot:
+    if not snapshot or (usage_refresh is not None and generation != usage_refresh.generation):
+        # A credential change during collection makes even live probe data
+        # stale, even if the usage loop already consumed the wakeup event.
         return False
     # local health first: survives a failed POST
     try:
@@ -296,6 +313,7 @@ async def execute_command(
     paired_root_pubkey: str | None = None,
     command_id: str | None = None,
     resolve_model: Callable[..., str] | None = None,
+    usage_refresh: UsageRefresh | None = None,
 ) -> dict:
     """Apply a decrypted command to local agent state for the reconciler.
 
@@ -345,7 +363,7 @@ async def execute_command(
         if not server_url:
             return {"ok": False, "error": "refresh_usage: no server_url"}
         posted = await post_usage_snapshot(
-            load_or_create_machine(), server_url.rstrip("/")
+            load_or_create_machine(), server_url.rstrip("/"), usage_refresh=usage_refresh
         )
         return {"ok": True, "posted": posted}
     if op == "create":
@@ -651,8 +669,12 @@ class MachineControlClient:
     """Holds the single control WS; verifies each command against the pinned
     operator root named in the frame, executes it, and acks."""
 
-    def __init__(self, machine, *, resolve_model: Callable[..., str] | None = None) -> None:
+    def __init__(
+        self, machine, *, resolve_model: Callable[..., str] | None = None,
+        usage_refresh: UsageRefresh | None = None,
+    ) -> None:
         self.machine = machine
+        self._usage_refresh = usage_refresh
         self._resolve_model = resolve_model
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
         self._command_tasks: set[asyncio.Future] = set()
@@ -875,6 +897,7 @@ class MachineControlClient:
                 paired_root_pubkey=pairing.operator_root_pubkey,
                 command_id=str(command_id or ""),
                 resolve_model=self._resolve_model,
+                usage_refresh=self._usage_refresh,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
@@ -954,9 +977,13 @@ class ControlManager:
     ``server_url``. Multiple operators on that same server are served; a
     machine paired across two different servers only serves the first."""
 
-    def __init__(self, *, resolve_model: Callable[..., str] | None = None) -> None:
+    def __init__(
+        self, *, resolve_model: Callable[..., str] | None = None,
+        usage_refresh: UsageRefresh | None = None,
+    ) -> None:
         self._resolve_model = resolve_model
         self._stop = asyncio.Event()
+        self._usage_refresh = usage_refresh if usage_refresh is not None else UsageRefresh()
 
     async def run(self) -> None:
         machine = None
@@ -969,7 +996,9 @@ class ControlManager:
                 if pairings and machine is None:
                     machine = load_or_create_machine()
                 if pairings and ws_task is None:
-                    client = MachineControlClient(machine, resolve_model=self._resolve_model)
+                    client = MachineControlClient(
+                        machine, resolve_model=self._resolve_model, usage_refresh=self._usage_refresh,
+                    )
                     ws_task = spawn(client.run(self._stop), name="client.run")
                     me_task = spawn(self._me_loop(machine), name="me_loop")
                     usage_task = spawn(self._usage_loop(machine), name="usage_loop")
@@ -1001,16 +1030,32 @@ class ControlManager:
 
     async def _usage_loop(self, machine) -> None:
         """Probe each runtime's /usage budget and POST the machine's snapshot.
+        Credential changes coalesce into a fresh probe on this same loop.
         Replace-latest server-side, so a dropped tick just resends next time."""
         while not self._stop.is_set():
+            self._usage_refresh.event.clear()
             try:
                 pairings = load_pairings()
                 if pairings:
                     base = next(iter(pairings.values())).server_url.rstrip("/")
-                    await post_usage_snapshot(machine, base)
+                    await post_usage_snapshot(
+                        machine, base, usage_refresh=self._usage_refresh,
+                    )
             except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
                 log.debug("control: usage report failed: %s", exc)
-            await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
+            await self._wait_for_usage_refresh()
+
+    async def _wait_for_usage_refresh(self) -> None:
+        periodic = spawn(
+            _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS), name="usage_periodic_wait",
+        )
+        requested = spawn(self._usage_refresh.event.wait(), name="usage_refresh_wait")
+        try:
+            await asyncio.wait({periodic, requested}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            periodic.cancel()
+            requested.cancel()
+            await asyncio.gather(periodic, requested, return_exceptions=True)
 
     def stop(self) -> None:
         self._stop.set()

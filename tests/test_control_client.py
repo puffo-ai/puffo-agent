@@ -782,8 +782,9 @@ def _wire_run(monkeypatch, mgr, *, pairing_seq, stop_after):
     monkeypatch.setattr(cc, "load_or_create_machine", lambda: types.SimpleNamespace(machine_id="mac_1"))
 
     class _FakeClient:
-        def __init__(self, machine, *, resolve_model):
+        def __init__(self, machine, *, resolve_model, usage_refresh):
             assert resolve_model is mgr._resolve_model
+            assert usage_refresh is mgr._usage_refresh
 
         def run(self, stop):
             return aio.sleep(3600)
@@ -1099,3 +1100,122 @@ async def test_create_uses_running_daemon_model_not_changed_disk(home, monkeypat
     preparer.harness_name = harness
     assert seen == [preparer._resolve_model()] == ['unavailable']
     assert client._completed_results['model-check']['error_code'] == 'harness_not_ready'
+
+
+@pytest.mark.asyncio
+async def test_credential_refresh_wakes_usage_loop_and_coalesces(monkeypatch):
+    """Credential recovery must not wait six hours or spawn a probe per agent."""
+    refreshed = cc.UsageRefresh()
+    manager = cc.ControlManager(usage_refresh=refreshed)
+    first_probe = asyncio.Event()
+    release_probe = asyncio.Event()
+    calls = []
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://s/"),
+    })
+
+    async def post(machine, base, **kwargs):
+        calls.append(base)
+        if len(calls) == 1:
+            first_probe.set()
+            await release_probe.wait()
+        else:
+            manager.stop()
+        return True
+
+    monkeypatch.setattr(cc, "post_usage_snapshot", post)
+    task = asyncio.create_task(manager._usage_loop(object()))
+    try:
+        await asyncio.wait_for(first_probe.wait(), 2)
+        # Changes arriving during a probe need one later fresh snapshot.
+        refreshed.invalidate()
+        refreshed.event.set()
+        refreshed.invalidate()
+        refreshed.event.set()
+        release_probe.set()
+        await asyncio.wait_for(task, 2)
+        assert calls == ["https://s", "https://s"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_rotated_credentials_discard_inflight_healthy_snapshot(monkeypatch):
+    """A healthy result from the old credential must not unlock the new one."""
+    manager = cc.ControlManager()
+    first_probe = asyncio.Event()
+    release_probe = asyncio.Event()
+    applied = []
+    posts = []
+    probes = 0
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://s/"),
+    })
+
+    async def collect(home):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            first_probe.set()
+            await release_probe.wait()
+            return {"codex": {"session": {"used_pct": 1}}}
+        manager.stop()
+        return {"codex": {"session": {"used_pct": 100}}}
+
+    monkeypatch.setattr(cc, "collect_usage_snapshot", collect)
+    monkeypatch.setattr(cc, "apply_drained_health", applied.append)
+    monkeypatch.setattr(cc.machine_auth, "signed_headers", lambda *a, **k: {})
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda *a, **k: _FakeSession(200, posts))
+    task = asyncio.create_task(manager._usage_loop(types.SimpleNamespace(machine_id="mac")))
+    try:
+        await asyncio.wait_for(first_probe.wait(), 2)
+        manager._usage_refresh.invalidate()
+        manager._usage_refresh.event.set()
+        release_probe.set()
+        await asyncio.wait_for(task, 2)
+        assert applied == [{"codex": {"session": {"used_pct": 100}}}]
+        assert len(posts) == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotate", [False, True])
+async def test_manual_usage_discards_rotation_even_after_loop_clears_event(monkeypatch, rotate):
+    """The command path shares the generation; consuming the event cannot hide rotation."""
+    manager = cc.ControlManager()
+    client = cc.MachineControlClient(object(), usage_refresh=manager._usage_refresh)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    applied, posts = [], []
+
+    async def collect(home):
+        started.set()
+        await release.wait()
+        return {"codex": {"session": {"used_pct": 1}}}
+
+    monkeypatch.setattr(cc, "collect_usage_snapshot", collect)
+    monkeypatch.setattr(cc, "apply_drained_health", applied.append)
+    monkeypatch.setattr(cc, "load_or_create_machine", lambda: types.SimpleNamespace(machine_id="mac"))
+    monkeypatch.setattr(cc.machine_auth, "signed_headers", lambda *a, **k: {})
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda *a, **k: _FakeSession(200, posts))
+    pairing = types.SimpleNamespace(server_url="https://s/", operator_root_pubkey="synthetic")
+    task = asyncio.create_task(client._execute_and_ack(None, "quota", {
+        "op": "refresh_usage", "agent_slug": None, "params": {},
+    }, pairing, nonce=None))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        if rotate:
+            manager._usage_refresh.invalidate()
+            manager._usage_refresh.event.set()
+            manager._usage_refresh.event.clear()
+        release.set()
+        await asyncio.wait_for(task, 2)
+        assert client._completed_results["quota"] == {"ok": True, "posted": not rotate}
+        assert applied == ([] if rotate else [{"codex": {"session": {"used_pct": 1}}}])
+        assert len(posts) == (0 if rotate else 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

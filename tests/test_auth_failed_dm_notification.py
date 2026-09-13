@@ -368,7 +368,10 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
 
         _register_with_refresher = daemon_module.Daemon._register_with_refresher
 
+    from puffo_agent.portal.control.client import UsageRefresh
+
     d = _StubDaemon()
+    d._usage_refresh = UsageRefresh()
     w = _StubWorker()
     # Simulate auth_failed → refresh_success → expect both
     # ``runtime.health`` cleared AND ``_auth_failed_notification_sent``

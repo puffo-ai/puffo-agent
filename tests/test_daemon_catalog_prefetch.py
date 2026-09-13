@@ -199,8 +199,9 @@ async def test_daemon_run_cleans_partial_services_before_readiness(
             return None
 
     class ControlManager:
-        def __init__(self, *, resolve_model):
+        def __init__(self, *, resolve_model, usage_refresh):
             assert resolve_model == daemon.daemon_cfg.resolve_model
+            assert usage_refresh is daemon._usage_refresh
 
         async def run(self):
             return None
