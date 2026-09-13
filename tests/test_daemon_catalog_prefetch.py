@@ -208,8 +208,7 @@ async def test_daemon_run_cleans_partial_services_before_readiness(
         def stop(self):
             return None
 
-    daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
-    daemon.daemon_cfg = DaemonConfig()
+    daemon = daemon_mod.Daemon(DaemonConfig())
     daemon.ws_local_hub = object()
     daemon._stop = asyncio.Event()
     daemon._stop.set()

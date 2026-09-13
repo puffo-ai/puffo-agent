@@ -40,6 +40,9 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_windows_archive_lifecycle.py
+          tests/test_windows_daemon_scheduling.py
+          tests/test_keystore_and_certs.py
+          tests/test_reminder_sync.py
           tests/test_background.py
           tests/test_windows_harness_launch.py
           tests/test_child_env_allowlist.py

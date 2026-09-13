@@ -1070,7 +1070,8 @@ def test_dek_is_private_stable_and_scoped_to_agent_state(tmp_path, caplog):
     path = keys_a._message_backup_dek_path("agent-a")
 
     assert len(first) == 32
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert KeyStore(tmp_path / "agent-a" / "keys").load_or_create_message_backup_dek(
         "agent-a"
     ) == first

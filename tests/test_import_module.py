@@ -239,7 +239,8 @@ async def test_import_happy_path(mock_server):
         / "alpha-bot.message-backup-dek-v1"
     )
     assert backup_path.read_bytes() == info["backup_dek"]
-    assert backup_path.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        assert backup_path.stat().st_mode & 0o077 == 0
     if os.name != "nt":
         agent_root = identity_path.parents[1]
         assert agent_root.stat().st_mode & 0o777 == 0o700

@@ -31,13 +31,22 @@ has passed a live end-to-end test. macOS/Linux were not investigated here.
   before revoking. Existing markers without a lifecycle field remain valid.
 * Final deletion: extended Windows paths allow recursive removal after moving
   a tree to the longer archive path. Filesystem work runs off the event loop.
+* Independent lifecycle progress: Windows now owns one operation task per
+  Agent. A slow provider warm or archive report no longer pins discovery and
+  transitions for every other Agent. Two startup observation slots bound
+  concurrent warm observation; superseded startup waits can be cancelled.
+  Shutdown drains stop/archive/delete work before releasing its owners.
+* Binary message backup keys: the merged #366 opens Windows key files in
+  binary mode and recognizes the precise legacy CRLF expansion. Live testing
+  reproduced a 32-byte key reading as 16 bytes at Ctrl-Z before this fix;
+  the same Agent and key successfully resumed after the fix.
 
 ## State and operation inventory
 
 | Owner / states | Operations and Windows boundary | Evidence / remaining limits |
 | --- | --- | --- |
 | Daemon startup: `starting`, `ready`, `exited` | background start, duplicate start, stop; console, job and PID ownership | Native background tests pass; live restart reconnects. Login autostart is a separate path below. |
-| Agent desired state: `running`, `paused`; observed runtime: `starting`, `running`, `paused`, `error`, `stopped` | create, pause, resume, config restart, restart flag | Control/worker tests pass. Codex tree cleanup fixes the shared shutdown boundary. Warm-up remains serial with a 120-second per-worker bound. |
+| Agent desired state: `running`, `paused`; observed runtime: `starting`, `running`, `paused`, `error`, `stopped` | create, pause, resume, config restart, restart flag | Windows uses independent operation tasks and two warm observation slots, each with the existing 120-second bound. Live create, pause/resume, restart and model change pass; see the E2E report. POSIX retains sequential reconciliation. |
 | Archive/delete flags → moved directory → report/revoke → optional removal | directory rename, provider locks, long paths, network retry | Native locked-file, long-path, destination-collision and deletion tests pass. Two live pending archives completed; both devices were revoked. |
 | Runtime health: `unknown`, `ok`, `in_progress`, `auth_failed`, `api_error_abandoned`, `provider_error`, `refresh_broken`, `drained`, `extra_usage_required`, `unhandled_error`, `codex_thread_wedged`, `server_unreachable`, `mcp_unreachable`, `no_progress` | heartbeat, quota/auth gating, health probes, reopen | Worker/health tests exercised on Windows. Network/provider failures were not all induced against live services. Health is separate from lifecycle/activity. |
 | Runtime/session: ready, failed, exited; session opened/resumed/updated | start, close, refresh, resume fallback; pipes and child processes | Driver and runtime tests cover these paths; native Codex descendant cleanup passes. A killed/already-exited launcher can still make descendants undiscoverable by PID-tree lookup; Job ownership would be a stronger future guarantee. |
@@ -55,9 +64,10 @@ has passed a live end-to-end test. macOS/Linux were not investigated here.
   `stopped`; that state alone does not prove every resource was released.
   Native process-tree cleanup reduces the reproduced cause, but cancellation
   and cleanup-failure ownership need a separate design/test pass.
-* Lifecycle reconciliation still awaits worker shutdown and network reporting.
-  Removing bulk copies and fixed archive sleeps fixes the observed long stall;
-  it does not make independent agents' lifecycle transitions fully concurrent.
+* Each Agent still awaits its own shutdown and network reporting. Independent
+  Windows Agents progress concurrently, but two slow startup observations can
+  delay queued starts. The 120-second observation timeout releases a slot; it
+  does not terminate a still-warming provider or impose a hard process cap.
 * Pending archive network retries currently run at startup. Files remain safe,
   but a continuously running daemon does not periodically sweep these markers.
 * Docker, remote/WS-local providers and login autostart were not exercised as
@@ -68,6 +78,13 @@ has passed a live end-to-end test. macOS/Linux were not investigated here.
   variant runs locally. Production detachment flags are not weakened.
 
 ## Validation
+
+The following counts describe the earlier #365 audit. For the subsequent
+Windows scheduler, binary key fix and actual browser workflow, see
+[the local end-to-end report](windows-e2e-2026-09-13.md). The final focused
+selection passed **309 tests with 3 skips**; both Windows lifecycle CI jobs
+and both Ubuntu full-suite jobs passed. The full native Windows suite remains
+an incomplete, failing run and is documented separately in that report.
 
 The three native regressions first failed on the previous implementation:
 locked long-path archive, existing destination preservation, and a surviving
