@@ -1072,7 +1072,7 @@ async def test_credential_refresh_wakes_usage_loop_and_coalesces(monkeypatch):
         "op": types.SimpleNamespace(server_url="https://s/"),
     })
 
-    async def post(machine, base):
+    async def post(machine, base, **kwargs):
         calls.append(base)
         if len(calls) == 1:
             first_probe.set()
@@ -1091,6 +1091,46 @@ async def test_credential_refresh_wakes_usage_loop_and_coalesces(monkeypatch):
         release_probe.set()
         await asyncio.wait_for(task, 2)
         assert calls == ["https://s", "https://s"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_rotated_credentials_discard_inflight_healthy_snapshot(monkeypatch):
+    """A healthy result from the old credential must not unlock the new one."""
+    manager = cc.ControlManager()
+    first_probe = asyncio.Event()
+    release_probe = asyncio.Event()
+    applied = []
+    posts = []
+    probes = 0
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://s/"),
+    })
+
+    async def collect(home):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            first_probe.set()
+            await release_probe.wait()
+            return {"codex": {"session": {"used_pct": 1}}}
+        manager.stop()
+        return {"codex": {"session": {"used_pct": 100}}}
+
+    monkeypatch.setattr(cc, "collect_usage_snapshot", collect)
+    monkeypatch.setattr(cc, "apply_drained_health", applied.append)
+    monkeypatch.setattr(cc.machine_auth, "signed_headers", lambda *a, **k: {})
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda *a, **k: _FakeSession(200, posts))
+    task = asyncio.create_task(manager._usage_loop(types.SimpleNamespace(machine_id="mac")))
+    try:
+        await asyncio.wait_for(first_probe.wait(), 2)
+        manager._usage_refresh.set()
+        release_probe.set()
+        await asyncio.wait_for(task, 2)
+        assert applied == [{"codex": {"session": {"used_pct": 100}}}]
+        assert len(posts) == 1
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

@@ -263,12 +263,16 @@ async def _wait_for_agent_start(agent_id: str) -> dict | None:
     }
 
 
-async def post_usage_snapshot(machine, base: str) -> bool:
+async def post_usage_snapshot(
+    machine, base: str, *, invalidated: Callable[[], bool] | None = None,
+) -> bool:
     """Collect the machine's usage-budget snapshot and POST it to the server.
     Returns True iff there was a snapshot to send. Shared by the periodic loop
     and the on-demand ``refresh_usage`` command."""
     snapshot = await collect_usage_snapshot(Path.home())
-    if not snapshot:
+    if not snapshot or (invalidated is not None and invalidated()):
+        # A credential change during collection makes even live probe data
+        # stale. The usage loop retains the request and probes again.
         return False
     # local health first: survives a failed POST
     try:
@@ -999,7 +1003,9 @@ class ControlManager:
                 pairings = load_pairings()
                 if pairings:
                     base = next(iter(pairings.values())).server_url.rstrip("/")
-                    await post_usage_snapshot(machine, base)
+                    await post_usage_snapshot(
+                        machine, base, invalidated=self._usage_refresh.is_set,
+                    )
             except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
                 log.debug("control: usage report failed: %s", exc)
             await self._wait_for_usage_refresh()
@@ -1018,4 +1024,3 @@ class ControlManager:
 
     def stop(self) -> None:
         self._stop.set()
-        self._usage_refresh.set()
