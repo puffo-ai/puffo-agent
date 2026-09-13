@@ -802,6 +802,10 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     cfg = AgentConfig.load(agent_id)
+    from .control.lingtai_profile import is_lingtai_runtime
+    if is_lingtai_runtime(cfg.runtime):
+        print("error: LingTai owns this agent's name; edit it in LingTai", file=sys.stderr)
+        return 2
     old_name = cfg.display_name
     if new_name == old_name:
         print(f"agent {agent_id!r} display_name already {new_name!r}")
@@ -920,6 +924,11 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         print(f"server_url:    {cfg.puffo_core.server_url}")
         return 0
 
+    from .control.lingtai_profile import is_lingtai_runtime
+    if is_lingtai_runtime(cfg.runtime):
+        print("error: LingTai owns this agent's profile; edit it in LingTai", file=sys.stderr)
+        return 2
+
     # Validation mirrors the control provision contract so the CLI fails
     # locally before bothering the server.
     if role_short_arg is not None and role_arg is None and not cfg.role:
@@ -936,9 +945,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
 
-    # Build the wire patch + apply locally in lock-step. agent.yml
-    # writes happen first so a server-side hiccup doesn't lose what
-    # the operator typed; the sync warning surfaces after.
+    # Persist locally before publishing; a network failure must not lose edits.
     patch: dict[str, Any] = {}
     if isinstance(display_name_arg, str):
         new_name = display_name_arg.strip() or cfg.display_name

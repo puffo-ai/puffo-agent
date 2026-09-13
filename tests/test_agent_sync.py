@@ -661,3 +661,78 @@ async def test_control_edit_role_rewrites_profile_role_line(monkeypatch):
     text = profile.read_text(encoding="utf-8")
     assert "**Role:** coder: new description\n" in text
     assert "helper: old" not in text
+
+@pytest.mark.asyncio
+async def test_lingtai_source_name_sync_retries_clear_and_preserves_other_fields(tmp_path, monkeypatch):
+    """A failed rename must retry; null clears, corrupt/revoked sources never overwrite."""
+    import json
+    from puffo_agent.portal.lingtai_profile_sync import LingtaiProfileSync
+    from puffo_agent.portal.state import RuntimeConfig
+    home = isolated_home()
+    write_test_agent(home, "source-bot")
+    cfg = AgentConfig.load("source-bot")
+    source = tmp_path / "source"
+    source.mkdir()
+    manifest = source / ".agent.json"
+    registry = Path(home).resolve() / "lingtai" / "runtime-registry.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"runtimes": {"bound": {
+        "runtime_id": "bound", "agent_dir": str(source), "status": "active",
+    }}}))
+    cfg.runtime = RuntimeConfig(kind="cli-local", harness="acp", harness_command=[
+        "/bin/lingtai-agent", "acp", "--profile", "puffo-v1",
+        "--runtime-id", "bound", "--registry", str(registry),
+    ])
+    cfg.display_name = "Old"
+    cfg.save()
+    import argparse
+    from puffo_agent.portal.cli import cmd_agent_rename, cmd_agent_profile
+    before_config = cfg.display_name
+    assert cmd_agent_rename(argparse.Namespace(id=cfg.id, display_name="Ghost")) == 2
+    assert cmd_agent_profile(argparse.Namespace(id=cfg.id, display_name="Ghost", role=None, role_short=None)) == 2
+    assert AgentConfig.load(cfg.id).display_name == before_config
+    posted = []
+    fail = True
+    async def patch_profile(config, patch):
+        nonlocal fail
+        posted.append(patch)
+        if fail:
+            fail = False
+            raise OSError("offline")
+    monkeypatch.setattr("puffo_agent.portal.profile_sync.sync_agent_profile", patch_profile)
+    await sync_full_profile(cfg)
+    assert posted == []  # A warm/startup snapshot must not restore the imported name.
+    monitor = LingtaiProfileSync()
+    manifest.write_text('{"agent_name":"New", "system_prompt":"PRIVATE"}')
+    with pytest.raises(OSError):
+        await monitor.sync_one(cfg)
+    assert AgentConfig.load(cfg.id).display_name == "Old"
+    await monitor.sync_one(cfg)
+    assert AgentConfig.load(cfg.id).display_name == "New"
+    await monitor.sync_one(AgentConfig.load(cfg.id))
+    assert posted == [{"display_name": "New"}] * 2
+    assert manifest.read_text() == '{"agent_name":"New", "system_prompt":"PRIVATE"}'
+    manifest.write_text('broken')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2
+    manifest.unlink()
+    (source / "init.json").write_text('{"manifest":{"agent_name":null}}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # Missing current manifest must not clear a self-chosen name.
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Stale bootstrap"}}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # Nor can a stale bootstrap name roll back the current one.
+    manifest.write_text('{}')
+    await monitor.sync_one(cfg)
+    assert len(posted) == 2  # A missing field is not an explicit clear either.
+    manifest.write_text('{"agent_name":null}')
+    await monitor.sync_one(cfg)
+    assert posted[-1] == {"display_name": None}
+    assert AgentConfig.load(cfg.id).display_name == ""
+    manifest.write_text('{"agent_name":"Reborn"}')
+    await monitor.sync_one(cfg)
+    assert posted[-1] == {"display_name": "Reborn"}
+    registry.write_text('{"runtimes":{}}')
+    manifest.write_text('{"agent_name":"Unbound"}')
+    await monitor.sync_one(cfg)
+    assert posted[-1] == {"display_name": "Reborn"}

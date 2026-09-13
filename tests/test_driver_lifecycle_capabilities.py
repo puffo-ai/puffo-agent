@@ -15,6 +15,11 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     SteerCapability,
 )
+from puffo_agent.agent.harness import (
+    SUPPORTED_LOCAL_DRIVERS,
+    UnsupportedDriver,
+    build_driver,
+)
 from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManagerAdapter
 
 
@@ -30,6 +35,27 @@ def _shipped_capabilities():
 
 def test_shipped_drivers_declare_lifecycle_and_busy_delivery():
     for name, caps in _shipped_capabilities().items():
+        assert RuntimeLifecycle(caps.lifecycle), name
+        assert BusyDelivery(caps.busy_delivery), name
+
+
+def test_every_buildable_driver_declares_lifecycle_and_busy_delivery():
+    """Bind the roster, not just its listed members.
+
+    ``_shipped_capabilities`` is hand-kept and names two drivers (plus one
+    claude-code variant), while ``SUPPORTED_LOCAL_DRIVERS`` admits five. A
+    driver added to the factory — acp, opencode and pi already are — is
+    examined by nothing here, and so is the next one. Deriving the set from the
+    factory means adding a driver without declaring its lifecycle fails, rather
+    than passing silently.
+    """
+
+    for name in sorted(SUPPORTED_LOCAL_DRIVERS):
+        driver = build_driver(name)
+        assert not isinstance(driver, UnsupportedDriver), name
+        caps = driver.current_capabilities()
+        assert caps is not None, f"{name} declares no capabilities"
+        # Constructing the enum rejects a value outside it.
         assert RuntimeLifecycle(caps.lifecycle), name
         assert BusyDelivery(caps.busy_delivery), name
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -12,6 +13,7 @@ from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode
 from ...crypto.primitives import ed25519_verify
 from ...mcp.config import supported_inference_levels
+from ...tasks import spawn
 from ..host_assets import _atomic_write_private, _ensure_private_directory
 from ..runtime_matrix import (
     RUNTIME_CLI_LOCAL,
@@ -32,6 +34,8 @@ from ..state import (
     is_valid_agent_id,
 )
 from .certs import CertError, verify_device_cert, verify_identity_cert, verify_slug_binding
+from .lingtai_profile import validate_import_profile
+from .lingtai import LingtaiLaunch, parse_lingtai_launch, provision_lingtai, revoke_lingtai
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +89,22 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         operator_root_key_b64,
     )
     core_fields = _verify_core(core, bound_slug, device_cert)
-    profile_fields = _verify_profile(payload, bound_slug)
+    try:
+        lingtai = parse_lingtai_launch(runtime_input.get("lingtai"))
+    except (ValueError, OSError) as exc:
+        raise ProvisionError(str(exc)) from exc
+    if lingtai is not None:
+        if runtime_input.get("kind") != RUNTIME_CLI_LOCAL or runtime_input.get("harness") != "acp":
+            raise ProvisionError("LingTai requires the cli-local ACP runtime")
+        try:
+            validate_import_profile(payload, lingtai.agent_dir)
+        except ValueError as exc:
+            raise ProvisionError(str(exc)) from exc
+        profile_fields = (payload["display_name"], str(payload.get("avatar_url") or "").strip(),
+                          "", "", payload["profile"])
+        runtime_input = {**runtime_input, "harness_command": lingtai.argv()}
+    else:
+        profile_fields = _verify_profile(payload, bound_slug)
     runtime = _verify_runtime(runtime_input)
     desired_skills, desired_mcps = _verify_desired(payload)
     server_url, slug, device_id, space_id, operator_slug = core_fields
@@ -103,6 +122,7 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         "space_id": space_id,
         "operator_slug": operator_slug,
         "runtime": runtime,
+        "lingtai": lingtai,
         "desired_skills": desired_skills,
         "desired_mcps": desired_mcps,
         "bundle": bundle,
@@ -318,6 +338,7 @@ def write_agent_from_context(context: dict) -> dict:
                 operator_slug=context["operator_slug"],
             ),
             runtime=context["runtime"],
+            workspace_dir=str(context["lingtai"].workspace) if context.get("lingtai") else "workspace",
             triggers=TriggerRules(),
             desired_skills=context["desired_skills"],
             desired_mcps=context["desired_mcps"],
@@ -332,6 +353,29 @@ def write_agent_from_context(context: dict) -> dict:
     return {"agent_id": agent_id, "agent_dir": str(target)}
 
 
+async def _rollback_lingtai(launch: LingtaiLaunch) -> None:
+    # Own and join the cleanup task: shielding alone would leave it detached
+    # when the request receives another cancellation during daemon shutdown.
+    cleanup = spawn(
+        asyncio.wait_for(revoke_lingtai(launch), timeout=30), name="lingtai.rollback",
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Finish bounded cleanup and let the caller re-raise its original
+            # failure, even if that failure was not a cancellation. Later
+            # cancellations do not replace it; reconsider this policy before
+            # using this helper under structured cancellation (e.g. TaskGroup).
+            continue
+        except Exception:
+            break
+    try:
+        cleanup.result()
+    except (Exception, asyncio.CancelledError):
+        logger.warning("LingTai rollback failed for runtime %s", launch.runtime_id)
+
+
 async def provision_agent_from_bundle(
     payload: dict,
     operator_root_key_b64: str,
@@ -342,9 +386,21 @@ async def provision_agent_from_bundle(
     context = verify_agent_bundle(payload, operator_root_key_b64)
     if preflight is not None:
         await preflight(context)
-    if materialize is not None:
-        await materialize(context)
-    result = write_agent_from_context(context)
+    launch = context["lingtai"]
+    if launch is not None:
+        try:
+            validate_import_profile(payload, launch.agent_dir)
+            await provision_lingtai(launch)
+        except (ValueError, OSError, asyncio.TimeoutError) as exc:
+            raise ProvisionError(f"LingTai runtime provisioning failed: {exc}") from exc
+    try:
+        if materialize is not None:
+            await materialize(context)
+        result = write_agent_from_context(context)
+    except BaseException:
+        if launch is not None:
+            await _rollback_lingtai(launch)
+        raise
     result.update(
         device_id=context["device_id"],
         role=context["role"],

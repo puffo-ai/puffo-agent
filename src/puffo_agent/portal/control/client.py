@@ -34,6 +34,7 @@ from ...tasks import spawn
 
 log = logging.getLogger("puffo_agent.control")
 
+BACKGROUND_OPS = frozenset({"create", "discover_lingtai"})
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 # Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
@@ -306,6 +307,10 @@ async def execute_command(
         "runtime.inspect_recovery", "runtime.stop_recovery", "runtime.retry_recovery",
     }:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
+    if op == "discover_lingtai":
+        from .lingtai_discovery import discover_lingtai
+
+        return await discover_lingtai(params, operator=paired_root_pubkey)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
@@ -383,6 +388,12 @@ def _set_agent_state(agent_slug: str | None, state: str) -> dict:
 
 async def _execute_edit(agent_slug: str | None, params: dict) -> dict:
     cfg = AgentConfig.load(agent_slug)
+    from .lingtai_profile import guarded_edit_params
+
+    try:
+        params = guarded_edit_params(cfg, params)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     patch, prompt_changed = _apply_edit_profile_fields(cfg, params)
     runtime_changed, error = _apply_edit_runtime(cfg, params)
     if error is not None:
@@ -581,8 +592,11 @@ def build_capabilities() -> dict:
         # names (gemini, kimi, opencode …), so no single binary probe can
         # stand for it; admission is checked per-target at creation time.
         "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
+        # Presence advertises the directory-association creation contract.
+        # The operator supplies the executable, so check that target at create.
+        "lingtai": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
-    cli_tools = {name: r.legacy for name, r in readiness.items()}
+    cli_tools = {name: r.legacy for name, r in readiness.items() if name != "lingtai"}
     # Frozen wire quirks, kept byte-stable for old portal consumers:
     # opencode historically meant binary-present (credentials unknown), and
     # "acp" mirrored that opencode binary status. New consumers read
@@ -819,7 +833,7 @@ class MachineControlClient:
             execution = self._execute_and_ack(
                 (
                     None
-                    if background_create and command_id and decrypted["op"] == "create"
+                    if background_create and command_id and decrypted["op"] in BACKGROUND_OPS
                     else ws
                 ),
                 command_id,
@@ -829,7 +843,7 @@ class MachineControlClient:
             )
             if command_id:
                 self._inflight_command_ids.add(str(command_id))
-            if background_create and command_id and decrypted["op"] == "create":
+            if background_create and command_id and decrypted["op"] in BACKGROUND_OPS:
                 # A first Docker image build can take minutes. Keep that wait
                 # out of the one machine-control receive loop so pause/resume,
                 # runtime decisions, and other operators remain responsive.

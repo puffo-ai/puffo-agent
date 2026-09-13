@@ -248,6 +248,7 @@ class AcpDriver(Driver):
         self._fallback_block_id = ""
         self._capabilities = acp_capabilities(session_resume=False)
         self._model_selection = ""
+        self._permission_mode = ""
         self._spawn_warnings: tuple[str, ...] = ()
         self._driver_authority: DriverAuthorityServer | None = None
         self._closed = False
@@ -266,6 +267,9 @@ class AcpDriver(Driver):
             self._closed = False
             self._events = asyncio.Queue()
         launch = self._validate_launch_plan(spec)
+        # Run configuration, not a remembered decision: derived permission
+        # decisions last one request, preserving the peer's turn scope.
+        self._permission_mode = spec.permission_mode
         self._proc = await self._spawn(launch)
         if self._proc.stdin is None or self._proc.stdout is None:
             raise RuntimeError("ACP child did not expose stdio pipes")
@@ -851,13 +855,40 @@ class AcpDriver(Driver):
         if session_id != self._native_session_id or not self._active.value:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         ref = PermissionRef(f"permission_{uuid.uuid4().hex}")
-        future = asyncio.get_running_loop().create_future()
-        self._permissions[ref] = (future, options)
+        # ``bypassPermissions`` means the operator has pre-authorised this
+        # runtime's tool use, so answer immediately instead of parking the
+        # request on a human. The sibling drivers express the same policy at
+        # launch (codex ``approvalPolicy: never``, opencode ``--auto``); ACP
+        # has no such switch because in ACP the client *is* the authority, so
+        # answering on the spot is where the policy lands here.
+        #
+        # The answer is derived from this request alone and nothing is stored:
+        # no future is registered, no grant is cached, and the peer still asks
+        # again next turn. That keeps LingTai's turn-scoped permission
+        # contract intact -- this is not a persistent-permission capability.
+        auto_allow = self._permission_mode == "bypassPermissions"
+        selected_auto = _allow_shaped_permission(options) if auto_allow else None
+        if auto_allow and selected_auto is None:
+            # Deliberately NOT ``_preferred_permission``: that one falls back
+            # to ``options[0]`` when nothing allow-shaped is offered, which for
+            # a human approval is a reasonable last resort but here would let
+            # us return "allowed" carrying a *reject* option id. With no
+            # allow-shaped option there is no consent to give, so fall through
+            # to the human instead of inventing one.
+            auto_allow = False
+        future: asyncio.Future[PermissionDecision] | None = None
+        if not auto_allow:
+            future = asyncio.get_running_loop().create_future()
+            self._permissions[ref] = (future, options)
         await self._emit(
             HarnessEventType.PERMISSION_REQUESTED,
             turn=self._active,
             data={
                 "permission_ref": str(ref),
+                # Says what actually happened: an auto-allowed request was
+                # never pending, so a reader must not score it as an
+                # unanswered prompt.
+                "auto_allowed": auto_allow,
                 "tool_call_ref": str(getattr(tool_call, "tool_call_id", "")),
                 "label": str(getattr(tool_call, "title", "")),
                 "options": tuple(
@@ -871,6 +902,15 @@ class AcpDriver(Driver):
             },
             native_payload=tool_call,
         )
+        if auto_allow:
+            assert selected_auto is not None
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(
+                    outcome="selected",
+                    option_id=selected_auto.option_id,
+                )
+            )
+        assert future is not None
         decision = await future
         self._permissions.pop(ref, None)
         if decision is PermissionDecision.DENY:
@@ -935,6 +975,23 @@ class AcpDriver(Driver):
     def _require_active(self, turn: TurnRef) -> None:
         if turn != self._active or not self._active.value:
             raise RuntimeError("stale or foreign active turn")
+
+
+def _allow_shaped_permission(
+    options: list[PermissionOption],
+) -> PermissionOption | None:
+    """An option that actually grants, or ``None``.
+
+    Unlike :func:`_preferred_permission` this never falls back to an
+    arbitrary option: a caller that auto-approves must not be handed a
+    ``reject_once`` entry to "allow" with.
+    """
+
+    for kind in ("allow_once", "allow_always"):
+        for option in options:
+            if option.kind == kind:
+                return option
+    return None
 
 
 def _preferred_permission(

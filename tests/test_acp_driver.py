@@ -42,6 +42,13 @@ from puffo_agent.agent.harness.driver import (
     TurnInput,
 )
 from puffo_agent.agent.harness.support.subprocess_io import ProcessTreeShutdownError
+from puffo_agent.agent.harness.runtime.docker_runtime import (
+    _sanitise_permission_mode as _docker_sanitise_permission_mode,
+)
+from puffo_agent.agent.harness.runtime.local_runtime import (
+    VALID_PERMISSION_MODES,
+    _sanitise_permission_mode as _local_sanitise_permission_mode,
+)
 
 
 class _FakeProcess:
@@ -403,7 +410,12 @@ async def test_permission_request_waits_for_typed_driver_resolution():
         harness.process_factory,
         connection_factory=harness.connection_factory,
     )
-    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    # Explicitly non-bypass: RuntimeSpec defaults to "bypassPermissions", so
+    # without this the driver answers on its own and this test would silently
+    # stop covering the human path it exists to pin.
+    await driver.open(
+        RuntimeSpec("/workspace", executable="agent", permission_mode="ask")
+    )
     stream = driver.events()
     await driver.start_turn(TurnInput("hello"))
     permission = asyncio.create_task(harness.client.request_permission(
@@ -807,3 +819,148 @@ async def test_session_calls_receive_the_projected_mcp_servers(
         ("PUFFO_AGENT_ID", "agent_test")
     ]
     await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_answers_without_a_human():
+    """``bypassPermissions`` must not park a tool call on an operator.
+
+    The runtime only ever supplies this mode (VALID_PERMISSION_MODES holds
+    exactly one value), so an unattended agent depends on this path entirely.
+    """
+
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(
+        RuntimeSpec(
+            "/workspace", executable="agent", permission_mode="bypassPermissions"
+        )
+    )
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+    # No resolve_permission() anywhere: if the driver waits, this await times out.
+    response = await asyncio.wait_for(
+        harness.client.request_permission(
+            [
+                PermissionOption(
+                    option_id="deny", name="Deny", kind="reject_once"
+                ),
+                PermissionOption(
+                    option_id="allow", name="Allow once", kind="allow_once"
+                ),
+            ],
+            "acp_session",
+            ToolCallStart(
+                session_update="tool_call", tool_call_id="tool_1", title="shell"
+            ),
+        ),
+        timeout=1,
+    )
+    assert response.outcome.outcome == "selected"
+    assert response.outcome.option_id == "allow"
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.PERMISSION_REQUESTED), timeout=1
+    )
+    # The record must say it was auto-allowed, not look like an unanswered prompt.
+    assert events[-1].data["auto_allowed"] is True
+    # Nothing retained: no pending future, so no cross-request grant exists to
+    # reuse. This is the property that keeps the peer's turn-scoped permission
+    # contract intact.
+    assert driver._permissions == {}
+    harness.conn.prompt_result.set_result(PromptResponse(stop_reason="cancelled"))
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_will_not_allow_with_a_reject_only_option_set():
+    """Auto-approval needs something that actually grants.
+
+    ``_preferred_permission`` falls back to ``options[0]``; reusing it here
+    would return outcome="selected" carrying a *reject* option id -- an
+    "approval" that denies. With nothing allow-shaped on offer the driver must
+    fall back to asking a human.
+    """
+
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(
+        RuntimeSpec(
+            "/workspace", executable="agent", permission_mode="bypassPermissions"
+        )
+    )
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+    pending = asyncio.create_task(
+        harness.client.request_permission(
+            [
+                PermissionOption(
+                    option_id="deny", name="Deny", kind="reject_once"
+                ),
+            ],
+            "acp_session",
+            ToolCallStart(
+                session_update="tool_call", tool_call_id="tool_1", title="shell"
+            ),
+        )
+    )
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.PERMISSION_REQUESTED), timeout=1
+    )
+    assert events[-1].data["auto_allowed"] is False
+    # Still pending on a human rather than silently "allowing" with a denial.
+    assert not pending.done()
+    ref = PermissionRef(str(events[-1].data["permission_ref"]))
+    await driver.resolve_permission(ref, PermissionDecision.DENY)
+    response = await asyncio.wait_for(pending, timeout=1)
+    assert response.outcome.outcome == "cancelled"
+    harness.conn.prompt_result.set_result(PromptResponse(stop_reason="cancelled"))
+    await driver.close()
+
+
+def test_widening_permission_modes_needs_an_operator_answer_path():
+    """Tripwire: nothing in production can currently ask a human.
+
+    Both runtimes coerce every configured ``permission_mode`` to
+    ``bypassPermissions``, and every RuntimeSpec is built from that sanitised
+    value — so the waiting branch of ``_request_permission`` is reachable only
+    from tests. The docstring above
+    (``test_bypass_permissions_answers_without_a_human``) states that as prose;
+    this binds it.
+
+    Widening this set is a one-line change that silently activates the wait.
+    Before doing so, confirm something presents ``turn.permission_requested``
+    to an operator and calls ``runtime.resolve_permission``. Puffo sets no
+    timeout of its own, so without that path every tool call runs out the ACP
+    peer's timeout and is then DENIED.
+    """
+
+    assert VALID_PERMISSION_MODES == frozenset({"bypassPermissions"}), (
+        "permission_mode gained a reachable value, so the ask-a-human branch "
+        "is now live. Verify an operator-facing answer path exists "
+        "(turn.permission_requested -> runtime.resolve_permission) before "
+        "shipping this, or every tool call becomes a timeout-then-deny."
+    )
+
+
+def test_both_runtimes_agree_on_which_permission_modes_exist():
+    """The docker sanitiser hardcodes its own set instead of importing one.
+
+    Two copies of the same guard drift silently: widening the local constant
+    would leave docker still coercing, so the same agent config would ask a
+    human on one runtime and not the other. Compare behaviour, not the
+    literals, so this keeps working if either side is refactored.
+    """
+
+    probes = ["bypassPermissions", "ask", "acceptEdits", "plan", "", "default"]
+    local = {mode: _local_sanitise_permission_mode(mode, "agent") for mode in probes}
+    docker = {mode: _docker_sanitise_permission_mode(mode, "agent") for mode in probes}
+    assert local == docker, (
+        "local_runtime and docker_runtime disagree about permission modes; "
+        "they hold separate copies of the same allow-list."
+    )

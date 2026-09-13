@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 
 import pytest
 
@@ -437,3 +439,242 @@ def test_partial_write_is_cleaned_up(tmp_path, monkeypatch):
     with pytest.raises(KeyError):
         write_agent_from_context(context)
     assert not (tmp_path / "agents/helper-1234").exists()
+
+
+@pytest.mark.asyncio
+async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path, monkeypatch):
+    """Browser-selected folders must survive provision into the driver argv/cwd."""
+    import json
+    import sys
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "existing-lingtai"
+    workspace = tmp_path / "existing-workspace"
+    source.mkdir()
+    workspace.mkdir()
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
+    marker = tmp_path / "cli-args.json"
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text(
+        f"#!{sys.executable}\nimport json,sys\n"
+        f"open({str(marker)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+    )
+    executable.chmod(0o700)
+    payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(workspace), "agent_name": "Helper"},
+    }
+
+    async def materialize(context):
+        assert marker.exists(), "runtime must be provisioned before remote identity materializes"
+
+    await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    cfg = AgentConfig.load("helper-1234")
+    argv = cfg.runtime.harness_command
+    provision_args = json.loads(marker.read_text())
+    assert cfg.resolve_workspace_dir() == workspace
+    assert argv[:4] == [str(executable), "acp", "--profile", "puffo-v1"]
+    for field in ["--runtime-id", "--registry"]:
+        assert argv[argv.index(field) + 1] == provision_args[provision_args.index(field) + 1]
+    assert provision_args[provision_args.index("--agent-dir") + 1] == str(source)
+    assert (source / "init.json").read_text() == '{"manifest":{"agent_name":"Helper"}}'
+
+
+@pytest.mark.asyncio
+async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path, monkeypatch):
+    """An unusable LingTai runtime must not leave a running Puffo agent behind."""
+    import sys
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text(f"#!{sys.executable}\nimport sys\nprint('error: puffo-v0 runtime registry parent directory is owned by another user', file=sys.stderr)\nraise SystemExit(1)\n")
+    executable.chmod(0o700)
+    payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(source), "agent_name": "Helper"},
+    }
+    materialized = []
+
+    async def materialize(context):
+        materialized.append(context)
+
+    with pytest.raises(ProvisionError, match="registry parent directory is owned by another user"):
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert materialized == []
+    assert not (tmp_path / "daemon/agents/helper-1234/agent.yml").exists()
+
+
+@pytest.fixture
+def lingtai_creation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
+    payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": sys.executable, "agent_dir": str(source), "workspace": str(source), "agent_name": "Helper"},
+    }
+    associations = set()
+
+    async def register(launch):
+        associations.add((launch.runtime_id, launch.registry))
+
+    async def revoke(launch):
+        associations.remove((launch.runtime_id, launch.registry))
+
+    monkeypatch.setattr(provision, "provision_lingtai", register)
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    return payload, operator, associations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["materialize", "write"])
+async def test_lingtai_creation_failure_revokes_association(lingtai_creation, monkeypatch, stage):
+    """Either post-registration failure must revoke the same registry entry."""
+    payload, operator, associations = lingtai_creation
+    original = RuntimeError("creation failed")
+
+    async def materialize(context):
+        assert associations
+        if stage == "materialize":
+            raise original
+
+    def write(context):
+        raise original
+
+    monkeypatch.setattr(provision, "write_agent_from_context", write)
+    with pytest.raises(RuntimeError) as caught:
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert caught.value is original
+    assert not associations
+
+
+@pytest.mark.asyncio
+async def test_lingtai_rollback_failure_preserves_original_error(lingtai_creation, monkeypatch, caplog):
+    """Cleanup failure must be logged without replacing the creation error."""
+    payload, operator, _ = lingtai_creation
+    original = RuntimeError("materialize failed")
+
+    async def materialize(context):
+        raise original
+
+    async def revoke(launch):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    with pytest.raises(RuntimeError) as caught:
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert caught.value is original
+    assert "LingTai rollback failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lingtai_repeated_cancellation_finishes_rollback(lingtai_creation, monkeypatch):
+    """A second shutdown cancellation must not interrupt revoke or replace the first."""
+    payload, operator, associations = lingtai_creation
+    materializing = asyncio.Event()
+    revoking = asyncio.Event()
+    release = asyncio.Event()
+
+    async def materialize(context):
+        materializing.set()
+        await asyncio.Event().wait()
+
+    async def revoke(launch):
+        revoking.set()
+        await release.wait()
+        associations.remove((launch.runtime_id, launch.registry))
+
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    task = asyncio.create_task(provision_agent_from_bundle(payload, operator, materialize=materialize))
+    await asyncio.wait_for(materializing.wait(), 2)
+    task.cancel("first cancellation")
+    await asyncio.wait_for(revoking.wait(), 2)
+    task.cancel("second cancellation")
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert not associations
+    assert caught.value.args == ("first cancellation",)
+
+
+@pytest.mark.parametrize("change", ["display_name", "role", "soul", "profile", "source", "missing_source"])
+def test_lingtai_import_rejects_source_profile_drift_before_creation(lingtai_creation, change):
+    """A stale browser choice or persona payload must never materialize identity."""
+    from pathlib import Path
+
+    payload, operator, associations = lingtai_creation
+    if change in ("source", "missing_source"):
+        source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+        (source / "init.json").write_text('{"manifest":{"agent_name":"Changed"}}' if change == "source" else "{}")
+    else:
+        payload[change] = "Override"
+    with pytest.raises(ProvisionError, match="LingTai"):
+        verify_agent_bundle(payload, operator)
+    assert not associations
+
+
+@pytest.mark.asyncio
+async def test_lingtai_source_drift_during_preflight_cannot_register(lingtai_creation):
+    """An async preflight must not turn source validation into a stale snapshot."""
+    from pathlib import Path
+
+    payload, operator, associations = lingtai_creation
+    async def preflight(context):
+        source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+        (source / "init.json").write_text('{"manifest":{"agent_name":"Changed"}}')
+    with pytest.raises(ProvisionError, match="source name changed"):
+        await provision_agent_from_bundle(payload, operator, preflight=preflight)
+    assert not associations
+
+
+@pytest.mark.parametrize("name", [None, ""])
+def test_unnamed_lingtai_import_preserves_empty_profile_without_name(lingtai_creation, name):
+    """Unnamed sources persist empty facts, with no invented name or slug fallback."""
+    import json
+    from pathlib import Path
+
+    payload, operator, _ = lingtai_creation
+    source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+    (source / ".agent.json").write_text(json.dumps({"agent_name": name}))
+    payload["runtime"]["lingtai"]["agent_name"] = None
+    payload.update(display_name="", profile="")
+    context = verify_agent_bundle(payload, operator)
+    assert context["display_name"] == ""
+    assert context["profile_text"] == ""
+    write_agent_from_context(context)
+    cfg = AgentConfig.load(context["agent_id"])
+    assert cfg.display_name == ""
+    assert cfg.resolve_profile_path().read_text() == ""
+    payload.update(display_name="Helper", profile="# Helper\n")
+    with pytest.raises(ProvisionError, match="source name changed"):
+        verify_agent_bundle(payload, operator)
+
+
+@pytest.mark.parametrize("selection", ["missing", "named-placeholder", "unnamed-to-named"])
+def test_lingtai_import_requires_exact_nullable_name_snapshot(lingtai_creation, selection):
+    """Placeholder display equality must not mask named/unnamed source drift."""
+    from pathlib import Path
+
+    payload, operator, _ = lingtai_creation
+    source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+    if selection == "missing":
+        del payload["runtime"]["lingtai"]["agent_name"]
+    else:
+        payload.update(display_name="Unnamed Agent", profile="# Unnamed Agent\n")
+        selected_name = "Unnamed Agent" if selection == "named-placeholder" else None
+        payload["runtime"]["lingtai"]["agent_name"] = selected_name
+        (source / ".agent.json").write_text(
+            '{"agent_name":null}' if selected_name else '{"agent_name":"Unnamed Agent"}'
+        )
+    with pytest.raises(ProvisionError, match="source name changed"):
+        verify_agent_bundle(payload, operator)
