@@ -436,6 +436,13 @@ class StandardWorkerRun:
         worker._pending_activity = None
 
         async def emit_activity(activity: str | None) -> None:
+            # The desktop list reads the local snapshot, including during
+            # warm-up before the server reporter is attached.
+            worker.runtime.activity = activity
+            try:
+                worker.runtime.save(agent_id)
+            except OSError:
+                logger.warning("agent %s: activity snapshot write failed", agent_id, exc_info=True)
             # The overlay flips synchronously (event order preserved);
             # the heartbeat push runs detached because this callback
             # fires under the runtime command lock and a slow status
@@ -1100,6 +1107,7 @@ class StandardWorkerRun:
             except (asyncio.CancelledError, Exception):
                 pass
         worker.runtime.status = "stopped"
+        worker.runtime.activity = None
         worker.runtime.save(context.paths.agent_id)
         if context.runtime_event_outbox is not None:
             # The Runtime Manager's reader is what feeds this outbox, so it has
