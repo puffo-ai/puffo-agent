@@ -353,3 +353,44 @@ def test_simultaneous_discovery_shares_one_probe(monkeypatch):
         release.set()
         assert first.result() == other.result() == (OpenCodeModel("a/b"),)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("relative", [
+    "config/opencode/config.json", "config/opencode/config",
+    "config/opencode/opencode.jsonc", "project/.opencode/opencode.json",
+    "project/.opencode/opencode.jsonc", "home/.opencode/opencode.json",
+    "managed/opencode.json", "managed/opencode.jsonc", "custom.json",
+    "custom-dir/opencode.jsonc",
+])
+def test_discovery_invalidates_native_config_create_edit_delete(monkeypatch, tmp_path, relative):
+    """Native config edits must not leave readiness on the pre-edit model set."""
+    from puffo_agent.agent import opencode_auth as auth
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(auth, "_discovery_cache", {})
+    monkeypatch.setattr(auth, "build_child_environment", lambda: {
+        "HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "OPENCODE_TEST_MANAGED_CONFIG_DIR": str(tmp_path / "managed"),
+        "OPENCODE_CONFIG": str(tmp_path / "custom.json"),
+        "OPENCODE_CONFIG_DIR": str(tmp_path / "custom-dir"),
+    })
+    path = tmp_path / relative
+    calls = []
+
+    def probe(command, **kwargs):
+        calls.append(command)
+        model = path.read_text() if path.exists() else "a/missing"
+        return _completed(code=0, stdout=model + "\n")
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    assert auth.discover_opencode_models("test") == (OpenCodeModel("a/missing"),)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for value in ("a/created", "a/edited-longer"):
+        path.write_text(value)
+        assert auth.discover_opencode_models("test") == (OpenCodeModel(value),)
+    path.unlink()
+    assert auth.discover_opencode_models("test") == (OpenCodeModel("a/missing"),)
+    assert len(calls) == 4

@@ -750,3 +750,127 @@ async def test_turn_reclaims_native_temp_files_after_child_stops(tmp_path, outco
         assert directories and all(not path.exists() for path in directories)
     finally:
         await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["turn", "context", "serve"])
+@pytest.mark.parametrize("failure", [OSError, asyncio.TimeoutError, asyncio.CancelledError])
+async def test_failed_shutdown_preserves_child_files_until_retry(
+    monkeypatch, tmp_path, operation, failure,
+):
+    """An interrupted shutdown must not free live-child storage or allow reuse."""
+    from pathlib import Path
+    from puffo_agent.agent.harness.drivers import opencode
+
+    proc = _TurnProcess()
+    entered = asyncio.Event()
+    directories = []
+
+    def factory(command, spec):
+        directory = Path(dict(spec.environment)["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").write_bytes(b"library")
+        entered.set()
+        return proc
+
+    async def create(*args, **kwargs):
+        return factory(args, RuntimeSpec(str(tmp_path), environment=kwargs["env"]))
+
+    async def communicate():
+        await asyncio.Event().wait()
+
+    async def cannot_stop(*args, **kwargs):
+        raise failure("shutdown interrupted")
+
+    proc.communicate = communicate
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(opencode, "shutdown_process_tree", cannot_stop)
+    driver = OpenCodeDriver(factory)
+    spec = RuntimeSpec(str(tmp_path), executable="opencode")
+    await driver.open(spec)
+    if operation == "turn":
+        work = driver.start_turn(TurnInput("hello"))
+    elif operation == "context":
+        work = driver._resolve_context_window(spec)
+    else:
+        work = driver._summarize_via_serve(spec, "session")
+    task = asyncio.create_task(work)
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(BaseException):
+        await task
+    driver._cleanup_child_temps()
+    assert proc.returncode is None
+    assert (directories[0] / "native.so").exists()
+    with pytest.raises(RuntimeError, match="still running"):
+        await driver._spawn(spec, "second")
+    assert len(directories) == 1
+    with pytest.raises(BaseException):
+        await driver.close()
+    assert (directories[0] / "native.so").exists()
+
+    async def stop(child, **kwargs):
+        if child is not None:
+            child.exit()
+            child.eof()
+        waiter = kwargs.get("waiter")
+        if waiter is not None:
+            await waiter
+
+    monkeypatch.setattr(opencode, "shutdown_process_tree", stop)
+    await driver.close()
+    assert proc.returncode is not None
+    assert not directories[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["context", "serve"])
+async def test_second_cancel_during_shutdown_keeps_files_for_close(monkeypatch, tmp_path, operation):
+    """A second cancellation during the shutdown await cannot free a live child."""
+    from pathlib import Path
+    from puffo_agent.agent.harness.drivers import opencode
+
+    proc = _TurnProcess()
+    started, stopping = asyncio.Event(), asyncio.Event()
+    directories = []
+
+    async def create(*args, **kwargs):
+        directory = Path(kwargs["env"]["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").touch()
+        started.set()
+        return proc
+
+    async def communicate():
+        await asyncio.Event().wait()
+
+    async def slow_stop(*args, **kwargs):
+        stopping.set()
+        await asyncio.Event().wait()
+
+    proc.communicate = communicate
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(opencode, "shutdown_process_tree", slow_stop)
+    driver = OpenCodeDriver()
+    spec = RuntimeSpec(str(tmp_path), executable="opencode")
+    work = (driver._resolve_context_window(spec) if operation == "context"
+            else driver._summarize_via_serve(spec, "session"))
+    task = asyncio.create_task(work)
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    await asyncio.wait_for(stopping.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.returncode is None
+    assert (directories[0] / "native.so").exists()
+
+    async def stop(child, **kwargs):
+        if child is not None:
+            child.exit()
+            child.eof()
+
+    monkeypatch.setattr(opencode, "shutdown_process_tree", stop)
+    await driver.close()
+    assert proc.returncode is not None
+    assert not directories[0].exists()

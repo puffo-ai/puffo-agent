@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -232,8 +233,32 @@ def _discovery_files(environment: dict[str, str], executable: str) -> tuple:
     home = Path(environment.get("HOME") or environment.get("USERPROFILE") or Path.home())
     data = Path(environment.get("XDG_DATA_HOME") or home / ".local/share")
     config = Path(environment.get("XDG_CONFIG_HOME") or home / ".config")
-    paths = [Path(executable), data / "opencode/auth.json"]
-    for root in (config / "opencode", *Path.cwd().parents, Path.cwd()):
+    global_config = config / "opencode"
+    paths = [Path(executable), data / "opencode/auth.json",
+             global_config / "config.json", global_config / "config"]
+    roots = [global_config, Path(environment.get("OPENCODE_TEST_HOME") or home) / ".opencode"]
+    for root in (*Path.cwd().parents, Path.cwd()):
+        roots.extend((root, root / ".opencode"))
+    # Native v1.3.17 config/config.ts and config/paths.ts. Only forwarded
+    # child variables participate; parent-only overrides have no effect.
+    if environment.get("OPENCODE_CONFIG"):
+        paths.append(Path(environment["OPENCODE_CONFIG"]))
+    if environment.get("OPENCODE_CONFIG_DIR"):
+        roots.append(Path(environment["OPENCODE_CONFIG_DIR"]))
+    if sys.platform == "darwin":
+        import pwd
+
+        managed = Path("/Library/Application Support/opencode")
+        preferences = Path("/Library/Managed Preferences")
+        username = pwd.getpwuid(os.getuid()).pw_name
+        paths.extend(root / "ai.opencode.managed.plist"
+                     for root in (preferences, preferences / username))
+    elif sys.platform == "win32":
+        managed = Path(environment.get("ProgramData") or "C:\\ProgramData") / "opencode"
+    else:
+        managed = Path("/etc/opencode")
+    roots.append(Path(environment.get("OPENCODE_TEST_MANAGED_CONFIG_DIR") or managed))
+    for root in roots:
         paths.extend(root / name for name in ("opencode.json", "opencode.jsonc"))
     stamps = []
     for path in paths:
@@ -255,10 +280,10 @@ def discover_opencode_models(executable: str) -> tuple[OpenCodeModel, ...]:
     """
     environment = build_child_environment()
     key = (executable, os.getcwd(), tuple(sorted(environment.items())))
-    files = _discovery_files(environment, executable)
     # ponytail: serialize these short probes, including cache misses, so a
     # heartbeat and UI refresh cannot launch duplicate CLI processes.
     with _discovery_lock:
+        files = _discovery_files(environment, executable)
         now = time.monotonic()
         cached = _discovery_cache.get(key)
         if cached is None or cached.expires <= now or cached.files != files:
