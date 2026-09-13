@@ -246,6 +246,33 @@ def test_source_replacement_during_open_is_rejected(tmp_path, monkeypatch):
         lingtai_profile._read_source_object(path)
 
 
+@pytest.mark.parametrize("after_open", [False, True])
+def test_disappearing_primary_never_imports_stale_init(tmp_path, monkeypatch, after_open):
+    """Once observed, a primary source disappearing is an error, not absence."""
+    from types import SimpleNamespace
+    from puffo_agent.portal.control import lingtai_profile
+
+    primary = tmp_path / ".agent.json"
+    primary.write_text('{"agent_name":"Current"}')
+    (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale"}}')
+    def disappearing_open(path, flags):
+        if path != primary:
+            return os.open(path, flags)
+        if after_open:
+            fd = os.open(path, flags)
+            primary.unlink()
+            return fd
+        primary.unlink()
+        return os.open(path, flags)
+    monkeypatch.setattr(lingtai_profile, "os", SimpleNamespace(
+        **{**vars(os), "open": disappearing_open},
+    ))
+    profile = lingtai_profile.read_source_profile(tmp_path)
+    assert profile.profile_read_error == "source_unreadable"
+    assert profile.import_display_name is None
+    assert profile.name_source_file == ".agent.json"
+
+
 def test_agent_metadata_symlink_is_not_a_fallback(tmp_path):
     """Unsafe source indirection must not import a different identity or use init fallback."""
     (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')

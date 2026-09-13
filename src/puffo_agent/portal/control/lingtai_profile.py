@@ -31,15 +31,19 @@ def _read_source_object(path: Path) -> dict:
     flags = os.O_RDONLY
     for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
         flags |= getattr(os, name, 0)
-    fd = os.open(path, flags)
-    with os.fdopen(fd, "rb") as stream:
-        current = os.fstat(stream.fileno())
-        after = os.lstat(path)
-        if any(not stat.S_ISREG(item.st_mode)
-               or (item.st_dev, item.st_ino) != (before.st_dev, before.st_ino)
-               for item in (current, after)):
-            raise ValueError("source metadata changed while opening")
-        data = stream.read(_MAX_INIT_BYTES + 1)
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as stream:
+            current = os.fstat(stream.fileno())
+            after = os.lstat(path)
+            if any(not stat.S_ISREG(item.st_mode)
+                   or (item.st_dev, item.st_ino) != (before.st_dev, before.st_ino)
+                   for item in (current, after)):
+                raise ValueError("source metadata changed while opening")
+            data = stream.read(_MAX_INIT_BYTES + 1)
+    except FileNotFoundError as exc:
+        # Only absence at the initial check permits the legacy manifest fallback.
+        raise ValueError("source metadata disappeared while opening") from exc
     if len(data) > _MAX_INIT_BYTES:
         raise ValueError("source metadata exceeds the size limit")
     document = json.loads(data)
