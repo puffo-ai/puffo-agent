@@ -363,10 +363,35 @@ def test_propagate_outcome_refreshed_resets_counter(tmp_path, monkeypatch):
     assert r._consecutive_non_success == 0
 
 
-def test_propagate_outcome_unchanged_increments_counter(tmp_path, monkeypatch):
-    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
-    assert r._consecutive_non_success == 1
+@pytest.mark.parametrize("expires_in", [3600, 60, -60])
+def test_unchanged_probe_does_not_mark_refresh_broken(tmp_path, monkeypatch, expires_in):
+    """A successful probe without token rotation must not lock out agents (#232)."""
+    from puffo_agent.portal.state import RuntimeState
+
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    _write_creds(tmp_path / "host", expires_in_seconds=expires_in)
+    reloads = []
+    r.register_on_refresh_success(lambda: reloads.append(True))
+
+    async def probe(*args, **kwargs):
+        class Process:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", probe)
+
+    async def poll():
+        for _ in range(REFRESH_BROKEN_THRESHOLD + 1):
+            await r._tick(triggered_by_agent=True)
+
+    asyncio.run(poll())
+    assert RuntimeState.load(aid).health == "unknown"
+    assert r._consecutive_non_success == 0
+    assert reloads == []
 
 
 def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
@@ -379,13 +404,13 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch,
     from puffo_agent.portal.state import RuntimeState
     import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health != "refresh_broken"
     assert REFRESH_BROKEN_THRESHOLD == 2
     with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
@@ -393,7 +418,7 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch,
     assert "claude auth login" in rs.error
     # Outcome-class debug stays in the daemon log, not in runtime.error.
     assert any(
-        "flipping refresh_broken" in rec.getMessage() and "unchanged" in rec.getMessage()
+        "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
         for rec in caplog.records
     )
 
@@ -402,7 +427,7 @@ def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
     assert RuntimeState.load(aid).health == "refresh_broken"
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     rs = RuntimeState.load(aid)
@@ -434,7 +459,7 @@ def test_refresh_broken_does_not_overwrite_auth_failed(tmp_path, monkeypatch):
     rs.error = "401 from a real turn"
     rs.save(aid)
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "auth_failed"
@@ -544,7 +569,7 @@ def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
     r.register_agent(agent_home_dir("agent-beta"))
 
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
 
     assert RuntimeState.load("agent-alpha").health == "refresh_broken"
     assert RuntimeState.load("agent-beta").health == "refresh_broken"
@@ -553,8 +578,8 @@ def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
 def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch):
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
     rs_after_flip = RuntimeState.load(aid)
     assert rs_after_flip.health == "refresh_broken"
     initial_error = rs_after_flip.error
@@ -562,7 +587,7 @@ def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch)
     # already-refresh_broken agent's disk state must not be re-written
     # (avoids log spam + redundant disk writes once flipped).
     r._propagate_outcome(RefreshOutcome.FAILED)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
     r._propagate_outcome(RefreshOutcome.FAILED)
     rs_later = RuntimeState.load(aid)
     assert rs_later.health == "refresh_broken"
@@ -586,7 +611,7 @@ def test_refresh_broken_does_not_touch_unregistered_agents(tmp_path, monkeypatch
     r.unregister_agent(agent_home_dir("agent-leaves"))
 
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
 
     assert RuntimeState.load("agent-stays").health == "refresh_broken"
     assert RuntimeState.load("agent-leaves").health != "refresh_broken"
@@ -609,22 +634,38 @@ def test_refreshed_outcome_does_not_lift_unrelated_health_to_ok(
     assert rs_after.error == ""
 
 
-def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch, caplog):
+def test_unchanged_preserves_real_failures(tmp_path, monkeypatch):
+    """No rotation must not hide real failures on either side of the probe."""
     from puffo_agent.portal.state import RuntimeState
-    import logging
+
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
-        r._propagate_outcome(RefreshOutcome.UNCHANGED)
-        r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    assert r._consecutive_non_success == 1
+    assert RuntimeState.load(aid).health == "unknown"
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    assert r._consecutive_non_success == REFRESH_BROKEN_THRESHOLD
+    assert RuntimeState.load(aid).health == "refresh_broken"
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    assert r._consecutive_non_success == REFRESH_BROKEN_THRESHOLD
+    assert RuntimeState.load(aid).health == "refresh_broken"
+
+
+@pytest.mark.parametrize("health", ["auth_failed", "refresh_broken"])
+def test_unchanged_does_not_clear_persisted_health(tmp_path, monkeypatch, health):
+    """An unchanged probe after restart is not evidence of credential recovery."""
+    from puffo_agent.portal.state import RuntimeState
+
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     rs = RuntimeState.load(aid)
-    assert rs.health == "refresh_broken"
-    assert "Claude Code sign-in couldn't be refreshed" in rs.error
-    assert "claude auth login" in rs.error
-    # Latest-outcome class is logged, not written into runtime.error.
-    assert any(
-        "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
-        for rec in caplog.records
-    )
+    rs.health = health
+    rs.error = "existing failure"
+    rs.save(aid)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    rs = RuntimeState.load(aid)
+    assert rs.health == health
+    assert rs.error == "existing failure"
+    assert r._consecutive_non_success == 0
 
 
 # ── PUF-265 v2: Haiku probe model + rate-limit fast retry ────────────

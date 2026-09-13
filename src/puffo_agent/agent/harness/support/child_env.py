@@ -62,6 +62,10 @@ PROVIDER_CREDENTIAL_ENV_NAMES = frozenset({
     "PERPLEXITY_API_KEY", "COHERE_API_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
     "GH_TOKEN", "GITHUB_TOKEN",
+    # Subscription-plan credentials. Listed here for the same reason as the
+    # API keys above: ambient inheritance and env_overrides must not be able
+    # to smuggle one in, so only ``controlled`` can set them.
+    "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_SUBSCRIPTION_AUTH_JSON",
 })
 
 

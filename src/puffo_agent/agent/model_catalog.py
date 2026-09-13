@@ -472,13 +472,13 @@ def _opencode_models(*, fetch: bool) -> tuple[ModelOption, ...]:
     if cached is not None or not fetch:
         return cached if cached is not None else _stale_models("opencode")
     from .cli_bin import resolve_opencode_bin
-    from .opencode_auth import OpenCodeProbeError, list_opencode_model_catalog
+    from .opencode_auth import OpenCodeProbeError, discover_opencode_models
 
     executable = resolve_opencode_bin()
     if not executable:
         return _store_models("opencode", ())
     try:
-        models = list_opencode_model_catalog(executable)
+        models = discover_opencode_models(executable)
     except OpenCodeProbeError:
         return _stale_models("opencode")
     from ..mcp.config import OPENCODE_INFERENCE_LEVELS

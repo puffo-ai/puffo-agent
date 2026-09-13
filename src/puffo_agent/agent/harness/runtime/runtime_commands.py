@@ -135,6 +135,12 @@ def _allowed_fields(context: _CommandContext) -> tuple[set[str], str, str]:
     permission = (
         "runtime.resolve_permission" if context.cloud_wire else "resolve_permission"
     )
+    prefix = "runtime." if context.cloud_wire else ""
+    if context.wire_op in {prefix + name for name in ("inspect_recovery", "stop_recovery", "retry_recovery")}:
+        extra = {"turn_ref"}
+        if context.wire_op == prefix + "retry_recovery":
+            extra.add("acknowledge_unknown_effects")
+        return common | extra, cancel, permission
     if context.wire_op == cancel:
         return common | {"turn_ref"}, cancel, permission
     if context.wire_op == permission:
@@ -172,7 +178,11 @@ def _validation_failure(context: _CommandContext) -> CommandResult | None:
         return _failure("foreign_operator")
     if context.agent_id != context.expected_agent_id:
         return _failure("foreign_agent")
-    if context.wire_op not in {cancel, permission}:
+    prefix = "runtime." if context.cloud_wire else ""
+    recovery_ops = {prefix + name for name in ("inspect_recovery", "stop_recovery", "retry_recovery")}
+    if context.wire_op == prefix + "retry_recovery" and context.command.get("acknowledge_unknown_effects") is not True:
+        return _failure("invalid_decision")
+    if context.wire_op not in {cancel, permission} | recovery_ops:
         return _failure("unsupported_operation")
     return None
 
@@ -208,6 +218,15 @@ async def _deliver_command(context: _CommandContext) -> CommandResult:
     manager = get_runtime_manager(context.manager_agent_id)
     if manager is None:
         return _failure("runtime_unavailable")
+    if op in {"inspect_recovery", "stop_recovery", "retry_recovery"}:
+        try:
+            return await manager.recover_turn(
+                session_ref=context.session_ref,
+                turn_ref=_required_text(context.command, "turn_ref"),
+                action=op.removesuffix("_recovery"),
+            )
+        except (RuntimeStateError, ValueError, OSError) as exc:
+            return {**_failure("recovery_refused"), "diagnostic": str(exc)}
     if context.session_ref != str(manager.session_ref):
         return _failure("stale_session_ref")
     turn_text, active_missing = _turn_text(context, manager, op)

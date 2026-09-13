@@ -21,7 +21,7 @@ def failure_outcome(exc: Exception) -> str:
         # plan_drained only — quota_exhausted includes per-model limits
         return (
             "drained"
-            if exc.error_code == "plan_drained"
+            if exc.error_code in ("plan_drained", "budget_exceeded")
             else "provider_failed"
         )
     return "failed"

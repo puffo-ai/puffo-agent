@@ -616,6 +616,16 @@ def _resolve_codex_bin() -> str | None:
 # KeychainBackend — macOS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _keychain_login_home() -> Path:
+    """Resolve the account owning Keychain without consulting daemon HOME."""
+    try:
+        import pwd  # macOS-only backend; keep platform-agnostic imports usable.
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError) as exc:
+        # Falling back to HOME would let sibling daemons use different locks.
+        raise RuntimeError("cannot resolve Keychain login home") from exc
+
+
 class KeychainBackend:
     """macOS backend. The Keychain is the canonical store; the daemon
     maintains a cache file and propagates rotations to every running
@@ -656,7 +666,7 @@ class KeychainBackend:
     def refresh_lock_path(self) -> Path:
         # Anchor outside PUFFO_AGENT_HOME so production and staging daemons
         # coordinate access to the same login Keychain credential.
-        return Path.home() / ".claude" / ".puffo-refresh.lock"
+        return _keychain_login_home() / ".claude" / ".puffo-refresh.lock"
 
     def expires_in_seconds(self) -> int | None:
         """Cache → Keychain → disk file. The disk fallthrough handles
@@ -691,7 +701,7 @@ class KeychainBackend:
                 return secs
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-        disk_blob = _read_disk_credentials_blob(Path.home())
+        disk_blob = _read_disk_credentials_blob(_keychain_login_home())
         if disk_blob is not None:
             logger.warning(
                 "keychain-backend expires_in read: falling through to disk "
@@ -708,7 +718,7 @@ class KeychainBackend:
                 "nor disk file readable",
                 kr.error if not kr.ok else "unparseable-blob",
             )
-        secs = _disk_expires_in_seconds(Path.home())
+        secs = _disk_expires_in_seconds(_keychain_login_home())
         if secs is not None:
             logger.debug(
                 "keychain-backend expires_in read: source=disk secs=%d", secs,
@@ -717,7 +727,7 @@ class KeychainBackend:
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
-        host_home = Path.home()
+        host_home = _keychain_login_home()
         kr_before = read_keychain_blob()
         before_blob = kr_before.blob if kr_before.ok else None
         disk_before = _read_disk_credentials_blob(host_home)
@@ -824,7 +834,7 @@ class KeychainBackend:
         the target already matches, so fan-out from concurrent
         ``ensure_fresh`` callers stays cheap."""
         cache_blob = self.cache.read()
-        blob = cache_blob or _read_disk_credentials_blob(Path.home())
+        blob = cache_blob or _read_disk_credentials_blob(_keychain_login_home())
         if not blob:
             return False
         if cache_blob is None:
@@ -892,7 +902,7 @@ class KeychainBackend:
         # Keychain bootstrap failed — fall through to disk file so the
         # daemon can still serve agents on hosts where Claude Code's
         # Keychain write silently fails (launchd session-context).
-        disk_blob = _read_disk_credentials_blob(Path.home())
+        disk_blob = _read_disk_credentials_blob(_keychain_login_home())
         if disk_blob is None:
             logger.warning(
                 "keychain-backend bootstrap: no Keychain (%s) and no "
@@ -920,7 +930,7 @@ class KeychainBackend:
         kr = read_keychain_blob()
         blob: Optional[str] = kr.blob if kr.ok and kr.blob else None
         if blob is None:
-            blob = _read_disk_credentials_blob(Path.home())
+            blob = _read_disk_credentials_blob(_keychain_login_home())
         if blob is None:
             logger.debug(
                 "keychain poll: neither Keychain (%s) nor disk file "
@@ -1286,6 +1296,11 @@ class CredentialRefresher:
         self._propagate_outcome(outcome)
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
+        if outcome is RefreshOutcome.UNCHANGED:
+            # No rotation is not a failed refresh, but it does not prove
+            # recovery either. Preserve real failures and existing health;
+            # ensure_fresh still checks expiry before allowing delivery.
+            return
         if outcome is RefreshOutcome.REFRESHED:
             if self._consecutive_non_success > 0:
                 logger.info(

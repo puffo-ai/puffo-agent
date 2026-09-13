@@ -94,22 +94,28 @@ def test_cleanup_reader_rejects_malformed_protocol_marker():
         cleanup_errors(failure)
 
 
-def test_cancellation_separates_suppressed_primary_from_cleanup_failure():
-    primary = ValueError("business failure")
+@pytest.mark.parametrize("label, earlier", [
+    ("cancelled operation", ValueError("business failure")),
+    ("ACP driver close failed", RuntimeError("connection cleanup failure")),
+])
+def test_cancellation_preserves_earlier_failure_without_assuming_its_role(label, earlier):
+    # Close-only callers have no primary operation: ordering cannot imply one.
     cancellation = asyncio.CancelledError()
     cleanup = RuntimeError("cleanup failure")
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
         raise_collected_errors(
-            "cancelled cleanup", [primary, cancellation, cleanup]
+            label, [earlier, cancellation, cleanup]
         )
 
-    assert suppressed_primary_errors(exc_info.value) == (primary,)
+    assert exc_info.value is cancellation
+    assert suppressed_primary_errors(exc_info.value) == (earlier,)
     assert cleanup_errors(exc_info.value) == (cleanup,)
     assert any(
-        "primary failure suppressed by cancellation" in note
+        "failure suppressed by cancellation" in note
         for note in exc_info.value.__notes__
     )
+    assert all("primary failure" not in note for note in exc_info.value.__notes__)
 
 
 @pytest.mark.asyncio

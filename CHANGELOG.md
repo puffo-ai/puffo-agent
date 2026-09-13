@@ -6,6 +6,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.5a1] - 2026-09-12
+
+TestPyPI preview; native Windows and real-container acceptance remain pending.
+This release does not include the proposed inline-subagent feature (#199),
+Monid tools (#323/#350), or the pending login/archive/seed contract changes.
+
+### Fixed
+
+- Normalize Windows Codex/Pi CLI launches and suppress console windows in
+  background probes. Restricted Windows Job detachment (#292) remains open.
+- Preflight Pi/OpenCode against the running daemon's actual default model
+  when creation omits an explicit model (#305).
+- Supervise autonomous-turn recovery and preserve quarantine across late
+  events and concurrent start attempts.
+- Recognize Claude Code 2.1.x API-error frames, preserve budget failure codes,
+  and back off repeated no-progress turns from 5 to 300 seconds (#335/#345).
+- Mount the Docker package directory rather than site-packages, and validate
+  imports before accepting the container layout (#318).
+- Preserve credential health on unchanged probes (#232/#245), anchor macOS
+  Keychain refresh paths to the login account (#343), and avoid describing
+  cleanup-only errors as primary failures (#300).
+
+### Added
+
+- **Sticky-note tools for threads.** Agents can post and read `/note` status
+  markers — `add_note` puts a Waiting / Processing / Complete (or custom
+  color+label) pill on a thread, `get_channel_notes` scans each thread's
+  active note across a channel, and `get_thread_notes` reads one thread's
+  note history. Multi-line note bodies survive the round trip with the web
+  client's pill format, including blank lines and prose colons. A managed
+  `use-puffo-notes` skill teaches the preset protocol.
+
 ## [2.0.4] - 2026-09-09
 
 The first PyPI release since `2.0.3`; 103 commits. The `2.0.4a1` pre-release

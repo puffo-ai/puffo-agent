@@ -192,3 +192,19 @@ async def test_daemon_authored_dms_always_use_the_e2ee_endpoint(monkeypatch):
     monkeypatch.setattr(om, "decode_secret", lambda _v: b"")
     assert await _daemon_dm_path() == "/messages"
     assert await _dm_gate_prompt_send() == ("operator-1", "")
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_forwards():
+    client, store, _ = _make_client()
+    store.get_channel_notes = AsyncMock(return_value=[])
+    assert await client.get_channel_notes("ch_42", limit=7) == []
+    store.get_channel_notes.assert_awaited_once_with("ch_42", limit=7)
+
+
+@pytest.mark.asyncio
+async def test_get_thread_notes_forwards():
+    client, store, _ = _make_client()
+    store.get_thread_notes = AsyncMock(return_value=[])
+    assert await client.get_thread_notes("msg_root", limit=3) == []
+    store.get_thread_notes.assert_awaited_once_with("msg_root", limit=3)

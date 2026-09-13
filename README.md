@@ -89,20 +89,16 @@ Python package is allowed. Use the equivalent module entry point in that case:
 
 ```powershell
 python -m puffo_agent start --background
-# or, without the GUI/tray dependency:
+# or, without launching the GUI/tray:
 python -m puffo_agent start --detach
 ```
 
 App Control is enforced before Puffo code starts, so administrators may also
 need to allow the generated launcher under the machine's policy.
 
-The base install supports both foreground and detached headless daemon modes.
-Install the GUI extra before using the desktop window or tray-backed mode:
-
-```bash
-uv tool install --force 'puffo-agent[gui]'
-# or: pip install 'puffo-agent[gui]'
-```
+The standard install includes desktop window and tray support as well as
+foreground and detached headless daemon modes. No extra installation option
+is needed. Headless modes do not initialize Qt.
 
 For contributors working from a source checkout:
 
@@ -120,7 +116,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--detach` runs headless in the background; `--ui` and tray-backed `--background` require the `[gui]` extra. |
+| `puffo-agent start` | Run the daemon (foreground). `--detach` runs headless in the background; `--ui` and tray-backed `--background` use the included desktop support. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |

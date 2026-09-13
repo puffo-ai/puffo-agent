@@ -136,6 +136,10 @@ class ClaudeCodeCliDriver(Driver):
         self._message_lifecycle_v1 = False
         self._owned_commands: set[str] = set()
         self._terminal_commands: set[str] = set()
+        self._active_assistant_ids: set[tuple[str, str]] = set()
+        # Keep completed identities across process reopen/resume. UUIDs are
+        # scoped to the native session, not to a local driver turn reference.
+        self._completed_assistant_ids: set[tuple[str, str]] = set()
         self._gated_command_id = ""
         self._gated_ack: asyncio.Future[_InputAckOutcome] | None = None
         self._result_input_tokens = 0
@@ -552,6 +556,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
 
     def _reset_turn_tracking(self, primary_command_id: str = "") -> None:
+        self._active_assistant_ids.clear()
         self._settle_gated_ack(_InputAckOutcome.REJECTED)
         self._gated_command_id = ""
         self._active_provider_error = None
@@ -781,6 +786,12 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _handle_assistant(self, frame: dict[str, Any]) -> None:
+        frame_uuid = str(frame.get("uuid") or "")
+        if frame_uuid:
+            identity = (self._native_session_id, frame_uuid)
+            if identity in self._completed_assistant_ids:
+                return
+            self._active_assistant_ids.add(identity)
         if not self._active.value:
             # No daemon-started turn is open, yet the CLI is producing
             # assistant output: a background task woke the model after the
@@ -933,6 +944,11 @@ class ClaudeCodeCliDriver(Driver):
             usage.get("cache_read_input_tokens") or 0
         )
         self._last_result_payload = frame
+        # 2.1.x reports an API failure as `subtype: success` + `is_error: true`
+        # with the provider text in `result` and the status in
+        # `api_error_status`; without this the turn counts as a clean success.
+        if frame.get("is_error") is True and self._active_provider_error is None:
+            self._active_provider_error = _result_provider_error(frame)
         if subtype not in {"success", ""}:
             if not self._result_error_code:
                 self._result_error_code = _result_error_code(frame, subtype)
@@ -948,6 +964,7 @@ class ClaudeCodeCliDriver(Driver):
         await self._finish_turn(self._last_result_payload or native_payload)
 
     async def _finish_turn(self, native_payload: dict[str, Any]) -> None:
+        self._completed_assistant_ids.update(self._active_assistant_ids)
         outcome = "failed" if self._result_error_code else "succeeded"
         data: dict[str, Any] = {
             "outcome": outcome,
@@ -1085,6 +1102,32 @@ def _result_error_code(frame: dict[str, Any], subtype: str) -> str:
     return normalized or "execution_error"
 
 
+def _result_provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a ``result`` frame that carries ``is_error: true``."""
+    raw_status = frame.get("api_error_status", frame.get("apiErrorStatus"))
+    status = raw_status if type(raw_status) is int else None
+    if (
+        frame.get("subtype") not in {None, "", "success"}
+        and status is None
+        and frame.get("terminal_reason") != "api_error"
+    ):
+        # CLI errors such as invalid_resume also set is_error. Preserve their
+        # existing recovery codes unless the frame identifies an API failure.
+        return None
+    errors = frame.get("errors")
+    fragments = [
+        str(frame.get("result") or ""),
+        str(frame.get("terminal_reason") or ""),
+        " ".join(str(e) for e in errors) if isinstance(errors, list) else "",
+    ]
+    return {
+        "error_code": classify_provider_failure(
+            status=status,
+            diagnostic="\n".join(fragments).lower(),
+        )
+    }
+
+
 def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize Claude's model-visible synthetic API errors.
 
@@ -1097,17 +1140,23 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
         or frame.get("parent_tool_use_id") is not None
     ):
         return None
-    raw_status = frame.get("apiErrorStatus")
+    # Claude Code ≤2.0 spelled these camelCase; 2.1.x emits snake_case
+    # (`is_api_error_message`, `api_error_status`, `error_details`). A miss
+    # here is not benign: the turn then settles as *succeeded* with no output,
+    # the runtime re-runs the wake at once, and a capped gateway is hit ~3×/s.
+    raw_status = frame.get("apiErrorStatus", frame.get("api_error_status"))
     status = raw_status if type(raw_status) is int else None
-    if frame.get("isApiErrorMessage") is not True and not (
-        status is not None and status >= 400
-    ):
+    flagged = (
+        frame.get("isApiErrorMessage") is True
+        or frame.get("is_api_error_message") is True
+    )
+    if not flagged and not (status is not None and status >= 400):
         return None
 
     fragments = [
         str(frame.get("error") or ""),
         json.dumps(
-            frame.get("errorDetails") or {},
+            frame.get("errorDetails") or frame.get("error_details") or {},
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,

@@ -95,3 +95,32 @@ def test_memory_git_requests_a_windowless_child_process(monkeypatch, tmp_path):
 
     assert result is not None
     assert captured["creationflags"] == _CREATE_NO_WINDOW
+
+
+@pytest.mark.parametrize("probe", ["pi-auth", "pi-models", "opencode-models", "windows-path"])
+def test_background_readiness_probes_request_windowless_processes(monkeypatch, tmp_path, probe):
+    """The heartbeat's native readiness checks and PATH discovery must not
+    allocate a console on each poll of a detached Windows daemon."""
+    from puffo_agent.agent import cli_bin, pi_auth, opencode_auth
+
+    observed = []
+
+    def run(command, **kwargs):
+        observed.append(kwargs)
+        output = '{"status":"ready","provider":"test"}' if probe == "pi-auth" else ""
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    module = {"pi-auth": pi_auth, "pi-models": pi_auth,
+              "opencode-models": opencode_auth, "windows-path": cli_bin}[probe]
+    monkeypatch.setattr(module, "no_window_kwargs", lambda: {"creationflags": _CREATE_NO_WINDOW}, raising=False)
+    monkeypatch.setattr(subprocess, "run", run)
+    if probe == "pi-auth":
+        pi_auth.check_pi_auth("pi", provider="test", config_dir=tmp_path)
+    elif probe == "pi-models":
+        pi_auth.list_pi_models("pi", config_dir=tmp_path)
+    elif probe == "opencode-models":
+        opencode_auth.list_opencode_models("opencode")
+    else:
+        cli_bin._windows_persistent_path()
+    assert len(observed) == 1
+    assert observed[0].get("creationflags", 0) & _CREATE_NO_WINDOW

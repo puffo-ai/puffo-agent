@@ -572,3 +572,30 @@ async def test_cloud_command_operator_slug_is_checked_against_configured_operato
         assert driver.cancel_calls == [TurnRef("driver-turn-1")]
     finally:
         unregister_runtime_manager("local-agent-id", manager)
+
+
+@pytest.mark.asyncio
+async def test_recovery_inspection_requires_operator_and_retry_acknowledgment(tmp_path):
+    """A cloud Agent identity cannot release quarantine; the configured
+    operator must explicitly acknowledge unknown external effects."""
+    from puffo_agent.agent.turn_recovery import TurnRecovery, write_recovery
+
+    client, manager, _ = runtime_fixture()
+    manager.spec = RuntimeSpec(str(tmp_path))
+    write_recovery(tmp_path, TurnRecovery(
+        session_ref="session-1", turn_ref="turn-1", owner="old-owner",
+        provider_session_id="native-session", provider_turn_id="native-turn",
+        reason="unknown effects", stopped=True,
+    ))
+    try:
+        request = command("inspect_recovery", "inspect-unknown", turn_ref="turn-1")
+        request["command"]["operator_slug"] = "some-agent"
+        denied = await client._dispatch_bridge_frame(request)
+        assert denied["error_code"] == "foreign_operator"
+        request = command("inspect_recovery", "inspect-valid", turn_ref="turn-1")
+        inspected = await client._dispatch_bridge_frame(request)
+        assert inspected["recovery"]["reason"] == "unknown effects"
+        retry = command("retry_recovery", "retry-not-acknowledged", turn_ref="turn-1", acknowledge_unknown_effects=False)
+        assert (await client._dispatch_bridge_frame(retry))["error_code"] == "invalid_decision"
+    finally:
+        unregister_runtime_manager("local-agent-id", manager)

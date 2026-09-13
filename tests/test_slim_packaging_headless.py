@@ -1,10 +1,10 @@
 """Slim-packaging guard (Item A): the daemon / CLI path must import and
-run with PySide6 absent, and a GUI command without the ``[gui]`` extra
+run with PySide6 absent, and a GUI command with a missing dependency
 must fail with the actionable install hint — not a raw traceback.
 
 Deterministic in any environment: we block ``PySide6`` (and its
 submodules) via ``sys.modules[...] = None`` regardless of whether the
-extra happens to be installed, so this asserts the real headless
+package happens to be installed, so this asserts the real headless
 contract rather than "the test box didn't have Qt".
 """
 
@@ -13,8 +13,24 @@ from __future__ import annotations
 import argparse
 import importlib
 import sys
+import tomllib
+from pathlib import Path
 
 import pytest
+
+
+def test_plain_install_requires_gui_dependency():
+    """A plain uv force-upgrade must not silently remove desktop support."""
+    project = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]
+    from packaging.requirements import Requirement
+
+    requirements = [Requirement(value) for value in project["dependencies"]]
+    assert any(
+        req.name.lower() == "pyside6" and req.marker is None
+        for req in requirements
+    )
 
 
 # Every PySide6 entry point the UI modules reach for. Mapping a name to
@@ -68,11 +84,11 @@ def test_cli_import_does_not_eagerly_import_daemon(pyside6_blocked):
     assert "puffo_agent.portal.daemon" not in sys.modules
 
 
-def test_gui_command_without_extra_yields_actionable_hint(
+def test_gui_command_with_missing_dependency_yields_actionable_hint(
     pyside6_blocked, capsys,
 ):
     """`start --ui` with PySide6 absent returns non-zero and prints the
-    `pip install 'puffo-agent[gui]'` hint instead of ModuleNotFoundError."""
+    `pip install --upgrade --force-reinstall puffo-agent` hint instead of ModuleNotFoundError."""
     cli = importlib.import_module("puffo_agent.portal.cli")
     args = argparse.Namespace(
         ui=True, tray_runner=False, background=False, with_local_bridge=False,
@@ -81,10 +97,10 @@ def test_gui_command_without_extra_yields_actionable_hint(
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "puffo-agent[gui]" in combined
+    assert "pip install --upgrade --force-reinstall puffo-agent" in combined
 
 
-def test_tray_command_without_extra_yields_actionable_hint(
+def test_tray_command_with_missing_dependency_yields_actionable_hint(
     pyside6_blocked, capsys,
 ):
     """Same guard for the `start --tray-runner` entry point."""
@@ -96,4 +112,4 @@ def test_tray_command_without_extra_yields_actionable_hint(
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "puffo-agent[gui]" in combined
+    assert "pip install --upgrade --force-reinstall puffo-agent" in combined

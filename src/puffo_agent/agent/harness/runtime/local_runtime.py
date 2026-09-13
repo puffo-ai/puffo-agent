@@ -75,6 +75,13 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
+from ....portal.host_assets import atomic_write_private
+from ....portal.state import subscription_token
+from ..support.subscription_credentials import (
+    AUTH_MODE_SUBSCRIPTION,
+    SubscriptionUnsupported,
+    resolve_subscription_credentials,
+)
 from ..drivers.acp import selects_puffo_v0_profile
 from ..drivers.pi_bridge import (
     build_bridge_environment,
@@ -392,15 +399,21 @@ class LocalRuntimePreparer:
         return self._prepare_generic_spec(system_prompt)
 
     def _resolve_model(self) -> str:
-        runtime = self.agent_cfg.runtime
-        if self.harness_name == "codex":
-            return runtime.model or self.daemon_cfg.openai.model or ""
-        if self.harness_name == "claude-code":
-            return runtime.model or self.daemon_cfg.anthropic.model or ""
-        provider_cfg = getattr(self.daemon_cfg, self.provider, None)
-        return runtime.model or getattr(provider_cfg, "model", "") or ""
+        return self.daemon_cfg.resolve_model(
+            model=self.agent_cfg.runtime.model,
+            provider=self.provider,
+            harness=self.harness_name,
+        )
 
     def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # Only the claude-code spec resolves a plan credential. Running the
+            # api-gateway path here instead would bill the metered account for
+            # the life of the agent and look like success -- so refuse loudly.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                f"the 'generic' runtime path yet; only claude-code implements it."
+            )
         executable, launch_args = self._resolve_generic_command()
         controlled, opencode_config = self._prepare_executable_configuration(
             executable, system_prompt
@@ -408,6 +421,13 @@ class LocalRuntimePreparer:
         mcp_servers = self._project_protocol_mcp(
             controlled, opencode_config, tuple(launch_args)
         )
+        if (
+            self.harness_name == "opencode"
+            and self.agent_cfg.runtime.permission_mode == "bypassPermissions"
+        ):
+            # Use native config only for the explicitly selected mode, not the
+            # legacy normalizer's fallback for unsupported permission modes.
+            opencode_config["permission"] = "allow"
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
                 opencode_config
@@ -684,6 +704,42 @@ class LocalRuntimePreparer:
         ):
             strip_claude_api_key_from_settings(settings_path)
 
+    def _claude_llm_credentials(self) -> tuple[dict[str, str], tuple[str, ...]]:
+        """The claude child's LLM credential env, plus any extra allowances.
+
+        Two modes, and subscription **supersedes** the gateway env rather than
+        merging with it: a leftover ``ANTHROPIC_BASE_URL`` outranks the plan
+        token in the CLI's own credential precedence, so merging would route a
+        subscription agent back through the metered gateway in silence.
+
+        Any credential file the mode needs is written here, at ``0600``, before
+        the child is spawned.
+        """
+        runtime = self.agent_cfg.runtime
+        if runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            creds = resolve_subscription_credentials(
+                runtime.harness,
+                agent_home=self.agent_home,
+                token=subscription_token(self.daemon_cfg, runtime.harness),
+            )
+            for path, content in creds.files.items():
+                atomic_write_private(path, content)
+            return dict(creds.env), creds.extra_allowed
+
+        llm_env = anthropic_base_url_env(runtime.llm_base_url)
+        if llm_env and runtime.api_key:
+            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+            # Behind a budgeted gateway a 429 is usually the cap, not load.
+            # The CLI treats every 429 as transient and retries with backoff;
+            # under a cap that is a storm the gateway counts against the same
+            # budget. Cap the CLI's retries; the runtime parks on the drain.
+            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
+        else:
+            configured_key = claude_cli_api_key(self.daemon_cfg)
+            if configured_key:
+                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        return llm_env, ()
+
     def _prepare_claude_spec(self, system_prompt: str) -> RuntimeSpec:
         executable = resolve_claude_bin()
         if executable is None:
@@ -736,19 +792,7 @@ class LocalRuntimePreparer:
                 self.agent_id,
             )
         remove_legacy_permission_hook(self.claude_dir)
-        runtime = self.agent_cfg.runtime
-        llm_env = anthropic_base_url_env(runtime.llm_base_url)
-        if llm_env and runtime.api_key:
-            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
-            # Behind a budgeted gateway a 429 is usually the cap, not load.
-            # The CLI treats every 429 as transient and retries with backoff;
-            # under a cap that is a storm the gateway counts against the same
-            # budget. Cap the CLI's retries; the runtime parks on the drain.
-            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
-        else:
-            configured_key = claude_cli_api_key(self.daemon_cfg)
-            if configured_key:
-                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        llm_env, extra_allowed = self._claude_llm_credentials()
         # Same guarantee the old pop-before-and-after-overrides dance gave,
         # now from an allowlist: ambient provider keys never reach the child,
         # an override cannot reintroduce one, and only llm_env injects the
@@ -760,6 +804,7 @@ class LocalRuntimePreparer:
                 "USERPROFILE": str(self.agent_home),
                 **llm_env,
             },
+            extra_allowed=extra_allowed,
         )
         if is_macos():
             environment["CLAUDE_CONFIG_DIR"] = str(
@@ -782,6 +827,14 @@ class LocalRuntimePreparer:
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # Only the claude-code spec resolves a plan credential. Running the
+            # api-gateway path here instead would bill the metered account for
+            # the life of the agent and look like success -- so refuse loudly.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                f"the 'codex' runtime path yet; only claude-code implements it."
+            )
         codex_home = agent_codex_user_dir(self.agent_id)
         codex_home.mkdir(parents=True, exist_ok=True)
         agents_md = codex_home / "AGENTS.md"

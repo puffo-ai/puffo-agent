@@ -279,14 +279,12 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 # Shown when a GUI entry point (``start --ui`` / ``start --background``) is
-# invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
-# The base ``pip install puffo-agent`` is deliberately Qt-free so headless
-# / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
+# invoked but its required PySide6 dependency cannot be imported.
 _GUI_EXTRA_HINT = (
-    "the desktop UI requires the [gui] extra (PySide6), which is not "
-    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n"
+    "the desktop UI dependency (PySide6) could not be imported. "
+    "Repair the installation with:\n\n    pip install --upgrade --force-reinstall puffo-agent\n"
     "or, for a uv tool install:\n"
-    "    uv tool install --force 'puffo-agent[gui]'\n\n"
+    "    uv tool install --force puffo-agent\n\n"
     "(the headless daemon — `puffo-agent start` with no UI flag — runs "
     "without it.)"
 )
@@ -295,7 +293,7 @@ _GUI_EXTRA_HINT = (
 def cmd_start(args: argparse.Namespace) -> int:
     # The PySide6 import inside run_tray/launch is deferred to call time,
     # so the ImportError surfaces from the call, not the ``from .ui...``
-    # line — wrap both so a missing [gui] extra yields the actionable hint
+    # line — wrap both so a missing GUI dependency yields the actionable hint
     # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
         try:

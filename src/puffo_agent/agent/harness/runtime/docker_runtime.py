@@ -50,6 +50,10 @@ from ....portal.state import (
 )
 from ....portal.workspace_layout import prepare_workspace_shared_access
 from ...adapters.base import anthropic_base_url_env
+from ..support.subscription_credentials import (
+    AUTH_MODE_SUBSCRIPTION,
+    SubscriptionUnsupported,
+)
 from ...adapters.desired_install import run_spawn_install
 from ...cli_bin import resolve_docker_bin
 from .docker_support import (
@@ -308,6 +312,17 @@ class DockerRuntimePreparer:
                 "agent %s: Docker Claude Puffo MCP tools are unavailable "
                 "because puffo_core is incomplete",
                 self.agent_id,
+            )
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # cli-docker hands provider credentials to the container by name via
+            # `docker exec -e` -- a different mechanism from the cli-local path
+            # that implements subscription. Falling through to the api-gateway
+            # path would silently meter an agent the operator asked to bill their
+            # own plan, so refuse until this runtime implements it. Cloud agents
+            # are unaffected: they boot kind=cli-local.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                "the cli-docker runtime yet; cloud agents run cli-local."
             )
         remove_legacy_permission_hook(self.agent_home / ".claude")
         environment = {
@@ -599,8 +614,13 @@ class DockerRuntimePreparer:
         await run_cmd([self._docker_bin, "rm", self.container_name])
 
     async def _probe_container(self) -> tuple[bool | None, bool | None]:
+        # Import it for real: a file-existence check passes even when the
+        # mounted tree cannot actually load in-container (wrong-ABI native
+        # deps shadowing the image's), which is exactly how a mute fleet
+        # slipped through an upgrade.
         package = await self._probe_command(
-            "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py"
+            "PYTHONPATH=/opt/puffoagent-pkg python3 -c "
+            "'import puffo_agent.mcp.puffo_core_server'"
         )
         harness = await self._probe_command(
             f"command -v {self._harness_executable()} >/dev/null"
@@ -688,7 +708,7 @@ class DockerRuntimePreparer:
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",
-            f"{puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
+            f"{puffo_agent_pkg_dir()}:/opt/puffoagent-pkg/puffo_agent:ro",
         ]
         default_memory = self.agent_home / "memory"
         if self.memory_dir.resolve() != default_memory.resolve():

@@ -30,7 +30,8 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
-from .errors import AgentAPIError
+from .errors import AgentAPIError, ProviderFailureError
+from .turn_recovery import read_recovery, recovery_required
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
@@ -62,8 +63,6 @@ from .provider_failures import operator_failure_text
 from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
-
-
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
@@ -456,6 +455,9 @@ class GlobalInboxRuntime(
 
     async def recover_orphaned_turns(self) -> int:
         """Requeue active DB Turns left without a resumable crash join."""
+        if recovery_required(self.workspace):
+            self._report_recovery_required()
+            return 0
         recovered = 0
         for run in await self.store.get_active_turn_runs():
             if run.message_ids:
@@ -1328,14 +1330,6 @@ class GlobalInboxRuntime(
         if self.health.state == "in_progress":
             self.health = RuntimeHealth()
 
-    async def _wake_remaining_pending(self) -> None:
-        if self._degraded or not await self.store.get_pending(limit=1):
-            return
-        if await self.store.get_notice_candidates(
-            self.adapter.get_provider_session_id()
-        ):
-            self.notify()
-
     async def _handle_process_failure(
         self, planned: PlannedTurn, process_started: float, exc: Exception
     ) -> tuple[bool, str, str]:
@@ -1346,7 +1340,10 @@ class GlobalInboxRuntime(
             )
         terminal_error = operator_failure_text(exc)
         if process_outcome in {"drained", "extra_usage_required"}:
-            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+            if process_outcome == "drained" and (
+                (isinstance(exc, ProviderFailureError) and exc.error_code == "budget_exceeded")
+                or looks_like_budget_cap(terminal_error)
+            ):
                 hold = self.next_budget_park_hold()
                 self._park_drained(
                     hold_seconds=hold,
@@ -1381,6 +1378,9 @@ class GlobalInboxRuntime(
         return terminal, process_outcome, terminal_error
 
     async def process_once(self) -> bool:
+        if recovery_required(self.workspace):
+            self._report_recovery_required()
+            return False
         if not self._drained_park_allows_processing():
             return False
         if not self._try_degraded_recovery():
@@ -1432,6 +1432,9 @@ class GlobalInboxRuntime(
                     process_outcome = settled
                     if settled == "succeeded":
                         self._clear_budget_park_backoff()
+                        self._clear_no_progress_rearm_backoff()
+                    elif settled == "no_progress":
+                        self.note_no_progress_turn()
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)
@@ -1888,6 +1891,13 @@ class GlobalInboxRuntime(
 
     async def recover_current_turn(self) -> bool:
         """Finish or unwind a durable crash join before normal planning."""
+        if recovery_required(self.workspace):
+            record = read_recovery(self.workspace)
+            if record is not None and record.retry_requested and record.stopped:
+                await self._retry_quarantined_turn()
+            else:
+                self._report_recovery_required()
+            return False
         recovery_started = time.monotonic()
         try:
             raw: Any = json.loads(self.current_turn_path.read_text(encoding="utf-8"))
