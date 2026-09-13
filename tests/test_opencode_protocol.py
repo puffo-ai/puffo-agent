@@ -42,7 +42,6 @@ def test_run_command_resumes_by_session_and_keeps_prompt_positional():
         "openai/gpt-5",
         "--session",
         "ses_123",
-        "--auto",
         "--title",
         "Puffo",
         "one semantic input",
