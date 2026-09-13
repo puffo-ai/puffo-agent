@@ -362,7 +362,7 @@ async def test_provision_materializes_then_writes(tmp_path, monkeypatch):
     if os.name != "nt":
         assert agent_root.stat().st_mode & 0o777 == 0o700
         assert key_path.parent.stat().st_mode & 0o777 == 0o700
-    assert key_path.stat().st_mode & 0o777 == 0o600
+        assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
