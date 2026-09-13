@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,7 +32,14 @@ def test_detached_runner_commands_use_dash_m(monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows console regression")
-def test_detached_venv_runner_has_no_console_and_keeps_environment(tmp_path):
+@pytest.mark.parametrize("breakaway", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(
+        os.environ.get("GITHUB_ACTIONS") == "true",
+        reason="Hosted Actions jobs prohibit process breakaway; exercised locally",
+    )),
+])
+def test_detached_venv_runner_has_no_console_and_keeps_environment(tmp_path, breakaway):
     """Venv python.exe redirects to a child that allocates a fresh console."""
     probe = (
         "import ctypes,json,sys; import puffo_agent; "
@@ -41,7 +49,12 @@ def test_detached_venv_runner_has_no_console_and_keeps_environment(tmp_path):
     )
     for runner in (bg.tray_runner_command, bg.headless_runner_command):
         with (tmp_path / "probe.log").open("w+b") as log:
-            proc = subprocess.Popen([runner()[0], "-c", probe], **bg.detach_kwargs(log))
+            kwargs = bg.detach_kwargs(log)
+            if not breakaway:
+                # Console/venv behavior is independent of escaping a parent
+                # Job. CI must keep its children in its restricted Job.
+                kwargs["creationflags"] &= ~bg._CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen([runner()[0], "-c", probe], **kwargs)
             try:
                 assert proc.wait(timeout=15) == 0
             finally:

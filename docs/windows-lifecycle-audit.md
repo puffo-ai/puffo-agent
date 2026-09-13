@@ -62,13 +62,17 @@ has passed a live end-to-end test. macOS/Linux were not investigated here.
   but a continuously running daemon does not periodically sweep these markers.
 * Docker, remote/WS-local providers and login autostart were not exercised as
   real Windows deployments. No registry or login configuration was changed.
+* A parent Windows Job that prohibits breakaway rejects detached startup with
+  WinError 5. Hosted GitHub runners impose this restriction: CI exercises the
+  native console/environment probe inside that Job; the separate breakaway
+  variant runs locally. Production detachment flags are not weakened.
 
 ## Validation
 
 The three native regressions first failed on the previous implementation:
 locked long-path archive, existing destination preservation, and a surviving
 Codex wrapper descendant. They pass after the fixes. A standard-venv run of
-the new Windows CI selection completed with **177 passed, 3 POSIX-only skips**.
+the new Windows CI selection completed with **178 passed, 3 POSIX-only skips**.
 The broader focused lifecycle/import/driver run completed with **177 passed**
 (excluding the known Unix mode-bit import assertion).
 
