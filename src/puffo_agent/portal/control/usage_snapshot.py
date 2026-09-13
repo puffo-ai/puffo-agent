@@ -165,6 +165,19 @@ def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
     return out
 
 
+def _has_headroom(budgets: object) -> bool:
+    """Only concrete, valid quota windows can release a drained worker."""
+    if not isinstance(budgets, dict):
+        return False
+    windows = [budgets[key] for key in ("session", "weekly") if key in budgets]
+    return bool(windows) and all(
+        isinstance(entry, dict)
+        and type(entry.get("used_pct")) in (int, float)
+        and 0 <= entry["used_pct"] < 100
+        for entry in windows
+    )
+
+
 _live_workers_provider = None
 
 
@@ -197,6 +210,9 @@ def _apply_to_live_worker(worker, agent_id: str, spent_reset) -> None:
             # timed probe owns that exit
             return
         worker._clear_drained(worker.runtime, agent_id, logger)
+        client = worker._client
+        if client is not None and client.global_runtime is not None:
+            client.global_runtime.notify()
 
 
 def apply_drained_health(snapshot: dict) -> None:
@@ -209,6 +225,8 @@ def apply_drained_health(snapshot: dict) -> None:
     live = _live_workers()
     for agent_id, harness in agent_harnesses().items():
         if harness not in (snapshot or {}):
+            continue
+        if harness not in spent and not _has_headroom(snapshot[harness]):
             continue
         worker = live.get(agent_id)
         if worker is not None:
@@ -378,11 +396,8 @@ async def collect_usage_snapshot(host_home: Path) -> dict | None:
         raw = None
         if codex_bin := resolve_codex_bin():
             raw = await _probe_codex_rate_limits(codex_bin, host_home)
-        if raw is None:
-            # Probe failed — fall back to the last frame a live codex agent saw.
-            from .reporter import get_reporter
-
-            raw = get_reporter().latest_codex_rate_limits()
+        # A cached frame may predate exhaustion or belong to replaced
+        # credentials. Failed probes must never clear a quota pause.
         if parsed := parse_codex_rate_limits(raw):
             snapshot["codex"] = parsed
     return snapshot or None

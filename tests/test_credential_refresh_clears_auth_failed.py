@@ -471,3 +471,34 @@ def test_two_workers_both_get_auth_failed_cleared_on_one_refresh(tmp_path):
 
     assert worker_a.runtime.health == "ok"
     assert worker_b.runtime.health == "ok"
+
+
+@pytest.mark.asyncio
+async def test_refresh_rechecks_quota_without_optimistically_clearing_it(tmp_path, monkeypatch):
+    """Ordinary token rotation cannot reopen exhausted work or gateway caps."""
+    from puffo_agent.portal.daemon import refresh_provider_auth_flag_path
+
+    daemon = _make_daemon_stub(tmp_path)
+    daemon._usage_refresh = asyncio.Event()
+    monkeypatch.setattr("puffo_agent.portal.daemon._provider_auth_reload_jitter_seconds", lambda: 8.0)
+    worker = _make_fake_worker()
+    worker.runtime.health = "drained"
+    worker._drained_budget_cap = False
+    worker.notify_refresh = lambda: None
+    cfg = _FakeAgentCfg("quota-agent")
+    cfg.resolve_workspace_dir = lambda: tmp_path / "workspace"
+    daemon._register_with_refresher(cfg, worker)
+
+    for health, cap, expected in [
+        ("drained", False, True),
+        ("drained", True, False),
+        ("extra_usage_required", False, False),
+    ]:
+        daemon._usage_refresh.clear()
+        worker.runtime.health = health
+        worker._drained_budget_cap = cap
+        daemon.refresher._fire_refresh_success()
+        assert worker.runtime.health == health
+        assert daemon._usage_refresh.is_set() is expected
+        flag = json.loads(refresh_provider_auth_flag_path(cfg.resolve_workspace_dir()).read_text())
+        assert flag["jitter_seconds"] == (0.0 if expected else 8.0)

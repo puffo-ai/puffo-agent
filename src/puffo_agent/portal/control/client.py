@@ -940,9 +940,13 @@ class ControlManager:
     ``server_url``. Multiple operators on that same server are served; a
     machine paired across two different servers only serves the first."""
 
-    def __init__(self, *, resolve_model: Callable[..., str] | None = None) -> None:
+    def __init__(
+        self, *, resolve_model: Callable[..., str] | None = None,
+        usage_refresh: asyncio.Event | None = None,
+    ) -> None:
         self._resolve_model = resolve_model
         self._stop = asyncio.Event()
+        self._usage_refresh = usage_refresh if usage_refresh is not None else asyncio.Event()
 
     async def run(self) -> None:
         machine = None
@@ -987,8 +991,10 @@ class ControlManager:
 
     async def _usage_loop(self, machine) -> None:
         """Probe each runtime's /usage budget and POST the machine's snapshot.
+        Credential changes coalesce into a fresh probe on this same loop.
         Replace-latest server-side, so a dropped tick just resends next time."""
         while not self._stop.is_set():
+            self._usage_refresh.clear()
             try:
                 pairings = load_pairings()
                 if pairings:
@@ -996,7 +1002,20 @@ class ControlManager:
                     await post_usage_snapshot(machine, base)
             except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
                 log.debug("control: usage report failed: %s", exc)
-            await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
+            await self._wait_for_usage_refresh()
+
+    async def _wait_for_usage_refresh(self) -> None:
+        periodic = spawn(
+            _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS), name="usage_periodic_wait",
+        )
+        requested = spawn(self._usage_refresh.wait(), name="usage_refresh_wait")
+        try:
+            await asyncio.wait({periodic, requested}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            periodic.cancel()
+            requested.cancel()
+            await asyncio.gather(periodic, requested, return_exceptions=True)
 
     def stop(self) -> None:
         self._stop.set()
+        self._usage_refresh.set()

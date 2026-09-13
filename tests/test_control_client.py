@@ -1058,3 +1058,39 @@ async def test_create_uses_running_daemon_model_not_changed_disk(home, monkeypat
     preparer.harness_name = harness
     assert seen == [preparer._resolve_model()] == ['unavailable']
     assert client._completed_results['model-check']['error_code'] == 'harness_not_ready'
+
+
+@pytest.mark.asyncio
+async def test_credential_refresh_wakes_usage_loop_and_coalesces(monkeypatch):
+    """Credential recovery must not wait six hours or spawn a probe per agent."""
+    refreshed = asyncio.Event()
+    manager = cc.ControlManager(usage_refresh=refreshed)
+    first_probe = asyncio.Event()
+    release_probe = asyncio.Event()
+    calls = []
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://s/"),
+    })
+
+    async def post(machine, base):
+        calls.append(base)
+        if len(calls) == 1:
+            first_probe.set()
+            await release_probe.wait()
+        else:
+            manager.stop()
+        return True
+
+    monkeypatch.setattr(cc, "post_usage_snapshot", post)
+    task = asyncio.create_task(manager._usage_loop(object()))
+    try:
+        await asyncio.wait_for(first_probe.wait(), 2)
+        # Changes arriving during a probe need one later fresh snapshot.
+        refreshed.set()
+        refreshed.set()
+        release_probe.set()
+        await asyncio.wait_for(task, 2)
+        assert calls == ["https://s", "https://s"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
