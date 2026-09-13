@@ -288,7 +288,7 @@ async def test_reader_loop_survives_malformed_and_unroutable_frames():
       "codexErrorInfo": None}, "plan_drained"),
     ({"message": "Limit reached", "codexErrorInfo": "usageLimitExceeded"},
      "plan_drained"),
-    ({"message": "Retry later", "codexErrorInfo": "rateLimitExceeded"},
+    ({"message": "Usage limit reached; retry shortly", "codexErrorInfo": "rateLimitExceeded"},
      "rate_limit"),
     ({"message": "rate limit exceeded", "codexErrorInfo": None}, "rate_limit"),
 ])
