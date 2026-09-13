@@ -164,9 +164,9 @@ def opencode_has_accessible_models() -> bool:
     executable = resolve_opencode_bin()
     if not executable:
         return False
-    from .opencode_auth import list_opencode_models
+    from .opencode_auth import discover_opencode_models
 
-    return bool(list_opencode_models(executable))
+    return bool(discover_opencode_models(executable))
 
 
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:

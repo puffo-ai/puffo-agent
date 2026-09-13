@@ -709,3 +709,44 @@ def _assert_process_exited(pid: int) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"descendant process {pid} is still alive")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failed", "close", "spawn_error"])
+async def test_turn_reclaims_native_temp_files_after_child_stops(tmp_path, outcome):
+    """Repeated real turns must not accumulate the CLI's extracted libraries."""
+    from pathlib import Path
+
+    directories = []
+    proc = _TurnProcess()
+
+    def factory(command, spec):
+        directory = Path(dict(spec.environment)["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").write_bytes(b"library")
+        if outcome == "spawn_error":
+            raise OSError("cannot spawn")
+        proc.feed({"type": "step_start", "sessionID": "ses_tmp",
+                   "part": {"messageID": "msg_tmp"}})
+        return proc
+
+    driver = OpenCodeDriver(factory)
+    await driver.open(RuntimeSpec(str(tmp_path), environment={"TMPDIR": str(tmp_path)}))
+    try:
+        if outcome == "spawn_error":
+            with pytest.raises(OSError):
+                await driver.start_turn(TurnInput("hello"))
+        else:
+            await driver.start_turn(TurnInput("hello"))
+            assert (directories[0] / "native.so").exists()
+            if outcome == "close":
+                await driver.close()
+            else:
+                proc.exit(1 if outcome == "failed" else 0)
+                proc.eof()
+                await asyncio.wait_for(
+                    _next_matching(driver.events(), HarnessEventType.TURN_COMPLETED), 2,
+                )
+        assert directories and all(not path.exists() for path in directories)
+    finally:
+        await driver.close()

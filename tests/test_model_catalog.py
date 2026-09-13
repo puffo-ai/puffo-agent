@@ -243,7 +243,7 @@ def test_opencode_catalog_uses_models_visible_to_native_cli(monkeypatch):
     from puffo_agent.agent.opencode_auth import OpenCodeModel
 
     monkeypatch.setattr(
-        "puffo_agent.agent.opencode_auth.list_opencode_model_catalog",
+        "puffo_agent.agent.opencode_auth.discover_opencode_models",
         lambda executable: (
             OpenCodeModel("opencode/big-pickle"),
             OpenCodeModel(
@@ -298,7 +298,7 @@ def test_opencode_catalog_drops_logged_out_provider_after_short_ttl(monkeypatch)
         (ModelOption("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-pro"),),
     )
     monkeypatch.setattr(
-        "puffo_agent.agent.opencode_auth.list_opencode_model_catalog",
+        "puffo_agent.agent.opencode_auth.discover_opencode_models",
         lambda executable: (),
     )
     monkeypatch.setattr(

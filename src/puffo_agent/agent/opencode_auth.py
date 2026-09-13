@@ -11,9 +11,14 @@ runtime can actually launch.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
+import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from .._proc import no_window_kwargs
@@ -55,15 +60,22 @@ def _run_opencode_models(
     if verbose:
         command.append("--verbose")
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=build_child_environment(),
-            timeout=timeout_seconds,
-            **no_window_kwargs(),
-        )
+        # OpenCode extracts native libraries on every process start. Own only
+        # this invocation's temp files; subprocess.run kills/waits on timeout
+        # before TemporaryDirectory removes them.
+        with tempfile.TemporaryDirectory(prefix="puffo-opencode-probe-") as scratch:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **build_child_environment(),
+                    **{name: scratch for name in ("TMPDIR", "TMP", "TEMP")},
+                },
+                timeout=timeout_seconds,
+                **no_window_kwargs(),
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OpenCodeProbeError("OpenCode model check could not complete") from exc
 
@@ -201,3 +213,64 @@ def opencode_model_status(executable: str, model: str) -> OpenCodeModelStatus:
 def opencode_model_is_available(executable: str, model: str) -> bool:
     """Compatibility bool view of :func:`opencode_model_status`."""
     return opencode_model_status(executable, model) == "ready"
+
+
+@dataclass(frozen=True)
+class _Discovery:
+    expires: float
+    models: tuple[OpenCodeModel, ...] = ()
+    error: str = ""
+    files: tuple = ()
+
+
+_discovery_lock = threading.Lock()
+_discovery_cache: dict[tuple, _Discovery] = {}
+
+
+def _discovery_files(environment: dict[str, str], executable: str) -> tuple:
+    """Notice native login/logout and ordinary config edits without reading secrets."""
+    home = Path(environment.get("HOME") or environment.get("USERPROFILE") or Path.home())
+    data = Path(environment.get("XDG_DATA_HOME") or home / ".local/share")
+    config = Path(environment.get("XDG_CONFIG_HOME") or home / ".config")
+    paths = [Path(executable), data / "opencode/auth.json"]
+    for root in (config / "opencode", *Path.cwd().parents, Path.cwd()):
+        paths.extend(root / name for name in ("opencode.json", "opencode.jsonc"))
+    stamps = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            stamp = None
+        stamps.append((str(path), stamp))
+    return tuple(stamps)
+
+
+def discover_opencode_models(executable: str) -> tuple[OpenCodeModel, ...]:
+    """Bound expensive advisory discovery; admission probes remain uncached.
+
+    Readiness and the picker share a result for five minutes. Failed discovery
+    retries after 30 seconds. Environment/cwd changes select a separate view;
+    native auth/config edits invalidate the view. Admission always probes live.
+    """
+    environment = build_child_environment()
+    key = (executable, os.getcwd(), tuple(sorted(environment.items())))
+    files = _discovery_files(environment, executable)
+    # ponytail: serialize these short probes, including cache misses, so a
+    # heartbeat and UI refresh cannot launch duplicate CLI processes.
+    with _discovery_lock:
+        now = time.monotonic()
+        cached = _discovery_cache.get(key)
+        if cached is None or cached.expires <= now or cached.files != files:
+            try:
+                models = list_opencode_model_catalog(executable)
+                cached = _Discovery(time.monotonic() + 300, models, files=files)
+            except OpenCodeProbeError as exc:
+                cached = _Discovery(time.monotonic() + 30, error=str(exc), files=files)
+            # Bound retained environment views in a long-running daemon.
+            if key not in _discovery_cache and len(_discovery_cache) >= 16:
+                del _discovery_cache[next(iter(_discovery_cache))]
+            _discovery_cache[key] = cached
+        if cached.error:
+            raise OpenCodeProbeError(cached.error)
+        return cached.models

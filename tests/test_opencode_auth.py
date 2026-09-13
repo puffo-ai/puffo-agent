@@ -223,3 +223,133 @@ def test_unexpected_native_failure_is_not_misreported_as_logged_out(monkeypatch)
 
     with pytest.raises(OpenCodeProbeError):
         list_opencode_models("/opt/bin/opencode", provider="deepseek")
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout"])
+def test_probe_removes_its_temporary_files_without_touching_parent(
+    monkeypatch, tmp_path, outcome,
+):
+    """Every probe must reclaim CLI extraction files, including failed probes."""
+    from pathlib import Path
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(name, str(tmp_path))
+    sentinel = tmp_path / "unrelated.so"
+    sentinel.write_bytes(b"keep")
+    directories = []
+
+    def fake_run(command, **kwargs):
+        directory = Path(kwargs["env"]["TMPDIR"])
+        directories.append(directory)
+        (directory / "extracted.so").write_bytes(b"library")
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(command, 5)
+        return _completed(code=1 if outcome == "error" else 0, stdout="a/b\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if outcome == "success":
+        assert list_opencode_models("opencode") == ("a/b",)
+    else:
+        with pytest.raises(OpenCodeProbeError):
+            list_opencode_models("opencode")
+    assert directories and all(not path.exists() for path in directories)
+    assert sentinel.read_bytes() == b"keep"
+    assert list(tmp_path.iterdir()) == [sentinel]
+
+
+def test_discovery_reuses_probe_but_preflight_stays_fresh(monkeypatch):
+    """Heartbeat readiness and picker must share one probe; admission is live."""
+    from puffo_agent.agent import cli_bin, model_catalog
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return _completed(code=0, stdout="a/b\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: "/test/discovery")
+    monkeypatch.setattr(model_catalog, "_cache", {})
+    for _ in range(3):
+        assert cli_bin.opencode_has_accessible_models()
+        assert model_catalog.provider_models("opencode", fetch=True)[1].id == "a/b"
+    assert calls == [["/test/discovery", "models", "--verbose"]]
+    assert opencode_model_status("/test/discovery", "a/b") == "ready"
+    assert calls[-1] == ["/test/discovery", "models", "a"]
+    assert len(calls) == 2
+
+
+def test_discovery_refreshes_on_expiry_auth_edit_and_failure(monkeypatch, tmp_path):
+    """Long-lived discovery must see login changes and back off failed probes."""
+    from puffo_agent.agent import opencode_auth as auth
+
+    monkeypatch.setattr(auth, "_discovery_cache", {})
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    now = [0.0]
+    monkeypatch.setattr(auth.time, "monotonic", lambda: now[0])
+    calls = []
+    fail = [False]
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return _completed(code=2 if fail[0] else 0, stdout="a/b\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    auth.discover_opencode_models("test")
+    now[0] = 299
+    auth.discover_opencode_models("test")
+    assert len(calls) == 1
+    now[0] = 300
+    auth.discover_opencode_models("test")
+    assert len(calls) == 2
+    path = tmp_path / "opencode/auth.json"
+    path.parent.mkdir()
+    path.write_text("{}")
+    auth.discover_opencode_models("test")
+    assert len(calls) == 3
+    path.unlink()
+    fail[0] = True
+    now[0] = 301
+    for _ in range(3):
+        with pytest.raises(OpenCodeProbeError):
+            auth.discover_opencode_models("test")
+    assert len(calls) == 5  # verbose, then compatibility fallback, once
+    now[0] = 332
+    fail[0] = False
+    assert auth.discover_opencode_models("test") == (OpenCodeModel("a/b"),)
+    assert len(calls) == 6
+
+
+def test_simultaneous_discovery_shares_one_probe(monkeypatch):
+    """Concurrent UI/heartbeat refreshes cannot duplicate an expensive probe."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from puffo_agent.agent import opencode_auth as auth
+
+    monkeypatch.setattr(auth, "_discovery_cache", {})
+    entered = threading.Event()
+    release = threading.Event()
+    second_started = threading.Event()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        entered.set()
+        assert release.wait(5)
+        return _completed(code=0, stdout="a/b\n")
+
+    def second():
+        second_started.set()
+        return auth.discover_opencode_models("concurrent")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(auth.discover_opencode_models, "concurrent")
+        assert entered.wait(5)
+        other = pool.submit(second)
+        assert second_started.wait(5)
+        release.set()
+        assert first.result() == other.result() == (OpenCodeModel("a/b"),)
+    assert len(calls) == 1

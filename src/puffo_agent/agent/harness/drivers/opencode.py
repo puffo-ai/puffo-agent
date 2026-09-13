@@ -219,6 +219,7 @@ class OpenCodeDriver(Driver):
         self._resumed = False
         self._session_announced = False
         self._proc: Any = None
+        self._turn_temp: tempfile.TemporaryDirectory | None = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._turn_generation = 0
@@ -326,6 +327,11 @@ class OpenCodeDriver(Driver):
         )
 
     async def _spawn(self, spec: RuntimeSpec, prompt: str) -> Any:
+        self._turn_temp = tempfile.TemporaryDirectory(prefix="puffo-opencode-turn-")
+        spec = dataclasses.replace(spec, environment={
+            **dict(spec.environment),
+            **{name: self._turn_temp.name for name in ("TMPDIR", "TMP", "TEMP")},
+        })
         command = build_opencode_run_command(
             spec,
             prompt=prompt,
@@ -403,6 +409,7 @@ class OpenCodeDriver(Driver):
                     "--verbose",
                     env={
                         **dict(spec.environment),
+                        **{name: scratch for name in ("TMPDIR", "TMP", "TEMP")},
                         "XDG_DATA_HOME": f"{scratch}/xdg-data",
                         "APPDATA": f"{scratch}/appdata",
                         "LOCALAPPDATA": f"{scratch}/localappdata",
@@ -524,6 +531,16 @@ class OpenCodeDriver(Driver):
     async def _summarize_via_serve(
         self, spec: RuntimeSpec, native_session_id: str
     ) -> None:
+        with tempfile.TemporaryDirectory(prefix="puffo-opencode-serve-") as scratch:
+            spec = dataclasses.replace(spec, environment={
+                **dict(spec.environment),
+                **{name: scratch for name in ("TMPDIR", "TMP", "TEMP")},
+            })
+            await self._summarize_with_environment(spec, native_session_id)
+
+    async def _summarize_with_environment(
+        self, spec: RuntimeSpec, native_session_id: str
+    ) -> None:
         """Run one summarize against a transient loopback server.
 
         The server shares the per-turn children's storage (same env, same
@@ -636,6 +653,7 @@ class OpenCodeDriver(Driver):
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             self._stderr_reader = None
+        self._cleanup_turn_temp()
         self._proc = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
@@ -878,6 +896,7 @@ class OpenCodeDriver(Driver):
                     native_turn_id=self._active_native_turn_id,
                     data=data,
                 )
+        self._cleanup_turn_temp()
         self._proc = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
@@ -896,11 +915,20 @@ class OpenCodeDriver(Driver):
                 await self._settle_turn_task(proc)
         finally:
             if generation == self._turn_generation:
+                self._cleanup_turn_temp()
                 self._proc = None
                 self._active = TurnRef("")
                 self._active_native_turn_id = ""
                 self._accepted = None
                 self._turn_task = None
+
+    def _cleanup_turn_temp(self) -> None:
+        # Never remove files from underneath a child that failed to stop.
+        if self._proc is not None and self._proc.returncode is None:
+            return
+        if self._turn_temp is not None:
+            self._turn_temp.cleanup()
+            self._turn_temp = None
 
     async def _settle_turn_task(self, proc: Any) -> None:
         task = self._turn_task
