@@ -122,6 +122,8 @@ class KeyStore:
         if os.name != "nt" and before.st_mode & 0o077:
             raise ValueError("message backup key file permissions are unsafe")
         flags = os.O_RDONLY
+        if os.name == "nt":
+            flags |= os.O_BINARY  # No CRLF translation or Ctrl-Z end-of-file.
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags)
@@ -145,6 +147,12 @@ class KeyStore:
             key = b"".join(chunks)
         finally:
             os.close(fd)
+        if os.name == "nt" and 32 < len(key) <= 64 and current.st_size == len(key):
+            # Older Windows writers expanded every LF to CRLF. Preserve those
+            # keys without rewriting files or changing valid 32-byte raw keys.
+            legacy_key = key.replace(b"\r\n", b"\n")
+            if len(legacy_key) == 32 and legacy_key.replace(b"\n", b"\r\n") == key:
+                key = legacy_key
         if len(key) != 32:
             raise ValueError("message backup key has invalid length")
         return key
@@ -184,6 +192,8 @@ class KeyStore:
         fd: int | None = None
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if os.name == "nt":
+                flags |= os.O_BINARY  # Persist exactly the generated key bytes.
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(temporary, flags, 0o600)
