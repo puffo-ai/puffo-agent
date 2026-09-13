@@ -8,7 +8,11 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..._proc import no_window_kwargs
+from ...agent.harness.support.cleanup_errors import collect_cleanup_errors, raise_collected_errors
+from ...agent.harness.support.subprocess_io import (
+    abandon_process_transport, process_group_spawn_kwargs, shutdown_process_tree,
+)
+from ...tasks import spawn
 from ..state import home_dir
 
 
@@ -74,8 +78,10 @@ async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
         str(launch.executable), *args, cwd=launch.workspace,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         limit=8193,
-        **no_window_kwargs(),
+        **process_group_spawn_kwargs(),
     )
+    waiter = spawn(process.wait(), name="lingtai.command.wait")
+    errors: list[BaseException] = []
     try:
         async with asyncio.timeout(30):
             assert process.stderr is not None
@@ -84,12 +90,24 @@ async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
                 raise ValueError("LingTai error output exceeded the size limit")
             except asyncio.IncompleteReadError as exc:
                 error = exc.partial
-            code = await process.wait()
-    except BaseException:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        raise
+            code = await asyncio.shield(waiter)
+    except BaseException as exc:
+        errors.append(exc)
+    await _close_command(process, waiter, errors)
     if code:
         detail = error.decode("utf-8", errors="replace").strip()
         raise ValueError(detail or f"LingTai command failed with exit code {code}")
+
+
+async def _close_command(process, waiter: asyncio.Task, errors: list[BaseException]) -> None:
+    # Join cleanup despite repeated request cancellation. The waiter starts at
+    # spawn time, before a short-lived parent can exit with inherited pipes open.
+    await collect_cleanup_errors(
+        shutdown_process_tree(process, waiter=waiter, timeout=1,
+                              task_name="lingtai.command.shutdown"),
+        errors, timeout=10,
+    )
+    if not waiter.done():
+        abandon_process_transport(process)
+        waiter.cancel()
+    raise_collected_errors("LingTai command and cleanup failed", errors)

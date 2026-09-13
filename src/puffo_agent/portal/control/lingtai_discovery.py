@@ -12,7 +12,9 @@ import sys
 import time
 from pathlib import Path
 
-from ..._proc import no_window_kwargs
+from ...agent.harness.support.subprocess_io import process_group_spawn_kwargs
+from ...tasks import spawn
+from .lingtai import _close_command
 from ..state import AgentConfig, discover_agents, home_dir
 from .ownership import is_owner
 
@@ -136,21 +138,23 @@ async def _query(executable: str, root: Path, registry: Path) -> list[dict]:
         "--registry", str(registry), "--json",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         limit=_MAX_OUTPUT + 1,
-        **no_window_kwargs(),
+        **process_group_spawn_kwargs(),
     )
+    waiter = spawn(process.wait(), name="lingtai.discovery.wait")
+    errors: list[BaseException] = []
     try:
-        async with asyncio.timeout(10):
-            assert process.stdout is not None
-            output = await process.stdout.readexactly(_MAX_OUTPUT + 1)
-            raise ValueError("LingTai discovery result is too large")
-    except asyncio.IncompleteReadError as exc:
-        output = exc.partial
-        # EOF can precede process exit; bound this wait separately too.
-        await asyncio.wait_for(process.wait(), timeout=2)
-    finally:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+        try:
+            async with asyncio.timeout(10):
+                assert process.stdout is not None
+                output = await process.stdout.readexactly(_MAX_OUTPUT + 1)
+                raise ValueError("LingTai discovery result is too large")
+        except asyncio.IncompleteReadError as exc:
+            output = exc.partial
+            # EOF can precede process exit; bound this wait separately too.
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=2)
+    except BaseException as exc:
+        errors.append(exc)
+    await _close_command(process, waiter, errors)
     if process.returncode:
         raise ValueError("LingTai discovery failed; check the installation and search folder")
     payload = json.loads(output)

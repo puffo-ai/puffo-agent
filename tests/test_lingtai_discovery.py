@@ -285,3 +285,70 @@ async def test_executable_folder_search_is_scoped_and_does_not_run_candidates(tm
     assert result["ok"] and result["executables"] == [str(binary)]
     assert result["searched_executable_root"] == str(root)
     assert result["agents"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["provision", "discover"])
+@pytest.mark.parametrize("parent_exits", [False, True])
+async def test_lingtai_cancel_closes_inherited_child_pipes(
+    tmp_path, monkeypatch, operation, parent_exits,
+):
+    """Cancellation must finish when a CLI descendant keeps output pipes open."""
+    import asyncio
+    import os
+    import signal
+    import sys
+    from puffo_agent.portal.control import lingtai
+
+    if os.name == "nt" and parent_exits:
+        pytest.skip("Windows taskkill cannot target a tree after its parent exits")
+    ready = tmp_path / "child.pid"
+    child = (
+        "import os, pathlib, signal, time; "
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if os.name != "nt" else "")
+        + f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    parent = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        + ("" if parent_exits else "time.sleep(60)")
+    )
+    spawn = asyncio.create_subprocess_exec
+    processes = []
+    async def fixture_spawn(*args, **kwargs):
+        if args[0] == "taskkill":
+            return await spawn(*args, **kwargs)
+        process = await spawn(sys.executable, "-c", parent, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fixture_spawn)
+    launch = lingtai.LingtaiLaunch(tmp_path / "cli", tmp_path, tmp_path,
+                                   tmp_path / "registry.json", "test")
+    task = asyncio.create_task(
+        lingtai._command(launch, []) if operation == "provision"
+        else discovery._query(str(launch.executable), tmp_path, launch.registry)
+    )
+    try:
+        async with asyncio.timeout(5):
+            while not ready.exists():
+                await asyncio.sleep(.01)
+            if parent_exits:
+                while processes[0].returncode is None:
+                    await asyncio.sleep(.01)
+        task.cancel("test cancellation")
+        done, _ = await asyncio.wait({task}, timeout=4)
+        assert task in done, "CLI cleanup hangs on a descendant's inherited pipe"
+        with pytest.raises(asyncio.CancelledError, match="test cancellation"):
+            task.result()
+        assert processes[0]._transport.is_closing()
+    finally:
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

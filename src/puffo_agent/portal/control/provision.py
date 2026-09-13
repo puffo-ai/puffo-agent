@@ -390,7 +390,13 @@ async def provision_agent_from_bundle(
     if launch is not None:
         try:
             validate_import_profile(payload, launch.agent_dir)
-            await provision_lingtai(launch)
+            try:
+                await provision_lingtai(launch)
+            except BaseException:
+                # Registration may be committed before the CLI exits. A lost
+                # result must revoke this attempt's binding before a retry.
+                await _rollback_lingtai(launch)
+                raise
         except (ValueError, OSError, asyncio.TimeoutError) as exc:
             raise ProvisionError(f"LingTai runtime provisioning failed: {exc}") from exc
     try:

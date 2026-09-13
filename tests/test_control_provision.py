@@ -578,6 +578,23 @@ async def test_lingtai_rollback_failure_preserves_original_error(lingtai_creatio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TimeoutError("CLI timed out"), asyncio.CancelledError("cancelled")])
+async def test_lingtai_interrupted_registration_revokes_association(
+    lingtai_creation, monkeypatch, failure,
+):
+    """A CLI can commit its registry entry before timing out or being cancelled."""
+    payload, operator, associations = lingtai_creation
+    async def register_then_fail(launch):
+        associations.add((launch.runtime_id, launch.registry))
+        raise failure
+    monkeypatch.setattr(provision, "provision_lingtai", register_then_fail)
+    expected = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else ProvisionError
+    with pytest.raises(expected):
+        await provision_agent_from_bundle(payload, operator)
+    assert not associations
+
+
+@pytest.mark.asyncio
 async def test_lingtai_repeated_cancellation_finishes_rollback(lingtai_creation, monkeypatch):
     """A second shutdown cancellation must not interrupt revoke or replace the first."""
     payload, operator, associations = lingtai_creation
