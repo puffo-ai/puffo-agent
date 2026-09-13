@@ -395,7 +395,10 @@ async def test_lingtai_cancel_closes_inherited_child_pipes(
         with pytest.raises(asyncio.CancelledError, match="test cancellation") as cancelled:
             task.result()
         assert cleanup_errors(cancelled.value) == ()
-        assert not child_process.is_running() or child_process.status() == psutil.STATUS_ZOMBIE
+        try:
+            assert not child_process.is_running() or child_process.status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            pass  # The child exited between the two process-state reads.
         assert processes[0]._transport.is_closing()
     finally:
         if ready.exists():
