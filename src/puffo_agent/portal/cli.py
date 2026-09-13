@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .cli_parser import build_parser as build_cli_parser
+from .desktop_dependencies import desktop_error_message, prepare_desktop
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -278,18 +279,6 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-# Shown when a GUI entry point (``start --ui`` / ``start --background``) is
-# invoked but its required PySide6 dependency cannot be imported.
-_GUI_EXTRA_HINT = (
-    "the desktop UI dependency (PySide6) could not be imported. "
-    "Repair the installation with:\n\n    pip install --upgrade --force-reinstall puffo-agent\n"
-    "or, for a uv tool install:\n"
-    "    uv tool install --force puffo-agent\n\n"
-    "(the headless daemon — `puffo-agent start` with no UI flag — runs "
-    "without it.)"
-)
-
-
 def cmd_start(args: argparse.Namespace) -> int:
     # The PySide6 import inside run_tray/launch is deferred to call time,
     # so the ImportError surfaces from the call, not the ``from .ui...``
@@ -297,11 +286,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
         try:
+            prepare_desktop()
             from .ui.tray import run_tray
 
             return run_tray()
-        except ImportError:
-            print(_GUI_EXTRA_HINT, file=sys.stderr)
+        except ImportError as exc:
+            print(desktop_error_message(exc), file=sys.stderr)
             return 1
     if getattr(args, "background", False):
         from .background import spawn_background
@@ -313,11 +303,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         return spawn_headless_background()
     if getattr(args, "ui", False):
         try:
+            prepare_desktop()
             from .ui.launcher import launch
 
             return launch()
-        except ImportError:
-            print(_GUI_EXTRA_HINT, file=sys.stderr)
+        except ImportError as exc:
+            print(desktop_error_message(exc), file=sys.stderr)
             return 1
     logging.basicConfig(
         level=logging.INFO,
