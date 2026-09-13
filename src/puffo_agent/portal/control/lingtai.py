@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..._proc import no_window_kwargs
 from ..state import home_dir
 
 
@@ -73,6 +74,7 @@ async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
         str(launch.executable), *args, cwd=launch.workspace,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         limit=8193,
+        **no_window_kwargs(),
     )
     try:
         async with asyncio.timeout(30):

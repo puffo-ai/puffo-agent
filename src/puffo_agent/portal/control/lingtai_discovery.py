@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+from ..._proc import no_window_kwargs
 from ..state import AgentConfig, discover_agents, home_dir
 from .ownership import is_owner
 
@@ -135,6 +136,7 @@ async def _query(executable: str, root: Path, registry: Path) -> list[dict]:
         "--registry", str(registry), "--json",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         limit=_MAX_OUTPUT + 1,
+        **no_window_kwargs(),
     )
     try:
         async with asyncio.timeout(10):
