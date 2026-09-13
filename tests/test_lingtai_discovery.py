@@ -348,9 +348,10 @@ async def test_lingtai_cancel_closes_inherited_child_pipes(
     """Cancellation must finish when a CLI descendant keeps output pipes open."""
     import asyncio
     import os
-    import signal
     import sys
     from puffo_agent.portal.control import lingtai
+    import psutil
+    from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
 
     if os.name == "nt" and parent_exits:
         pytest.skip("Windows taskkill cannot target a tree after its parent exits")
@@ -387,17 +388,20 @@ async def test_lingtai_cancel_closes_inherited_child_pipes(
             if parent_exits:
                 while processes[0].returncode is None:
                     await asyncio.sleep(.01)
+        child_process = psutil.Process(int(ready.read_text()))
         task.cancel("test cancellation")
-        done, _ = await asyncio.wait({task}, timeout=4)
+        done, _ = await asyncio.wait({task}, timeout=11)
         assert task in done, "CLI cleanup hangs on a descendant's inherited pipe"
-        with pytest.raises(asyncio.CancelledError, match="test cancellation"):
+        with pytest.raises(asyncio.CancelledError, match="test cancellation") as cancelled:
             task.result()
+        assert cleanup_errors(cancelled.value) == ()
+        assert not child_process.is_running() or child_process.status() == psutil.STATUS_ZOMBIE
         assert processes[0]._transport.is_closing()
     finally:
         if ready.exists():
             try:
-                os.kill(int(ready.read_text()), signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
-            except ProcessLookupError:
+                psutil.Process(int(ready.read_text())).kill()
+            except psutil.NoSuchProcess:
                 pass
         for process in processes:
             if process.returncode is None:

@@ -102,8 +102,9 @@ async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
 async def _close_command(process, waiter: asyncio.Task, errors: list[BaseException]) -> None:
     # Join cleanup despite repeated request cancellation. The waiter starts at
     # spawn time, before a short-lived parent can exit with inherited pipes open.
+    # Native Windows taskkill startup can exceed one second.
     await collect_cleanup_errors(
-        shutdown_process_tree(process, waiter=waiter, timeout=1,
+        shutdown_process_tree(process, waiter=waiter, timeout=3 if os.name == "nt" else 1,
                               task_name="lingtai.command.shutdown"),
         errors, timeout=10,
     )
