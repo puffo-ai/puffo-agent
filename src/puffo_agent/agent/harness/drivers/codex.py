@@ -11,7 +11,6 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from ...._proc import no_window_kwargs
 from ...cli_bin import normalize_launch_argv
 from ...errors import AgentAPIError, ProviderFailureError
 from ...provider_failures import (
@@ -56,7 +55,11 @@ from ..support.jsonl_rpc import (
     read_json_line,
     write_json_line,
 )
-from ..support.subprocess_io import drain_subprocess_stream
+from ..support.subprocess_io import (
+    drain_subprocess_stream,
+    process_group_spawn_kwargs,
+    shutdown_process_tree,
+)
 from ....tasks import spawn
 
 CODEX_CAPABILITIES = DriverCapabilities(
@@ -373,7 +376,7 @@ class CodexAppServerDriver(Driver):
                 # One provider frame can carry a large tool result; the default
                 # 64 KiB stream limit would terminate the reader mid-session.
                 limit=16 * 1024 * 1024,
-                **no_window_kwargs(),
+                **process_group_spawn_kwargs(),
             )
         else:
             self._proc = self.process_factory(spec)
@@ -542,14 +545,15 @@ class CodexAppServerDriver(Driver):
         if self._closed:
             return
         self._closed = True
-        proc, self._proc = self._proc, None
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+        proc = self._proc
+        try:
+            await shutdown_process_tree(
+                proc, waiter=None, timeout=3, task_name="codex-close",
+            )
+        except BaseException:
+            # Keep ownership so a later close can retry interrupted cleanup.
+            self._closed = False
+            raise
         if self._reader is not None:
             self._reader.cancel()
             await asyncio.gather(self._reader, return_exceptions=True)
@@ -558,6 +562,7 @@ class CodexAppServerDriver(Driver):
             await asyncio.gather(self._stderr_reader, return_exceptions=True)
         self._reader = None
         self._stderr_reader = None
+        self._proc = None
         fail_pending_requests(self._pending, "Codex app-server closed")
         self._active = TurnRef("")
         self._active_native_turn_id = ""

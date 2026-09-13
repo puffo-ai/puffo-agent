@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ def _seed_codex_tmp(root: Path) -> Path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows archives preserve provider tmp files")
 async def test_drain_removes_codex_tmp_on_clean_path(tmp_path: Path):
     codex_tmp = _seed_codex_tmp(tmp_path)
     assert codex_tmp.exists()
@@ -42,6 +44,7 @@ async def test_drain_is_noop_when_codex_dir_missing(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows archives preserve provider tmp files")
 async def test_drain_retries_then_succeeds(monkeypatch, tmp_path: Path):
     codex_tmp = _seed_codex_tmp(tmp_path)
 
@@ -69,6 +72,7 @@ async def test_drain_retries_then_succeeds(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows archives preserve provider tmp files")
 async def test_drain_falls_back_to_ignore_errors_after_exhaustion(
     monkeypatch, tmp_path: Path,
 ):

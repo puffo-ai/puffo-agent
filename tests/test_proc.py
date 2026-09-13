@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -27,7 +28,8 @@ def _finished_process():
     stdout.feed_eof()
     stderr.feed_eof()
     return SimpleNamespace(
-        stdin=object(), stdout=stdout, stderr=stderr, returncode=0
+        stdin=object(), stdout=stdout, stderr=stderr, returncode=0,
+        wait=AsyncMock(return_value=0),
     )
 
 
@@ -60,7 +62,7 @@ async def test_cli_drivers_request_windowless_child_processes(monkeypatch, provi
     module = claude_code_driver if provider == "claude" else codex_driver
     monkeypatch.setattr(
         module,
-        "no_window_kwargs",
+        "no_window_kwargs" if provider == "claude" else "process_group_spawn_kwargs",
         lambda: {"creationflags": _CREATE_NO_WINDOW},
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)

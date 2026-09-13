@@ -705,12 +705,6 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
-        # Heartbeat must precede revoke — afterwards the device is 401'd.
-        if cfg_for_revoke is not None:
-            try:
-                await _report_lifecycle(cfg_for_revoke, "archived")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("agent %s: archived report failed: %s", agent_id, exc)
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -732,6 +726,10 @@ class Daemon:
             return
         pc = cfg_for_revoke.puffo_core
         try:
+            # Only advertise completed local work, using the relocated keys.
+            # Heartbeat still precedes revoke, which invalidates those keys.
+            if not await _report_lifecycle(cfg_for_revoke, "archived", directory=dest):
+                raise RuntimeError("archived lifecycle report is pending")
             await revoke_archived_device(dest, slug=pc.slug)
             logger.info("agent %s: device revoked server-side", agent_id)
             return
@@ -754,6 +752,7 @@ class Daemon:
                     slug=identity.slug,
                     device_id=identity.device_id,
                     last_error=reason,
+                    lifecycle_status="archived",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -796,7 +795,7 @@ class Daemon:
             return
         if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
             try:
-                shutil.rmtree(dest)
+                await asyncio.to_thread(shutil.rmtree, _archive_fs_path(dest))
                 logger.info("agent %s: deleted", agent_id)
             except OSError as exc:
                 logger.warning(
@@ -837,7 +836,7 @@ class Daemon:
                 )
             return
         try:
-            shutil.rmtree(dest)
+            await asyncio.to_thread(shutil.rmtree, _archive_fs_path(dest))
             logger.info("agent %s: deleted", agent_id)
         except OSError as exc:
             logger.warning(
@@ -848,7 +847,9 @@ class Daemon:
             )
 
 
-async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
+async def _report_lifecycle(
+    agent_cfg: AgentConfig, status: str, *, directory: Path | None = None,
+) -> bool:
     """Report an operator lifecycle state (paused/archived) to the server as the
     agent. The worker is stopped at this point, so it can't heartbeat the state
     itself; the daemon does it out-of-band. Returns True when the report is
@@ -862,7 +863,8 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
     pc = agent_cfg.puffo_core
     if not pc.is_configured():
         return True  # can never report without config — settled, don't retry
-    http = PuffoCoreHttpClient(pc.server_url, KeyStore.for_agent(agent_cfg.id), pc.slug)
+    keystore = KeyStore(directory / "keys") if directory is not None else KeyStore.for_agent(agent_cfg.id)
+    http = PuffoCoreHttpClient(pc.server_url, keystore, pc.slug)
     try:
         body: dict = {"status": status}
         machine_id = current_machine_id()
@@ -904,7 +906,27 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
 _ARCHIVE_RETRY_BACKOFF_SECONDS = (3.0, 6.0, 12.0, 12.0)
 
 
+def _archive_fs_path(path: Path) -> str:
+    """Permit archived child paths beyond MAX_PATH without registry changes."""
+    value = os.path.abspath(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
 async def _retry_move(src: Path, dest: Path) -> OSError | None:
+    if os.name == "nt":
+        # Both directories live under the same Puffo home. Rename the tree
+        # without reading locked children or expanding their MAX_PATH names.
+        # Never copy/delete on failure: the flag lets the next tick retry,
+        # and an existing destination must remain untouched.
+        try:
+            await asyncio.to_thread(os.rename, _archive_fs_path(src), _archive_fs_path(dest))
+        except OSError as exc:
+            return exc
+        return None
     # shutil.move's copytree+rmtree fallback hollows out src when a
     # child file is locked (Windows aiosqlite WAL/SHM after stop_worker).
     # Split: copy (read-only on src) then best-effort rmtree.
@@ -936,6 +958,9 @@ async def _retry_move(src: Path, dest: Path) -> OSError | None:
 async def _drain_codex_tmp(src: Path) -> None:
     """Windows: codex's .lock in .codex/tmp/ can outlive the subprocess
     by a few hundred ms; pre-clean so the outer move/rmtree doesn't trip."""
+    if os.name == "nt":
+        # Renaming the whole agent does not require deleting provider files.
+        return
     codex_tmp = src / ".codex" / "tmp"
     if not codex_tmp.exists():
         return

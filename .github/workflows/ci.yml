@@ -18,6 +18,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-lifecycle:
+    name: Windows lifecycle (py${{ matrix.python-version }})
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: install
+        run: pip install ".[dev]"
+      - name: Native Windows lifecycle regressions
+        env:
+          PYTHONIOENCODING: utf-8
+        run: >-
+          python -m pytest -q
+          tests/test_windows_archive_lifecycle.py
+          tests/test_background.py
+          tests/test_windows_harness_launch.py
+          tests/test_child_env_allowlist.py
+          tests/test_control_client.py
+          tests/test_proc.py
+          tests/test_archive_codex_tmp_drain.py
+
   quality:
     name: pre-commit
     runs-on: ubuntu-latest

@@ -710,3 +710,33 @@ async def test_write_archived_pending_revoke_schema(tmp_path):
     assert payload["device_id"] == "dev_xyz"
     assert payload["last_error"] == "boom"
     assert isinstance(payload["attempted_at"], int)
+
+
+async def test_archive_revoke_waits_for_pending_lifecycle_report(mock_server, monkeypatch):
+    """A failed terminal heartbeat must not lose its usable signing identity."""
+    from unittest.mock import AsyncMock
+    from puffo_agent.crypto import http_client
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, _state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url)
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-ws-test"
+    agent_dir("alpha").rename(dest)
+    imp.write_archived_pending_revoke(
+        dest, server_url=url, slug=info["slug"], device_id=info["old_device_id"],
+        last_error="offline", lifecycle_status="archived",
+    )
+    http = AsyncMock()
+    http.post.side_effect = [ConnectionError("offline"), {}]
+    monkeypatch.setattr(http_client, "PuffoCoreHttpClient", lambda *args: http)
+    revoke = AsyncMock()
+    monkeypatch.setattr(imp, "self_revoke_device", revoke)
+    assert await imp.sweep_archived_pending_revokes() == 0
+    revoke.assert_not_awaited()
+    assert imp.archived_pending_revoke_path(dest).exists()
+    assert await imp.sweep_archived_pending_revokes() == 1
+    revoke.assert_awaited_once()
+    assert not imp.archived_pending_revoke_path(dest).exists()
