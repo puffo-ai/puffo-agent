@@ -421,6 +421,13 @@ class LocalRuntimePreparer:
         mcp_servers = self._project_protocol_mcp(
             controlled, opencode_config, tuple(launch_args)
         )
+        if (
+            self.harness_name == "opencode"
+            and self.agent_cfg.runtime.permission_mode == "bypassPermissions"
+        ):
+            # Use native config only for the explicitly selected mode, not the
+            # legacy normalizer's fallback for unsupported permission modes.
+            opencode_config["permission"] = "allow"
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
                 opencode_config

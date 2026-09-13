@@ -176,3 +176,47 @@ def test_window_parser_matches_on_object_id_not_line_pairing():
     assert _window_from_models_output(_MODELS_OUTPUT, "absent-model") is None
     assert _window_from_models_output("not json at all { broken", "x") is None
     assert _window_from_models_output("", "x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_registry_probe_cleans_temp_after_exit_or_cancel(monkeypatch, tmp_path, cancel):
+    """The separate context lookup must not leave native libraries in host TMP."""
+    from pathlib import Path
+
+    proc = _TurnProcess()
+    entered = asyncio.Event()
+    directories = []
+
+    async def communicate():
+        entered.set()
+        if cancel:
+            await asyncio.Event().wait()
+        proc.exit()
+        return _MODELS_OUTPUT.encode(), b""
+
+    proc.communicate = communicate
+
+    async def spawn(*command, **kwargs):
+        directory = Path(kwargs["env"]["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").write_bytes(b"library")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    driver = OpenCodeDriver()
+    task = asyncio.create_task(driver.open(RuntimeSpec(
+        str(tmp_path), executable="opencode", model="opencode/hy3-free",
+        environment={"TMPDIR": str(tmp_path)},
+    )))
+    await asyncio.wait_for(entered.wait(), 1)
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+        assert driver._context_window == 190000
+    assert proc.returncode is not None
+    assert directories and all(not p.exists() for p in directories)
+    await driver.close()

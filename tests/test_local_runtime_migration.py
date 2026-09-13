@@ -375,14 +375,15 @@ async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "command"),
+    ("harness", "command", "permission_mode"),
     [
-        ("opencode", []),
-        ("acp", ["/opt/bin/opencode", "acp"]),
+        ("opencode", [], "bypassPermissions"),
+        ("opencode", [], "default"),
+        ("acp", ["/opt/bin/opencode", "acp"], "bypassPermissions"),
     ],
 )
 async def test_generic_runtime_projects_puffo_tools(
-    puffo_home, monkeypatch, harness, command,
+    puffo_home, monkeypatch, harness, command, permission_mode,
 ):
     import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
@@ -396,6 +397,7 @@ async def test_generic_runtime_projects_puffo_tools(
             provider="anthropic",
             harness=harness,
             harness_command=command,
+            permission_mode=permission_mode,
         ),
         puffo_core=PuffoCoreConfig(
             server_url="http://localhost:3000",
@@ -418,11 +420,16 @@ async def test_generic_runtime_projects_puffo_tools(
     instruction_path = Path(inline["instructions"][0])
     assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
     if harness == "opencode":
+        if permission_mode == "bypassPermissions":
+            assert inline["permission"] == "allow"
+        else:
+            assert "permission" not in inline
         assert inline["mcp"]["puffo"]["command"] == [
             server.command,
             *server.args,
         ]
     else:
+        assert "permission" not in inline
         assert "mcp" not in inline
 
 

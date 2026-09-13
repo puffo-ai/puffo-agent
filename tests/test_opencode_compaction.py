@@ -241,3 +241,34 @@ def test_summarize_requires_documented_true_acknowledgement():
         _require_summarize_ack(200, "okay")
     with pytest.raises(RuntimeError, match="unexpected acknowledgement"):
         _require_summarize_ack(200, "false")
+
+
+@pytest.mark.asyncio
+async def test_serve_cancellation_reaps_before_reclaiming_temp(monkeypatch, tmp_path):
+    """Cancelling compaction must reclaim the transient server's native files."""
+    from pathlib import Path
+
+    proc = _TurnProcess()
+    entered = asyncio.Event()
+    directories = []
+
+    async def spawn(*command, **kwargs):
+        directory = Path(kwargs["env"]["TMPDIR"])
+        directories.append(directory)
+        (directory / "native.so").write_bytes(b"library")
+        entered.set()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    driver = OpenCodeDriver()
+    task = asyncio.create_task(driver._summarize_via_serve(
+        RuntimeSpec(str(tmp_path), executable="opencode",
+                    environment={"TMPDIR": str(tmp_path)}), "session",
+    ))
+    await asyncio.wait_for(entered.wait(), 1)
+    assert (directories[0] / "native.so").exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.returncode is not None
+    assert all(not p.exists() for p in directories)

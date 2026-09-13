@@ -33,8 +33,6 @@ def build_opencode_run_command(
         command.extend(("--model", spec.model))
     if native_session_id:
         command.extend(("--session", native_session_id))
-    if spec.permission_mode == "bypassPermissions":
-        command.append("--auto")
     command.extend(spec.launch_args)
     command.append(prompt)
     return tuple(command)
