@@ -9,12 +9,50 @@ to the right entry point.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
+import venv
 
+import pytest
 
 from puffo_agent.portal import background as bg
 from puffo_agent.portal.state import DaemonStartupState
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows venv redirector")
+def test_windows_venv_background_has_no_visible_console(tmp_path):
+    """The venv redirector must not give the real daemon a closable console."""
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    result_path = tmp_path / "console.json"
+    script = (
+        "import ctypes, json, pathlib, sys\n"
+        "kernel = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+        "user = ctypes.WinDLL('user32', use_last_error=True)\n"
+        "kernel.GetConsoleWindow.restype = ctypes.c_void_p\n"
+        "user.IsWindowVisible.argtypes = [ctypes.c_void_p]\n"
+        "window = kernel.GetConsoleWindow()\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+        "'visible': bool(user.IsWindowVisible(window)), 'prefix': sys.prefix}))\n"
+        "print('background output remains available', flush=True)\n"
+    )
+    log_path = tmp_path / "background.log"
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [str(environment / "Scripts" / "python.exe"), "-c", script, str(result_path)],
+            **bg.detach_kwargs(log),
+        )
+        try:
+            assert proc.wait(timeout=30) == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+    result = json.loads(result_path.read_text())
+    assert result["prefix"].casefold() == str(environment).casefold()
+    assert not result["visible"], "venv launcher created a visible daemon console"
+    assert "background output remains available" in log_path.read_text()
 
 
 def test_detached_runner_commands_use_dash_m():

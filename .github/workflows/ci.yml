@@ -18,6 +18,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-background:
+    name: Windows background (py${{ matrix.python-version }})
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Exercise the real Windows venv launcher
+        run: python -m pytest -v tests/test_background.py -k windows_venv_background
+
   quality:
     name: pre-commit
     runs-on: ubuntu-latest
