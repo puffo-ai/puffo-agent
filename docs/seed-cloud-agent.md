@@ -31,14 +31,14 @@ long form — what the command does and how to run the pieces by hand.
 | `E2B_API_KEY` | `--verify` | in `~/.env`; the platform E2B key |
 
 ### Two preconditions
-- puffo-agent checkout on branch **`feat/seed-to-s3`** (tool flags and skill live there until merged).
+- puffo-agent checkout on **`main`**.
 - **The cloud agent already exists** — created in the Hub (name, runtime, model, LLM plan). No CLI can create a Hub-visible agent; the Hub mints identity, bridge token, group membership and the slug.
 
 ## The commands
 
 ```bash
 # 0. the tool's branch
-cd /Volumes/External/workspace/puffo-agent && git checkout feat/seed-to-s3 && git pull
+cd /Volumes/External/workspace/puffo-agent && git checkout main && git pull
 
 # 1. credentials (token resolved in-process, never printed; only E2B_API_KEY from ~/.env —
 #    sourcing all of ~/.env also exports the wrong AWS account's keys)
@@ -89,7 +89,7 @@ python3 tools/seed_cloud_agent.py --from "$LOCAL" --to "$SLUG" --profile --deliv
 
 ## Triggering it with the skill instead
 
-In a Claude Code session whose working directory is **puffo-agent** on `feat/seed-to-s3`:
+In a Claude Code session whose working directory is **puffo-agent** (`main`):
 
 ```
 /agent-seed
