@@ -70,7 +70,7 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
     start_mode.add_argument(
         "--detach",
         action="store_true",
-        help="Detach the headless daemon without requiring the desktop GUI extra.",
+        help="Detach the daemon without launching the desktop window or tray.",
     )
     # Internal: the detached child that --background spawns to host the
     # tray. Hidden from --help.

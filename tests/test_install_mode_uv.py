@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
 from puffo_agent.portal.cli import (
     _is_uv_tool_install,
     upgrade_command_for_install_mode,
@@ -38,23 +36,6 @@ class TestIsUvToolInstall:
 
 
 class TestUpgradeCommandForInstallMode:
-    @pytest.fixture(autouse=True)
-    def headless_environment(self):
-        with patch("importlib.util.find_spec", return_value=None):
-            yield
-
-    @pytest.mark.parametrize("source, uv, expected", [
-        (False, True, 'uv tool install "puffo-agent[gui]" --force'),
-        (False, False, 'pip install --upgrade "puffo-agent[gui]"'),
-        (True, False, 'pip install --upgrade --user "puffo-agent[gui] @ git+https://github.com/puffo-ai/puffo-agent.git"'),
-    ])
-    def test_desktop_upgrade_preserves_gui_extra(self, source, uv, expected):
-        # Reinstalling a desktop tool without its extra can remove Qt.
-        with patch("importlib.util.find_spec", return_value=object()), \
-             patch("puffo_agent.portal.cli.is_source_install", return_value=source), \
-             patch("puffo_agent.portal.cli._is_uv_tool_install", return_value=uv):
-            assert upgrade_command_for_install_mode() == expected
-
     def test_source_install_path_wins(self):
         with patch("puffo_agent.portal.cli.is_source_install", return_value=True):
             cmd = upgrade_command_for_install_mode()

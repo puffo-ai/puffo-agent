@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import logging
 import os
 import shutil
@@ -193,20 +192,14 @@ def _is_uv_tool_install() -> bool:
 
 def upgrade_command_for_install_mode() -> str:
     """Suggested upgrade command for the current install mode."""
-    # Preserve desktop support without importing Qt into a headless daemon.
-    gui = importlib.util.find_spec("PySide6") is not None
-    package = '"puffo-agent[gui]"' if gui else "puffo-agent"
     if is_source_install():
-        requirement = "git+https://github.com/puffo-ai/puffo-agent.git"
-        if gui:
-            requirement = f"puffo-agent[gui] @ {requirement}"
         return (
             "pip install --upgrade --user "
-            f'"{requirement}"'
+            "'git+https://github.com/puffo-ai/puffo-agent.git'"
         )
     if _is_uv_tool_install():
-        return f"uv tool install {package} --force"
-    return f"pip install --upgrade {package}"
+        return "uv tool install puffo-agent --force"
+    return "pip install --upgrade puffo-agent"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,14 +279,12 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 # Shown when a GUI entry point (``start --ui`` / ``start --background``) is
-# invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
-# The base ``pip install puffo-agent`` is deliberately Qt-free so headless
-# / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
+# invoked but its required PySide6 dependency cannot be imported.
 _GUI_EXTRA_HINT = (
-    "the desktop UI requires the [gui] extra (PySide6), which is not "
-    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n"
+    "the desktop UI dependency (PySide6) could not be imported. "
+    "Repair the installation with:\n\n    pip install --upgrade --force-reinstall puffo-agent\n"
     "or, for a uv tool install:\n"
-    "    uv tool install --force 'puffo-agent[gui]'\n\n"
+    "    uv tool install --force puffo-agent\n\n"
     "(the headless daemon — `puffo-agent start` with no UI flag — runs "
     "without it.)"
 )
@@ -302,7 +293,7 @@ _GUI_EXTRA_HINT = (
 def cmd_start(args: argparse.Namespace) -> int:
     # The PySide6 import inside run_tray/launch is deferred to call time,
     # so the ImportError surfaces from the call, not the ``from .ui...``
-    # line — wrap both so a missing [gui] extra yields the actionable hint
+    # line — wrap both so a missing GUI dependency yields the actionable hint
     # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
         try:
