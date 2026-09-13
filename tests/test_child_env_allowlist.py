@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -320,3 +321,123 @@ def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
         "build the child environment with child_env.build_child_environment "
         "once, then pass RuntimeSpec.environment through unchanged."
     )
+
+
+# ── Windows case-insensitivity ────────────────────────────────────────────
+#
+# Windows environment variable names are case-insensitive and Python's
+# Windows os.environ upper-cases every key. The allowlist was compared with
+# ``in``, so entries written in mixed case never matched what the OS hands
+# us and those variables were dropped from every child.
+#
+# ``case_insensitive`` is passed explicitly throughout so both platforms'
+# behaviour is asserted on whichever runner this lands on, and so the
+# case-sensitive contrast below can be stated as a test at all.
+#
+# Note what did *not* let this through: this module is already in the native
+# Windows CI job, so the Windows branch was being executed. What was missing
+# was any assertion naming these four variables -- the only Windows name
+# under test was SYSTEMROOT, which happens to be the one spelled twice in
+# the allowlist. Running on the right platform is not coverage of the right
+# names.
+
+# Reported missing in the shipped wheels: 2.0.5 lost SYSTEMROOT, and the
+# follow-up restored only SYSTEMROOT while these four stayed broken.
+_WINDOWS_ESSENTIALS = {
+    "SYSTEMROOT": r"C:\Windows",
+    "SYSTEMDRIVE": "C:",
+    "PROGRAMDATA": r"C:\ProgramData",
+    "PROGRAMFILES": r"C:\Program Files",
+    "COMSPEC": r"C:\Windows\system32\cmd.exe",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_WINDOWS_ESSENTIALS))
+def test_windows_essentials_survive_when_names_fold(name):
+    env = build_child_environment(source=_WINDOWS_ESSENTIALS, case_insensitive=True)
+    assert env[name] == _WINDOWS_ESSENTIALS[name]
+
+
+@pytest.mark.parametrize("name", sorted(set(_WINDOWS_ESSENTIALS) - {"SYSTEMROOT"}))
+def test_case_sensitive_matching_is_what_dropped_them(name):
+    """The regression itself, pinned so the fix cannot be quietly reverted.
+
+    This is also the control for the test above: without folding these names
+    really are absent, so the assertion there is capable of failing rather
+    than passing on an environment that was never filtered.
+    """
+    env = build_child_environment(source=_WINDOWS_ESSENTIALS, case_insensitive=False)
+    assert name not in env
+
+
+def test_posix_names_stay_case_sensitive():
+    """PATH and path are two variables on POSIX and must remain two."""
+    env = build_child_environment(
+        source={"PATH": "ambient"}, overrides={"path": "override"},
+        case_insensitive=False,
+    )
+    assert env["PATH"] == "ambient"
+    assert env["path"] == "override"
+
+
+def test_windows_override_replaces_rather_than_duplicating():
+    """One variable must yield one key.
+
+    ``dict.update`` would leave both PATH and Path in the block and let the
+    child pick; on Windows that is a coin toss over the search path.
+    """
+    env = build_child_environment(
+        source={"PATH": "ambient"}, overrides={"Path": "override"},
+        case_insensitive=True,
+    )
+    assert [k for k in env if k.upper() == "PATH"] == ["PATH"]
+    assert env["PATH"] == "override"
+
+
+@pytest.mark.parametrize("name", sorted(PROVIDER_CREDENTIAL_ENV_NAMES))
+def test_credential_strip_folds_case_on_windows(name):
+    """The post-merge strip must not be escapable by re-spelling the name."""
+    env = build_child_environment(
+        source={"PATH": "p"}, overrides={name.title(): "smuggled"},
+        case_insensitive=True,
+    )
+    assert not [k for k in env if k.upper() == name]
+
+
+@pytest.mark.parametrize("name", sorted(PROVIDER_CREDENTIAL_ENV_NAMES))
+def test_case_sensitive_strip_is_the_leak(name):
+    """Control for the test above, and the security half of this bug.
+
+    Under case-sensitive comparison a differently-spelled override walks
+    straight past the strip. On Windows that is the same variable, so the
+    credential reaches the child.
+    """
+    env = build_child_environment(
+        source={"PATH": "p"}, overrides={name.title(): "smuggled"},
+        case_insensitive=False,
+    )
+    assert env[name.title()] == "smuggled"
+
+
+def test_extra_allowed_folds_case_on_windows():
+    env = build_child_environment(
+        source={"CODEX_HOME": "/agents/a/.codex"}, extra_allowed=("Codex_Home",),
+        case_insensitive=True,
+    )
+    assert env["CODEX_HOME"] == "/agents/a/.codex"
+
+
+@pytest.mark.parametrize("fold", [False, True])
+def test_controlled_injection_yields_exactly_one_key(fold):
+    env = build_child_environment(
+        source={"PATH": "p"}, overrides={"OPENAI_API_KEY": "smuggled"},
+        controlled={"OPENAI_API_KEY": "controlled"}, case_insensitive=fold,
+    )
+    assert [k for k in env if k.upper() == "OPENAI_API_KEY"] == ["OPENAI_API_KEY"]
+    assert env["OPENAI_API_KEY"] == "controlled"
+
+
+def test_default_follows_the_host_platform():
+    """``case_insensitive=None`` asks the host; expectations are literals."""
+    env = build_child_environment(source={"SYSTEMDRIVE": "C:"})
+    assert env == ({"SYSTEMDRIVE": "C:"} if os.name == "nt" else {})
