@@ -88,7 +88,7 @@ def test_gui_command_with_missing_dependency_yields_actionable_hint(
     pyside6_blocked, capsys,
 ):
     """`start --ui` with PySide6 absent returns non-zero and prints the
-    `pip install --upgrade --force-reinstall puffo-agent` hint instead of ModuleNotFoundError."""
+    repair hint preserving the original version instead of a downgrade command."""
     cli = importlib.import_module("puffo_agent.portal.cli")
     args = argparse.Namespace(
         ui=True, tray_runner=False, background=False, with_local_bridge=False,
@@ -97,7 +97,9 @@ def test_gui_command_with_missing_dependency_yields_actionable_hint(
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "pip install --upgrade --force-reinstall puffo-agent" in combined
+    assert "original installation source and version" in combined
+    assert "force-reinstall puffo-agent" not in combined
+    assert "libdbus-1-3" in combined
 
 
 def test_tray_command_with_missing_dependency_yields_actionable_hint(
@@ -112,4 +114,6 @@ def test_tray_command_with_missing_dependency_yields_actionable_hint(
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "pip install --upgrade --force-reinstall puffo-agent" in combined
+    assert "original installation source and version" in combined
+    assert "force-reinstall puffo-agent" not in combined
+    assert "libdbus-1-3" in combined

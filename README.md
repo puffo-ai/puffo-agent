@@ -54,6 +54,29 @@ loaded as `cli-local` and keep their persisted profile and state.
 
 ## 2. Install
 
+### Linux requirements
+
+The 2.0.5 prereleases include PySide6 in every installation. Use a glibc-based
+distribution such as Debian or Ubuntu. Alpine/musl cannot resolve the required
+PySide6 wheels; adding OS graphics libraries does not fix that wheel mismatch.
+For a Linux container deployment, use a Debian/Ubuntu base image.
+
+On a minimal Debian/Ubuntu image, desktop imports also need system libraries:
+
+```bash
+sudo apt-get update
+sudo apt-get install libgl1 libegl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+```
+
+These packages were verified with the published 2.0.5a4 wheel on Debian 12
+x86_64 (Python 3.11, glibc 2.36). A headless daemon (`puffo-agent start`)
+starts without these graphics libraries. An actual desktop session needs a
+working display server and its Qt platform dependencies as well; creating an
+offscreen Qt application is only a smoke check, not interactive desktop validation.
+On small VMs, prefer `uv tool install` to reduce installation overhead.
+
+### Python package
+
 If you manage Python with `uv` (uv-managed interpreter, common on
 macOS via Homebrew + uv), use the `uv tool` path — `pip install`
 fails with PEP 668 `externally-managed-environment` on uv-managed
