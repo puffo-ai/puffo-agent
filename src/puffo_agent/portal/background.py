@@ -13,8 +13,8 @@ import os
 import subprocess
 import sys
 import time
-from importlib.util import find_spec
 
+from .desktop_dependencies import desktop_error_message, prepare_desktop
 from .state import (
     DAEMON_STARTUP_OBSERVATION_SECONDS,
     DaemonStartupState,
@@ -31,11 +31,6 @@ from .state import (
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-_GUI_EXTRA_HINT = (
-    "puffo-agent start --background could not import the desktop dependency "
-    "(PySide6). Repair with: pip install --upgrade --force-reinstall puffo-agent or "
-    "uv tool install --force puffo-agent"
-)
 
 
 def tray_runner_command() -> list[str]:
@@ -193,7 +188,9 @@ def spawn_background() -> int:
     foreground caller, which exits immediately afterward."""
     if (existing := _existing_daemon_result()) is not None:
         return existing
-    if find_spec("PySide6") is None:
-        print(_GUI_EXTRA_HINT, file=sys.stderr)
+    try:
+        prepare_desktop()
+    except ImportError as exc:
+        print(desktop_error_message(exc), file=sys.stderr)
         return 1
     return _spawn_detached(tray_runner_command(), tray=True)

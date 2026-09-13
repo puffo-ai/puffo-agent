@@ -100,19 +100,22 @@ def test_headless_background_reports_existing_daemon_stalled(monkeypatch, capsys
 
 def test_spawn_background_preflights_gui_before_detach(monkeypatch, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: None)
+    def unavailable():
+        raise ImportError("Qt setup failed")
+
+    monkeypatch.setattr(bg, "prepare_desktop", unavailable)
 
     def _no_spawn(*_args, **_kwargs):
         raise AssertionError("must not detach without the GUI dependency")
 
     monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
     assert bg.spawn_background() == 1
-    assert "uv tool install --force puffo-agent" in capsys.readouterr().err
+    assert "Qt setup failed" in capsys.readouterr().err
 
 
 def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
@@ -148,7 +151,7 @@ def test_spawn_background_keeps_a_live_child_after_observation_timeout(
     monkeypatch, tmp_path, capsys
 ):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
@@ -205,7 +208,7 @@ def test_spawn_background_reports_child_exit_before_ready(
     monkeypatch, tmp_path, capsys
 ):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
