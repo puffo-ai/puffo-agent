@@ -255,17 +255,22 @@ def test_disappearing_primary_never_imports_stale_init(tmp_path, monkeypatch, af
     primary = tmp_path / ".agent.json"
     primary.write_text('{"agent_name":"Current"}')
     (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale"}}')
+    opened = False
     def disappearing_open(path, flags):
-        if path != primary:
-            return os.open(path, flags)
-        if after_open:
-            fd = os.open(path, flags)
+        nonlocal opened
+        if path == primary and not after_open:
             primary.unlink()
-            return fd
-        primary.unlink()
-        return os.open(path, flags)
+        fd = os.open(path, flags)
+        opened = True
+        return fd
+    def disappearing_lstat(path):
+        if path == primary and after_open and opened:
+            # Windows cannot unlink this open CRT handle; inject that race at
+            # the path lookup boundary while retaining real descriptor I/O.
+            raise FileNotFoundError(path)
+        return os.lstat(path)
     monkeypatch.setattr(lingtai_profile, "os", SimpleNamespace(
-        **{**vars(os), "open": disappearing_open},
+        **{**vars(os), "open": disappearing_open, "lstat": disappearing_lstat},
     ))
     profile = lingtai_profile.read_source_profile(tmp_path)
     assert profile.profile_read_error == "source_unreadable"
