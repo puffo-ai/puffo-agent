@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,7 @@ async def test_discovery_cli_contract_and_hidden_root(tmp_path, monkeypatch):
     # Run the Python CLI fixture explicitly; Windows does not execute shebangs.
     create_process = discovery.asyncio.create_subprocess_exec
     async def launch_fixture(program, *args, **kwargs):
-        assert program == sys.executable
+        assert Path(program) == Path(sys.executable).resolve()
         return await create_process(program, str(executable), *args, **kwargs)
     monkeypatch.setattr(discovery.asyncio, "create_subprocess_exec", launch_fixture)
     monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
