@@ -9,21 +9,51 @@ to the right entry point.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 
 from puffo_agent.portal import background as bg
 from puffo_agent.portal.state import DaemonStartupState
 
 
-def test_detached_runner_commands_use_dash_m():
+def test_detached_runner_commands_use_dash_m(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
     assert bg.tray_runner_command() == [
         sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner",
     ]
     assert bg.headless_runner_command() == [
         sys.executable, "-m", "puffo_agent.portal.cli", "start",
     ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console regression")
+def test_detached_venv_runner_has_no_console_and_keeps_environment(tmp_path):
+    """Venv python.exe redirects to a child that allocates a fresh console."""
+    probe = (
+        "import ctypes,json,sys; import puffo_agent; "
+        "print(json.dumps({'console':ctypes.windll.kernel32.GetConsoleWindow(),"
+        "'prefix':sys.prefix}),flush=True); "
+        "print('stderr redirected',file=sys.stderr,flush=True)"
+    )
+    for runner in (bg.tray_runner_command, bg.headless_runner_command):
+        with (tmp_path / "probe.log").open("w+b") as log:
+            proc = subprocess.Popen([runner()[0], "-c", probe], **bg.detach_kwargs(log))
+            try:
+                assert proc.wait(timeout=15) == 0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            log.seek(0)
+            lines = log.read().decode().splitlines()
+        result = json.loads(lines[0])
+        assert result["console"] == 0, "detached runner recreated a console"
+        assert Path(result["prefix"]) == Path(sys.prefix)
+        assert lines[1] == "stderr redirected"
 
 
 def test_detach_kwargs_posix(monkeypatch):

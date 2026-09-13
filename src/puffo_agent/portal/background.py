@@ -33,15 +33,29 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
+def _background_python() -> str:
+    # Venv redirectors can allocate a fresh console after being detached.
+    # Some uv trampolines even route pythonw.exe back to python.exe. Launch
+    # the base windowless interpreter and restore the venv in detach_kwargs.
+    if sys.platform == "win32":
+        # Interpreter compatibility boundary: CPython exposes its base
+        # executable; other implementations may only expose sys.executable.
+        base = getattr(sys, "_base_executable", sys.executable)
+        pythonw = os.path.join(os.path.dirname(base), "pythonw.exe")
+        if os.path.isfile(pythonw):
+            return pythonw
+    return sys.executable
+
+
 def tray_runner_command() -> list[str]:
     """Re-invoke this CLI as the detached tray host. ``-m`` avoids
     depending on the ``puffo-agent`` script being on PATH."""
-    return [sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner"]
+    return [_background_python(), "-m", "puffo_agent.portal.cli", "start", "--tray-runner"]
 
 
 def headless_runner_command() -> list[str]:
     """Re-invoke the foreground daemon inside a detached process."""
-    return [sys.executable, "-m", "puffo_agent.portal.cli", "start"]
+    return [_background_python(), "-m", "puffo_agent.portal.cli", "start"]
 
 
 def detach_kwargs(log_handle) -> dict:
@@ -53,6 +67,16 @@ def detach_kwargs(log_handle) -> dict:
         "stderr": log_handle,
     }
     if os.name == "nt":
+        if _background_python() != sys.executable:
+            # This is the mechanism CPython's Windows venv redirector uses.
+            # The child gets the original venv's sys.prefix/site-packages,
+            # while pythonw.exe (not a console redirector) owns its lifetime.
+            kwargs["env"] = {
+                **os.environ,
+                "__PYVENV_LAUNCHER__": os.path.join(
+                    os.path.dirname(sys.executable), "pythonw.exe"
+                ),
+            }
         # DETACHED_PROCESS severs the console connection, but Windows children
         # still inherit their parent's Job object by default.  Terminal hosts
         # and managed launchers may configure that job to terminate its whole

@@ -75,6 +75,12 @@ def test_operational_variables_survive():
         assert env[name] == _AMBIENT[name], name
 
 
+def test_windows_systemroot_survives_python_environ_uppercasing():
+    """Without SYSTEMROOT, the Node launcher aborts in ncrypto::CSPRNG."""
+    source = {"SYSTEMROOT": r"C:\Windows", "OPENAI_API_KEY": "must-not-leak"}
+    assert build_child_environment(source=source) == {"SYSTEMROOT": r"C:\Windows"}
+
+
 def test_open_ended_prefixes_survive():
     env = build_child_environment(source=_AMBIENT)
     assert env["LC_ALL"] == "C.UTF-8"
@@ -218,7 +224,7 @@ IMPLICIT_SUBPROCESS_ENV_EXEMPTIONS = {
 
 def _harness_modules() -> list[str]:
     return [
-        str(path.relative_to(_REPO_ROOT))
+        path.relative_to(_REPO_ROOT).as_posix()
         for path in sorted((_REPO_ROOT / "src/puffo_agent/agent/harness").rglob("*.py"))
     ]
 

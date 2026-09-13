@@ -30,7 +30,9 @@ _BASE_ALLOWLIST = frozenset({
     "TMPDIR", "TMP", "TEMP",
     "LANG", "LANGUAGE",
     # Windows process essentials
-    "USERPROFILE", "SystemRoot", "SystemDrive", "windir", "WINDIR",
+    # Python's Windows os.environ uppercases keys. Node needs SYSTEMROOT
+    # for its crypto initialization before the Codex launcher can run.
+    "USERPROFILE", "SystemRoot", "SYSTEMROOT", "SystemDrive", "windir", "WINDIR",
     "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles",
     "ComSpec", "PATHEXT", "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
