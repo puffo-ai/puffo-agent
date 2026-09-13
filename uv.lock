@@ -1049,7 +1049,7 @@ wheels = [
 
 [[package]]
 name = "puffo-agent"
-version = "2.0.5a3"
+version = "2.0.5a4"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
@@ -1062,6 +1062,7 @@ dependencies = [
     { name = "pillow" },
     { name = "psutil" },
     { name = "pyhpke" },
+    { name = "pyside6" },
     { name = "python-socks" },
     { name = "pyyaml" },
     { name = "tzdata" },
@@ -1074,13 +1075,9 @@ attachments = [
 ]
 dev = [
     { name = "pre-commit" },
-    { name = "pyside6" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-]
-gui = [
-    { name = "pyside6" },
 ]
 
 [package.metadata]
@@ -1097,8 +1094,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pyhpke", specifier = ">=0.6" },
-    { name = "pyside6", marker = "extra == 'dev'", specifier = ">=6.7" },
-    { name = "pyside6", marker = "extra == 'gui'", specifier = ">=6.7" },
+    { name = "pyside6", specifier = ">=6.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-socks", specifier = ">=2.4" },

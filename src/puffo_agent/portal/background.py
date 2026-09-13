@@ -32,9 +32,9 @@ _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _GUI_EXTRA_HINT = (
-    "puffo-agent start --background requires the desktop [gui] extra "
-    "(PySide6). install it with: pip install 'puffo-agent[gui]' or "
-    "uv tool install --force 'puffo-agent[gui]'"
+    "puffo-agent start --background could not import the desktop dependency "
+    "(PySide6). Repair with: pip install --upgrade --force-reinstall puffo-agent or "
+    "uv tool install --force puffo-agent"
 )
 
 
