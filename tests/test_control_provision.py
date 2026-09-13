@@ -441,6 +441,17 @@ def test_partial_write_is_cleaned_up(tmp_path, monkeypatch):
     assert not (tmp_path / "agents/helper-1234").exists()
 
 
+def _run_python_cli_fixture(monkeypatch, executable):
+    """Keep real CLI execution without depending on POSIX shebang support."""
+    from puffo_agent.portal.control import lingtai
+
+    create_process = lingtai.asyncio.create_subprocess_exec
+    async def launch_fixture(program, *args, **kwargs):
+        assert program == str(executable)
+        return await create_process(sys.executable, program, *args, **kwargs)
+    monkeypatch.setattr(lingtai.asyncio, "create_subprocess_exec", launch_fixture)
+
+
 @pytest.mark.asyncio
 async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path, monkeypatch):
     """Browser-selected folders must survive provision into the driver argv/cwd."""
@@ -460,6 +471,7 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
         f"open({str(marker)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
     )
     executable.chmod(0o700)
+    _run_python_cli_fixture(monkeypatch, executable)
     payload, operator = _payload()
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
@@ -494,6 +506,7 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
     executable = tmp_path / "lingtai-agent"
     executable.write_text(f"#!{sys.executable}\nimport sys\nprint('error: puffo-v0 runtime registry parent directory is owned by another user', file=sys.stderr)\nraise SystemExit(1)\n")
     executable.chmod(0o700)
+    _run_python_cli_fixture(monkeypatch, executable)
     payload, operator = _payload()
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
