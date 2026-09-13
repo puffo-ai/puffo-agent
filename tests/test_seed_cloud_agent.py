@@ -11,6 +11,7 @@ slug shapes are in use.
 
 from __future__ import annotations
 
+import base64
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,10 @@ from seed_cloud_agent import (  # noqa: E402
     resolve_one,
     agent_name,
     soul_body,
-    stage,
+    collect_memory,
+    deliver,
+    set_profile,
+    upload,
 )
 
 
@@ -111,41 +115,69 @@ def test_agent_name_handles_both_slug_shapes(slug, expected):
     assert agent_name(slug) == expected
 
 
-class TestStaging:
-    def test_copies_profile_and_memory(self, tmp_path):
+class TestCollectingMemory:
+    """What goes up is memory and only memory. `profile.md` is read for the
+    report but never uploaded: the agent store owns the persona and restores its
+    copy on resume, so a profile written anywhere else is reverted on first idle."""
+
+    def test_memory_is_collected_with_relative_paths(self, tmp_path):
         src = _agent(
             tmp_path / "fleet",
             "desk-6332-b73d5e96",
             profile="# Desk\n\n# Soul\n\nfront of house\n",
             notes=[("notes/a.md", "one"), ("briefing/b.md", "two")],
         )
-        out = stage(src, tmp_path / "repo" / "desk")
+        files, out = collect_memory(src)
+        assert set(files) == {"notes/a.md", "briefing/b.md"}
+        assert files["notes/a.md"] == b"one"
         assert out["memory_files"] == 2
         assert out["soul_chars"] == len("front of house")
-        assert (tmp_path / "repo" / "desk" / "memory" / "notes" / "a.md").read_text() == "one"
 
-    def test_agent_with_no_memory_still_imports(self, tmp_path):
-        """30 of the surveyed fleet have no memory dir — that is not a failure."""
+    def test_the_profile_is_reported_but_not_collected(self, tmp_path):
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n")
+        files, out = collect_memory(src)
+        assert out["profile_bytes"] > 0
+        assert not any("profile" in k for k in files)
+
+    def test_the_managed_briefing_is_carried_and_the_runtime_owns_its_identity(self, tmp_path):
+        """Seeded byte-for-byte, source id and all. Correct: the worker rewrites
+        the managed block for the NEW agent at start and keeps user text outside
+        the markers, so this is how briefing notes travel. Excluding it (an
+        earlier version) threw away user-authored text."""
+        managed = "<!-- puffo:managed-profile -->\nYou are OptionExpert (agent optionexpe-9840-999e4666).\n<!-- /puffo:managed-profile -->\n\nMy own standing note.\n"
+        src = _agent(tmp_path / "fleet", "optionexpe-9840-999e4666", profile="# Soul\nx\n",
+                     notes=[("briefing/profile.md", managed), ("notes/lesson.md", "keep me")])
+        files, out = collect_memory(src)
+        assert set(files) == {"briefing/profile.md", "notes/lesson.md"}
+        assert b"My own standing note." in files["briefing/profile.md"]
+        assert out["memory_files"] == 2
+
+    def test_a_hand_written_briefing_is_still_seeded(self, tmp_path):
+        """Only the managed file is excluded; a user's own briefing note is content."""
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("briefing/context.md", "# My standing context\nremember this")])
+        files, _ = collect_memory(src)
+        assert set(files) == {"briefing/context.md"}
+
+    def test_agent_with_no_memory_is_not_a_failure(self, tmp_path):
+        """30 of the surveyed fleet have no memory dir."""
         src = _agent(tmp_path / "fleet", "grist-1-aaaaaaaa", profile="# Soul\nx\n")
-        out = stage(src, tmp_path / "repo" / "grist")
-        assert out["memory_files"] == 0
-        assert (tmp_path / "repo" / "grist" / "memory").is_dir()
+        files, out = collect_memory(src)
+        assert files == {} and out["memory_files"] == 0
 
     def test_identity_and_bulk_are_left_behind(self, tmp_path):
         """Carrying keys/ would make this a migration; workspace/ is 100MB of
-        reproducible checkout."""
+        reproducible checkout. Only the memory tree is ever read."""
         src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n")
         (src / "keys").mkdir()
         (src / "keys" / "k.json").write_text("SECRET")
         (src / "workspace").mkdir()
         (src / "workspace" / "big.bin").write_text("x" * 1000)
         (src / "messages.db").write_text("db")
-        dest = tmp_path / "repo" / "desk"
-        stage(src, dest)
-        assert not (dest / "keys").exists()
-        assert not (dest / "workspace").exists()
-        assert not (dest / "messages.db").exists()
-        assert {p.name for p in dest.iterdir()} == {"profile.md", "memory"}
+        files, _ = collect_memory(src)
+        blob = b"".join(files.values())
+        assert b"SECRET" not in blob
+        assert not any(k.startswith(("keys", "workspace")) or "messages.db" in k for k in files)
 
     def test_agent_local_git_dir_is_not_carried(self, tmp_path):
         """~/memory is itself a git repo; its .git is scaffolding, not content."""
@@ -155,14 +187,95 @@ class TestStaging:
             profile="# Soul\nx\n",
             notes=[("notes/a.md", "one"), (".git/config", "[core]")],
         )
-        out = stage(src, tmp_path / "repo" / "desk")
-        assert out["memory_files"] == 1
-        assert not (tmp_path / "repo" / "desk" / "memory" / ".git").exists()
+        files, out = collect_memory(src)
+        assert set(files) == {"notes/a.md"} and out["memory_files"] == 1
 
     def test_missing_soul_is_warned_not_fatal(self, tmp_path):
         src = _agent(tmp_path / "fleet", "x-1-aaaaaaaa", profile="# Agent\nprose\n")
-        out = stage(src, tmp_path / "repo" / "x")
+        _, out = collect_memory(src)
         assert out["warnings"] == ["profile has no soul-like heading"]
+
+
+    def test_a_symlink_out_of_the_tree_is_not_followed(self, tmp_path):
+        """`is_file()` is true for a link to a file and `read_bytes()` reads the
+        TARGET — a link under memory/ at ~/.ssh/id_ed25519 would upload the key
+        as a note. Refused, not followed."""
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("real.md", "fine")])
+        secret = tmp_path / "outside" / "id_ed25519"
+        secret.parent.mkdir(); secret.write_text("PRIVATE KEY")
+        (src / "memory" / "leak.md").symlink_to(secret)
+        files, out = collect_memory(src)
+        assert set(files) == {"real.md"}
+        assert b"PRIVATE KEY" not in b"".join(files.values())
+        assert out["memory_files"] == 1
+
+    def test_a_symlinked_directory_is_not_descended(self, tmp_path):
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="# Soul\nx\n",
+                     notes=[("real.md", "fine")])
+        outside = tmp_path / "outside"; outside.mkdir()
+        (outside / "creds.md").write_text("SECRET")
+        (src / "memory" / "linked").symlink_to(outside, target_is_directory=True)
+        files, _ = collect_memory(src)
+        assert b"SECRET" not in b"".join(files.values())
+
+
+class TestUpload:
+    """Upload goes through the control API, never to S3 directly — handing an
+    agent's owner S3 access would hand them a key to the bucket every other
+    agent's config lives in."""
+
+    def test_it_puts_base64_to_the_agents_memory_route(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_control(path, payload):
+            seen["path"] = path
+            seen["payload"] = payload
+            return {"files": len(payload["files"]), "delivered": False}
+
+        monkeypatch.setattr(seed_cloud_agent, "_control", fake_control)
+        n = upload("desk-cloud-2779", {"notes/a.md": b"one"})
+        assert n == 1
+        assert seen["path"] == "/agents/desk-cloud-2779/memory"
+        assert base64.b64decode(seen["payload"]["files"]["notes/a.md"]) == b"one"
+
+    def test_non_utf8_notes_survive_the_round_trip(self, tmp_path, monkeypatch):
+        """Base64 is why: JSON cannot carry raw bytes, and a note is not
+        guaranteed to be text."""
+        raw = b"\xff\xfe\x00binary"
+        captured = {}
+        monkeypatch.setattr(
+            seed_cloud_agent,
+            "_control",
+            lambda p, payload: captured.update(payload) or {"files": 1},
+        )
+        upload("a1", {"odd.bin": raw})
+        assert base64.b64decode(captured["files"]["odd.bin"]) == raw
+
+    def test_a_short_ack_is_an_error_not_a_success(self, monkeypatch):
+        """The server reports what it actually wrote; the client used to report
+        that number as success without comparing it to what it sent."""
+        monkeypatch.setattr(seed_cloud_agent, "_control", lambda p, b: {"files": 2})
+        with pytest.raises(SeedError, match="stored 2 of 3"):
+            upload("a1", {"a.md": b"1", "b.md": b"2", "c.md": b"3"})
+
+    def test_a_full_ack_returns_the_count(self, monkeypatch):
+        monkeypatch.setattr(seed_cloud_agent, "_control", lambda p, b: {"files": 3})
+        assert upload("a1", {"a.md": b"1", "b.md": b"2", "c.md": b"3"}) == 3
+
+    def test_nothing_to_upload_makes_no_call(self, monkeypatch):
+        monkeypatch.setattr(
+            seed_cloud_agent,
+            "_control",
+            lambda p, b: pytest.fail("should not call the API with no files"),
+        )
+        assert upload("a1", {}) == 0
+
+    def test_missing_credentials_is_a_clear_error(self, monkeypatch):
+        monkeypatch.delenv("AIM_CONTROL_URL", raising=False)
+        monkeypatch.delenv("AIM_CONTROL_TOKEN", raising=False)
+        with pytest.raises(SeedError, match="AIM_CONTROL_URL"):
+            seed_cloud_agent._control("/agents/a1/memory", {"files": {}})
 
 
 class TestTheProbeExtractsTheRelayHost:
@@ -206,3 +319,60 @@ class TestTheProbeExtractsTheRelayHost:
     def test_no_server_url_yields_empty_not_garbage(self, tmp_path):
         """Empty is the signal `conns_relay=-1` rides on — it must stay empty."""
         assert self._extract(tmp_path, "harness: claude-code\n") == ""
+
+
+
+class TestDeliver:
+    """Closes "stored, not delivered" without a reboot — a reboot mints a new
+    identity (keys/ lives only in the sandbox) and breaks the Hub agent."""
+
+    def test_it_posts_to_the_deliver_route(self, monkeypatch):
+        seen = {}
+
+        def fake(path, payload, method="PUT"):
+            seen.update(path=path, method=method)
+            return {"delivered": 2, "reason": "seeded into the running sandbox"}
+
+        monkeypatch.setattr(seed_cloud_agent, "_control", fake)
+        out = deliver("desk-cloud-2779")
+        assert seen == {"path": "/agents/desk-cloud-2779/memory/deliver", "method": "POST"}
+        assert out["delivered"] == 2
+
+    def test_a_non_empty_sandbox_is_reported_not_raised(self, monkeypatch):
+        """seed-once: the server leaves an agent with memory alone and says why."""
+        monkeypatch.setattr(
+            seed_cloud_agent, "_control",
+            lambda p, b, method="PUT": {"delivered": 0, "reason": "sandbox memory is not empty"},
+        )
+        out = deliver("a1")
+        assert out["delivered"] == 0 and "not empty" in out["reason"]
+
+    def test_deliver_only_mode_needs_to(self, capsys):
+        with pytest.raises(SystemExit):
+            seed_cloud_agent.main(["--deliver"])
+        assert "--to" in capsys.readouterr().err
+
+    def test_deliver_only_mode_runs_without_from(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            seed_cloud_agent, "_control",
+            lambda p, b, method="PUT": {"delivered": 3, "reason": "seeded"},
+        )
+        assert seed_cloud_agent.main(["--deliver", "--to", "a1"]) == 0
+        assert "delivered 3" in capsys.readouterr().out
+
+
+
+class TestSetProfile:
+    """The Hub's PROFILE field wants a Soul body; a whole profile.md pasted there
+    loses its persona in the briefing. PUT /agents/{slug} with the file verbatim
+    makes the cloud profile byte-identical to local."""
+
+    def test_it_puts_the_local_profile_verbatim(self, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(seed_cloud_agent, "_control",
+                            lambda path, payload, method="PUT": seen.update(path=path, method=method, payload=payload) or {"updated": True})
+        src = _agent(tmp_path / "fleet", "desk-1-aaaaaaaa", profile="**Role:** x\n\n# Soul\n\nrigorous\n")
+        n = set_profile("desk-cloud-2779", src)
+        assert seen["path"] == "/agents/desk-cloud-2779" and seen["method"] == "PUT"
+        assert seen["payload"]["soul"] == "**Role:** x\n\n# Soul\n\nrigorous\n"
+        assert n == len(seen["payload"]["soul"].encode())
