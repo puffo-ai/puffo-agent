@@ -144,7 +144,9 @@ class Daemon:
         self.workers: dict[str, Worker] = {}
         # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
-        self._usage_refresh = asyncio.Event()
+        from .control.client import UsageRefresh
+
+        self._usage_refresh = UsageRefresh()
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
@@ -647,6 +649,8 @@ class Daemon:
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
+            # Invalidate manual and periodic probes, even for healthy workers.
+            self._usage_refresh.invalidate()
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime,
                 agent_id,
@@ -685,7 +689,7 @@ class Daemon:
                 # Token rotation is not proof of renewed quota. Ask the
                 # shared usage loop for fresh evidence before releasing work.
                 if recheck_quota:
-                    self._usage_refresh.set()
+                    self._usage_refresh.event.set()
                 logger.info(
                     "agent %s: credential replaced — provider reload requested "
                     "with %.3fs jitter",

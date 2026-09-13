@@ -370,7 +370,10 @@ def _make_fake_worker():
 def _make_daemon_stub(tmp_path):
     from puffo_agent.portal.daemon import Daemon
 
+    from puffo_agent.portal.control.client import UsageRefresh
+
     daemon = Daemon.__new__(Daemon)
+    daemon._usage_refresh = UsageRefresh()
     _write_creds(tmp_path, expires_in_seconds=600)
     daemon.refresher = CredentialRefresher(host_home=tmp_path)
     daemon.codex_refresher = CredentialRefresher(host_home=tmp_path)
@@ -479,7 +482,6 @@ async def test_refresh_rechecks_quota_without_optimistically_clearing_it(tmp_pat
     from puffo_agent.portal.daemon import refresh_provider_auth_flag_path
 
     daemon = _make_daemon_stub(tmp_path)
-    daemon._usage_refresh = asyncio.Event()
     monkeypatch.setattr("puffo_agent.portal.daemon._provider_auth_reload_jitter_seconds", lambda: 8.0)
     worker = _make_fake_worker()
     worker.runtime.health = "drained"
@@ -493,12 +495,15 @@ async def test_refresh_rechecks_quota_without_optimistically_clearing_it(tmp_pat
         ("drained", False, True),
         ("drained", True, False),
         ("extra_usage_required", False, False),
+        ("ok", False, False),
     ]:
-        daemon._usage_refresh.clear()
+        daemon._usage_refresh.event.clear()
         worker.runtime.health = health
         worker._drained_budget_cap = cap
+        generation = daemon._usage_refresh.generation
         daemon.refresher._fire_refresh_success()
+        assert daemon._usage_refresh.generation == generation + 1
         assert worker.runtime.health == health
-        assert daemon._usage_refresh.is_set() is expected
+        assert daemon._usage_refresh.event.is_set() is expected
         flag = json.loads(refresh_provider_auth_flag_path(cfg.resolve_workspace_dir()).read_text())
         assert flag["jitter_seconds"] == (0.0 if expected else 8.0)
