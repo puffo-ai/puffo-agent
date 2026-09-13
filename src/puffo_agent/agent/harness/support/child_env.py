@@ -133,7 +133,6 @@ def build_child_environment(
     controlled: Mapping[str, str] | None = None,
     extra_allowed: Iterable[str] = (),
     source: Mapping[str, str] | None = None,
-    case_insensitive: bool | None = None,
 ) -> dict[str, str]:
     """Build a child environment from an allowlist.
 
@@ -142,17 +141,36 @@ def build_child_environment(
                    last and exempt from the strip -- this is the one path by
                    which a provider key may legitimately reach a child.
     ``extra_allowed`` names a specific runtime needs (e.g. ``CODEX_HOME``).
-    ``case_insensitive`` how to compare names; ``None`` asks the host, which
-                   means Windows. Passing it explicitly lets one test run
-                   assert both platforms' behaviour on whichever runner it
-                   happens to land on.
 
     Order matters: strip after merging overrides, not only before, so an
     override cannot reintroduce an ambient secret. That ordering is the one
     thing the Claude path already got right and is preserved here.
+
+    Whether names fold is read from the host and is deliberately not a
+    parameter. On Windows the fold is what makes the credential strip cover
+    every spelling of a name, so a caller able to switch it off would be a
+    caller able to turn that strip back into the leak it was. Tests reach
+    ``_build_child_environment`` directly to exercise both platforms.
     """
+    return _build_child_environment(
+        overrides=overrides,
+        controlled=controlled,
+        extra_allowed=extra_allowed,
+        source=source,
+        fold=os.name == "nt",
+    )
+
+
+def _build_child_environment(
+    *,
+    overrides: Mapping[str, str] | None,
+    controlled: Mapping[str, str] | None,
+    extra_allowed: Iterable[str],
+    source: Mapping[str, str] | None,
+    fold: bool,
+) -> dict[str, str]:
+    """Implementation with the platform decision passed in explicitly."""
     ambient = os.environ if source is None else source
-    fold = os.name == "nt" if case_insensitive is None else case_insensitive
     allowed_extra = frozenset(
         name.upper() if fold else name for name in extra_allowed
     )

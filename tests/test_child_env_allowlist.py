@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from puffo_agent.agent.harness.support.child_env import (
     PROVIDER_CREDENTIAL_ENV_NAMES,
+    _build_child_environment,
     build_child_environment,
 )
 
@@ -323,6 +325,24 @@ def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
     )
 
 
+def _build(*, fold, overrides=None, controlled=None, extra_allowed=(), source=None):
+    """Call the implementation with the platform decision supplied.
+
+    The public entry reads the host and takes no such argument on purpose:
+    on Windows the fold is what makes the credential strip cover every
+    spelling, so a caller who could switch it off could reopen that leak.
+    Tests need both platforms, so they go one level down rather than turning
+    the seam into public API or monkeypatching ``os.name`` globally.
+    """
+    return _build_child_environment(
+        overrides=overrides,
+        controlled=controlled,
+        extra_allowed=extra_allowed,
+        source=source,
+        fold=fold,
+    )
+
+
 # ── Windows case-insensitivity ────────────────────────────────────────────
 #
 # Windows environment variable names are case-insensitive and Python's
@@ -330,9 +350,11 @@ def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
 # ``in``, so entries written in mixed case never matched what the OS hands
 # us and those variables were dropped from every child.
 #
-# ``case_insensitive`` is passed explicitly throughout so both platforms'
-# behaviour is asserted on whichever runner this lands on, and so the
-# case-sensitive contrast below can be stated as a test at all.
+# These go through ``_build`` so the platform decision is supplied rather
+# than read from the host: both platforms' behaviour is then asserted on
+# whichever runner this lands on, and the case-sensitive contrast below can
+# be stated as a test at all. The public entry deliberately has no such
+# argument -- see ``_build``.
 #
 # Note what did *not* let this through: this module is already in the native
 # Windows CI job, so the Windows branch was being executed. What was missing
@@ -354,7 +376,7 @@ _WINDOWS_ESSENTIALS = {
 
 @pytest.mark.parametrize("name", sorted(_WINDOWS_ESSENTIALS))
 def test_windows_essentials_survive_when_names_fold(name):
-    env = build_child_environment(source=_WINDOWS_ESSENTIALS, case_insensitive=True)
+    env = _build(source=_WINDOWS_ESSENTIALS, fold=True)
     assert env[name] == _WINDOWS_ESSENTIALS[name]
 
 
@@ -366,15 +388,14 @@ def test_case_sensitive_matching_is_what_dropped_them(name):
     really are absent, so the assertion there is capable of failing rather
     than passing on an environment that was never filtered.
     """
-    env = build_child_environment(source=_WINDOWS_ESSENTIALS, case_insensitive=False)
+    env = _build(source=_WINDOWS_ESSENTIALS, fold=False)
     assert name not in env
 
 
 def test_posix_names_stay_case_sensitive():
     """PATH and path are two variables on POSIX and must remain two."""
-    env = build_child_environment(
-        source={"PATH": "ambient"}, overrides={"path": "override"},
-        case_insensitive=False,
+    env = _build(
+        source={"PATH": "ambient"}, overrides={"path": "override"}, fold=False,
     )
     assert env["PATH"] == "ambient"
     assert env["path"] == "override"
@@ -386,9 +407,8 @@ def test_windows_override_replaces_rather_than_duplicating():
     ``dict.update`` would leave both PATH and Path in the block and let the
     child pick; on Windows that is a coin toss over the search path.
     """
-    env = build_child_environment(
-        source={"PATH": "ambient"}, overrides={"Path": "override"},
-        case_insensitive=True,
+    env = _build(
+        source={"PATH": "ambient"}, overrides={"Path": "override"}, fold=True,
     )
     assert [k for k in env if k.upper() == "PATH"] == ["PATH"]
     assert env["PATH"] == "override"
@@ -397,9 +417,8 @@ def test_windows_override_replaces_rather_than_duplicating():
 @pytest.mark.parametrize("name", sorted(PROVIDER_CREDENTIAL_ENV_NAMES))
 def test_credential_strip_folds_case_on_windows(name):
     """The post-merge strip must not be escapable by re-spelling the name."""
-    env = build_child_environment(
-        source={"PATH": "p"}, overrides={name.title(): "smuggled"},
-        case_insensitive=True,
+    env = _build(
+        source={"PATH": "p"}, overrides={name.title(): "smuggled"}, fold=True,
     )
     assert not [k for k in env if k.upper() == name]
 
@@ -412,32 +431,40 @@ def test_case_sensitive_strip_is_the_leak(name):
     straight past the strip. On Windows that is the same variable, so the
     credential reaches the child.
     """
-    env = build_child_environment(
-        source={"PATH": "p"}, overrides={name.title(): "smuggled"},
-        case_insensitive=False,
+    env = _build(
+        source={"PATH": "p"}, overrides={name.title(): "smuggled"}, fold=False,
     )
     assert env[name.title()] == "smuggled"
 
 
 def test_extra_allowed_folds_case_on_windows():
-    env = build_child_environment(
+    env = _build(
         source={"CODEX_HOME": "/agents/a/.codex"}, extra_allowed=("Codex_Home",),
-        case_insensitive=True,
+        fold=True,
     )
     assert env["CODEX_HOME"] == "/agents/a/.codex"
 
 
 @pytest.mark.parametrize("fold", [False, True])
 def test_controlled_injection_yields_exactly_one_key(fold):
-    env = build_child_environment(
+    env = _build(
         source={"PATH": "p"}, overrides={"OPENAI_API_KEY": "smuggled"},
-        controlled={"OPENAI_API_KEY": "controlled"}, case_insensitive=fold,
+        controlled={"OPENAI_API_KEY": "controlled"}, fold=fold,
     )
     assert [k for k in env if k.upper() == "OPENAI_API_KEY"] == ["OPENAI_API_KEY"]
     assert env["OPENAI_API_KEY"] == "controlled"
 
 
-def test_default_follows_the_host_platform():
-    """``case_insensitive=None`` asks the host; expectations are literals."""
+def test_public_entry_reads_the_host_and_offers_no_override():
+    """The fold is a security property, so callers cannot select it.
+
+    If this ever becomes a public argument, a caller on Windows can switch
+    off the fold and with it the credential strip's coverage of alternate
+    spellings -- the leak pinned above.
+    """
     env = build_child_environment(source={"SYSTEMDRIVE": "C:"})
     assert env == ({"SYSTEMDRIVE": "C:"} if os.name == "nt" else {})
+    assert "fold" not in inspect.signature(build_child_environment).parameters
+    assert "case_insensitive" not in inspect.signature(
+        build_child_environment
+    ).parameters
