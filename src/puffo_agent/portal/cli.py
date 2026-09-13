@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import logging
 import os
 import shutil
@@ -192,14 +193,20 @@ def _is_uv_tool_install() -> bool:
 
 def upgrade_command_for_install_mode() -> str:
     """Suggested upgrade command for the current install mode."""
+    # Preserve desktop support without importing Qt into a headless daemon.
+    gui = importlib.util.find_spec("PySide6") is not None
+    package = '"puffo-agent[gui]"' if gui else "puffo-agent"
     if is_source_install():
+        requirement = "git+https://github.com/puffo-ai/puffo-agent.git"
+        if gui:
+            requirement = f"puffo-agent[gui] @ {requirement}"
         return (
             "pip install --upgrade --user "
-            "'git+https://github.com/puffo-ai/puffo-agent.git'"
+            f'"{requirement}"'
         )
     if _is_uv_tool_install():
-        return "uv tool install puffo-agent --force"
-    return "pip install --upgrade puffo-agent"
+        return f"uv tool install {package} --force"
+    return f"pip install --upgrade {package}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
