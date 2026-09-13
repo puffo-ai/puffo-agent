@@ -9,21 +9,64 @@ to the right entry point.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 
 from puffo_agent.portal import background as bg
 from puffo_agent.portal.state import DaemonStartupState
 
 
-def test_detached_runner_commands_use_dash_m():
+def test_detached_runner_commands_use_dash_m(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
     assert bg.tray_runner_command() == [
         sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner",
     ]
     assert bg.headless_runner_command() == [
         sys.executable, "-m", "puffo_agent.portal.cli", "start",
     ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console regression")
+@pytest.mark.parametrize("breakaway", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(
+        os.environ.get("GITHUB_ACTIONS") == "true",
+        reason="Hosted Actions jobs prohibit process breakaway; exercised locally",
+    )),
+])
+def test_detached_venv_runner_has_no_console_and_keeps_environment(tmp_path, breakaway):
+    """Venv python.exe redirects to a child that allocates a fresh console."""
+    probe = (
+        "import ctypes,json,sys; import puffo_agent; "
+        "print(json.dumps({'console':ctypes.windll.kernel32.GetConsoleWindow(),"
+        "'prefix':sys.prefix}),flush=True); "
+        "print('stderr redirected',file=sys.stderr,flush=True)"
+    )
+    for runner in (bg.tray_runner_command, bg.headless_runner_command):
+        with (tmp_path / "probe.log").open("w+b") as log:
+            kwargs = bg.detach_kwargs(log)
+            if not breakaway:
+                # Console/venv behavior is independent of escaping a parent
+                # Job. CI must keep its children in its restricted Job.
+                kwargs["creationflags"] &= ~bg._CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen([runner()[0], "-c", probe], **kwargs)
+            try:
+                assert proc.wait(timeout=15) == 0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            log.seek(0)
+            lines = log.read().decode().splitlines()
+        result = json.loads(lines[0])
+        assert result["console"] == 0, "detached runner recreated a console"
+        assert Path(result["prefix"]) == Path(sys.prefix)
+        assert lines[1] == "stderr redirected"
 
 
 def test_detach_kwargs_posix(monkeypatch):
@@ -100,19 +143,22 @@ def test_headless_background_reports_existing_daemon_stalled(monkeypatch, capsys
 
 def test_spawn_background_preflights_gui_before_detach(monkeypatch, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: None)
+    def unavailable():
+        raise ImportError("Qt setup failed")
+
+    monkeypatch.setattr(bg, "prepare_desktop", unavailable)
 
     def _no_spawn(*_args, **_kwargs):
         raise AssertionError("must not detach without the GUI dependency")
 
     monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
     assert bg.spawn_background() == 1
-    assert "uv tool install --force puffo-agent" in capsys.readouterr().err
+    assert "Qt setup failed" in capsys.readouterr().err
 
 
 def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
@@ -148,7 +194,7 @@ def test_spawn_background_keeps_a_live_child_after_observation_timeout(
     monkeypatch, tmp_path, capsys
 ):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
@@ -205,7 +251,7 @@ def test_spawn_background_reports_child_exit_before_ready(
     monkeypatch, tmp_path, capsys
 ):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "prepare_desktop", lambda: None)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,

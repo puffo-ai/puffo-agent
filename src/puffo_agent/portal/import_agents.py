@@ -679,6 +679,7 @@ def write_archived_pending_revoke(
     slug: str,
     device_id: str,
     last_error: str,
+    lifecycle_status: str = "",
 ) -> None:
     path = archived_pending_revoke_path(archived_agent_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -686,6 +687,7 @@ def write_archived_pending_revoke(
         json.dumps(
             {
                 "kind": "archive_self_revoke",
+                "lifecycle_status": lifecycle_status,
                 "server_url": server_url,
                 "slug": slug,
                 "device_id": device_id,
@@ -737,6 +739,8 @@ async def _retry_archived_pending_revoke(
         decode_secret(identity.device_signing_secret_key)
     )
     try:
+        if payload.get("lifecycle_status") == "archived":
+            await _report_archived_before_revoke(server_url, slug, keystore)
         await self_revoke_device(
             server_url=server_url,
             slug=slug,
@@ -756,6 +760,26 @@ async def _retry_archived_pending_revoke(
         pass
     logger.info("pending revoke retry for %s ok", archived_path.name)
     return _RetryOutcome.SUCCEEDED
+
+
+async def _report_archived_before_revoke(server_url: str, slug: str, keystore: KeyStore) -> None:
+    """Retry the terminal heartbeat before invalidating its signing identity."""
+    from ..crypto.http_client import HttpError, PuffoCoreHttpClient
+    from .control.store import current_machine_id
+
+    http = PuffoCoreHttpClient(server_url, keystore, slug)
+    body = {"status": "archived"}
+    machine_id = current_machine_id()
+    if machine_id:
+        body["machine_id"] = machine_id
+    try:
+        await http.post("/agents/me/heartbeat", body)
+    except HttpError as exc:
+        # Preserve the signing identity while timeout/rate-limit retries remain.
+        if exc.status in (408, 429) or not 400 <= exc.status < 500:
+            raise
+    finally:
+        await http.close()
 
 
 def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:

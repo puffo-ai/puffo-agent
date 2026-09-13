@@ -96,9 +96,32 @@ python -m puffo_agent start --detach
 App Control is enforced before Puffo code starts, so administrators may also
 need to allow the generated launcher under the machine's policy.
 
-The standard install includes desktop window and tray support as well as
-foreground and detached headless daemon modes. No extra installation option
-is needed. Headless modes do not initialize Qt.
+The installation and startup commands are the same on every platform:
+
+- macOS and Windows install desktop window and tray dependencies automatically.
+- Linux installs the headless Agent without requiring Qt. The first explicit
+  `start --ui` or tray-backed `start --background` automatically installs missing
+  PySide6 into the Python environment running Puffo. This first desktop setup
+  needs network access and either `uv` on PATH or pip in that environment. It
+  does not reinstall or upgrade Puffo itself. Subsequent desktop starts reuse Qt.
+- `start` and `start --detach` never install or initialize Qt. If an upgrade
+  rebuilds the environment, the next desktop start prepares Qt again as needed.
+
+Linux desktop use also requires OS graphics libraries. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install libgl1 libegl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+```
+
+Puffo does not run privileged OS package installation automatically. Missing
+system libraries are reported without repeatedly downloading PySide6. An
+explicit desktop request fails if the desktop cannot start; it is never silently
+changed into headless mode. Alpine/musl has no compatible PySide6 wheel, so desktop
+modes are unavailable there even though the base installation no longer requires
+Qt. Use a supported glibc desktop distribution for GUI operation.
+
+Existing `puffo-agent[gui]` installations remain supported for environments that
+preinstall desktop dependencies. No extra selection is needed for normal use.
 
 For contributors working from a source checkout:
 
@@ -116,7 +139,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--detach` runs headless in the background; `--ui` and tray-backed `--background` use the included desktop support. |
+| `puffo-agent start` | Run the daemon (foreground). `--detach` runs headless in the background; `--ui` and tray-backed `--background` prepare and use desktop support. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |

@@ -40,3 +40,11 @@ agents/*/memory/
 agents/*/workspace/
 daemon.yml
 daemon.pid
+
+# Skills ship with the repo: a fresh checkout must discover /agent-seed the way
+# it discovers the tool. Everything else under .claude/ (per-user session state,
+# settings.local.json) stays ignored. Negations only work for a path whose
+# parent is not itself ignored, hence the two-step un-ignore.
+!.claude/
+.claude/*
+!.claude/skills/

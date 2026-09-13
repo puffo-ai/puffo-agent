@@ -22,7 +22,9 @@ from .workspace_layout import (
     prepare_workspace_shared_access,
 )
 from ..agent.errors import ProviderFailureError
+from ..agent.memory import sync_profile_briefing
 from ..agent.memory_seed import memory_seed_name, seed_from_remote
+from .profile_sync import extract_soul_body
 from ..agent.processing_receipts import processing_run_id
 from ..agent._usage_markers import looks_like_budget_cap, parse_reset_epoch
 from ..tasks import spawn
@@ -34,6 +36,41 @@ if TYPE_CHECKING:
 logger = worker_module.logger
 RUNTIME_EVENT_DEGRADED_RETRY_SECONDS = 30.0
 LOCAL_WARM_RETRY_DELAYS_SECONDS = (1.0, 2.0)
+
+
+def refresh_managed_briefing(agent_cfg, memory_path: str, profile_path: str) -> str:
+    """(Re)write the managed block of ``briefing/profile.md`` for THIS agent.
+
+    The block names the agent — id, display name, role, soul, and its
+    authenticated ``puffo_core.slug``. Memory is seeded byte-for-byte from
+    another agent, so a seeded briefing names the *source*: the first live demo
+    agent read its seeded copy and concluded it was the local agent it came
+    from. ``sync_profile_briefing`` was written for exactly this ("how an
+    imported agent picks up its authenticated puffo_handle with no migration
+    step") — and was called by nothing but its tests. Wired here, after the
+    seed and before the worker starts, so every start leaves the identity block
+    correct and any user text outside the markers untouched. Best-effort: a
+    briefing that cannot be written must not stop the agent.
+    """
+    try:
+        soul = ""
+        try:
+            soul = extract_soul_body(Path(profile_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            pass
+        sync_profile_briefing(
+            Path(memory_path),
+            agent_id=agent_cfg.id,
+            display_name=agent_cfg.display_name,
+            role=agent_cfg.role,
+            role_short=agent_cfg.role_short,
+            soul=soul,
+            puffo_handle=getattr(agent_cfg.puffo_core, "slug", "") or "",
+        )
+        return "ok"
+    except Exception as exc:  # noqa: BLE001 — never fatal to a start
+        logger.warning("agent %s: managed briefing not refreshed: %s", agent_cfg.id, exc)
+        return f"failed:{type(exc).__name__}"
 
 
 @dataclass(frozen=True)
@@ -252,6 +289,13 @@ class StandardWorkerRun:
             )
             log = logger.info if not outcome.startswith("failed") else logger.warning
             log("agent %s: memory seed -> %s", agent_id, outcome)
+        # After any seed: the briefing must name THIS agent, whatever it was
+        # seeded from. Rewrites only the managed block; user text is preserved.
+        logger.info(
+            "agent %s: managed briefing -> %s",
+            agent_id,
+            refresh_managed_briefing(agent_cfg, memory_path, profile_path),
+        )
         workspace_path = str(agent_cfg.resolve_workspace_dir())
         claude_path = str(agent_cfg.resolve_claude_dir())
         shared_path = worker_module.docker_shared_dir()
@@ -436,6 +480,13 @@ class StandardWorkerRun:
         worker._pending_activity = None
 
         async def emit_activity(activity: str | None) -> None:
+            # The desktop list reads the local snapshot, including during
+            # warm-up before the server reporter is attached.
+            worker.runtime.activity = activity
+            try:
+                worker.runtime.save(agent_id)
+            except OSError:
+                logger.warning("agent %s: activity snapshot write failed", agent_id, exc_info=True)
             # The overlay flips synchronously (event order preserved);
             # the heartbeat push runs detached because this callback
             # fires under the runtime command lock and a slow status
@@ -1100,6 +1151,7 @@ class StandardWorkerRun:
             except (asyncio.CancelledError, Exception):
                 pass
         worker.runtime.status = "stopped"
+        worker.runtime.activity = None
         worker.runtime.save(context.paths.agent_id)
         if context.runtime_event_outbox is not None:
             # The Runtime Manager's reader is what feeds this outbox, so it has

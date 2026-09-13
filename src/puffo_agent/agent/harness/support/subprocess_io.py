@@ -53,9 +53,11 @@ async def signal_process_tree(
             # Fall back to the direct-child API in that case.
             pass
     elif os.name == "nt" and isinstance(pid, int):
-        command = ["taskkill", "/PID", str(pid), "/T"]
-        if force:
-            command.append("/F")
+        # Console children have no WM_CLOSE handler. Without /F taskkill can
+        # fail, after which terminating only the wrapper orphans its children
+        # (and a later /T cannot discover them). Windows terminate is already
+        # forceful; apply it to the entire owned tree in one operation.
+        command = ["taskkill", "/PID", str(pid), "/T", "/F"]
         taskkill = None
         try:
             taskkill = await asyncio.create_subprocess_exec(

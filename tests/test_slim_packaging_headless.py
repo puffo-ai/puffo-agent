@@ -1,6 +1,6 @@
 """Slim-packaging guard (Item A): the daemon / CLI path must import and
-run with PySide6 absent, and a GUI command with a missing dependency
-must fail with the actionable install hint — not a raw traceback.
+run with PySide6 absent, and failed automatic GUI setup must return an
+actionable error rather than a raw traceback or a main-package reinstall.
 
 Deterministic in any environment: we block ``PySide6`` (and its
 submodules) via ``sys.modules[...] = None`` regardless of whether the
@@ -19,17 +19,24 @@ from pathlib import Path
 import pytest
 
 
-def test_plain_install_requires_gui_dependency():
-    """A plain uv force-upgrade must not silently remove desktop support."""
+@pytest.mark.parametrize(
+    "system, required", [("Darwin", True), ("Windows", True), ("Linux", False)]
+)
+def test_plain_install_selects_gui_dependency_by_system(system, required):
+    """Linux servers must install without Qt; desktop defaults survive upgrades."""
     project = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     )["project"]
     from packaging.requirements import Requirement
 
     requirements = [Requirement(value) for value in project["dependencies"]]
-    assert any(
-        req.name.lower() == "pyside6" and req.marker is None
-        for req in requirements
+    assert (
+        any(
+            req.name.lower() == "pyside6"
+            and (req.marker is None or req.marker.evaluate({"platform_system": system}))
+            for req in requirements
+        )
+        is required
     )
 
 
@@ -58,6 +65,14 @@ def pyside6_blocked(monkeypatch):
             monkeypatch.delitem(sys.modules, name, raising=False)
         elif name.startswith("puffo_agent.portal.ui"):
             monkeypatch.delitem(sys.modules, name, raising=False)
+    from puffo_agent.portal import desktop_dependencies
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        desktop_dependencies.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=1),
+    )
     yield
 
 
@@ -85,31 +100,40 @@ def test_cli_import_does_not_eagerly_import_daemon(pyside6_blocked):
 
 
 def test_gui_command_with_missing_dependency_yields_actionable_hint(
-    pyside6_blocked, capsys,
+    pyside6_blocked,
+    capsys,
 ):
-    """`start --ui` with PySide6 absent returns non-zero and prints the
-    `pip install --upgrade --force-reinstall puffo-agent` hint instead of ModuleNotFoundError."""
+    """Failed `start --ui` setup must not recommend a potentially downgrading reinstall."""
     cli = importlib.import_module("puffo_agent.portal.cli")
     args = argparse.Namespace(
-        ui=True, tray_runner=False, background=False, with_local_bridge=False,
+        ui=True,
+        tray_runner=False,
+        background=False,
+        with_local_bridge=False,
     )
     rc = cli.cmd_start(args)
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "pip install --upgrade --force-reinstall puffo-agent" in combined
+    assert "Desktop support could not start" in combined
+    assert "force-reinstall" not in combined
 
 
 def test_tray_command_with_missing_dependency_yields_actionable_hint(
-    pyside6_blocked, capsys,
+    pyside6_blocked,
+    capsys,
 ):
     """Same guard for the `start --tray-runner` entry point."""
     cli = importlib.import_module("puffo_agent.portal.cli")
     args = argparse.Namespace(
-        ui=False, tray_runner=True, background=False, with_local_bridge=False,
+        ui=False,
+        tray_runner=True,
+        background=False,
+        with_local_bridge=False,
     )
     rc = cli.cmd_start(args)
     assert rc != 0
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "pip install --upgrade --force-reinstall puffo-agent" in combined
+    assert "Desktop support could not start" in combined
+    assert "force-reinstall" not in combined

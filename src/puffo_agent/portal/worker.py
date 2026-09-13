@@ -1372,6 +1372,7 @@ class Worker:
         if self._task is not None and not self._task.done():
             return self._task
         self.runtime.status = "starting"
+        self.runtime.activity = None
         self.runtime.error = ""
         self.runtime.save(self.agent_cfg.id)
         self._task = spawn(self._run(), name="run")

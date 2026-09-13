@@ -3,6 +3,8 @@ import sys
 import tempfile
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.crypto.canonical import canonicalize, canonicalize_for_signing
@@ -68,6 +70,41 @@ class TestCanonical:
 
 
 # ---- KeyStore ----
+
+
+@pytest.mark.parametrize("key", [b"A" * 31 + b"\n", b"A" * 31 + b"\x1a"],
+                         ids=["newline", "ctrl-z"])
+def test_backup_key_persists_binary_bytes_across_reopen(tmp_path, monkeypatch, key):
+    """Windows text descriptors must not expand LF or treat Ctrl-Z as EOF."""
+    monkeypatch.setattr(os, "urandom", lambda size: key if size == 32 else b"B" * size)
+    keys_dir = tmp_path / "keys"
+    store = KeyStore(keys_dir)
+    assert store.load_or_create_message_backup_dek("agent-a") == key
+    assert (keys_dir / "agent-a.message-backup-dek-v1").read_bytes() == key
+    assert KeyStore(keys_dir).load_or_create_message_backup_dek("agent-a") == key
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Legacy Windows text-mode key files")
+def test_backup_key_reads_legacy_newlines_without_rewriting(tmp_path):
+    """An upgrade must preserve previously readable text-expanded keys."""
+    key = b"A" * 29 + b"\r\n\n"
+    legacy = key.replace(b"\n", b"\r\n")
+    path = tmp_path / "agent-a.message-backup-dek-v1"
+    path.write_bytes(legacy)
+    assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
+    assert path.read_bytes() == legacy
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Legacy Windows text-mode key files")
+@pytest.mark.parametrize("stored", [b"A" * 31 + b"\r\nX", b"A" * 29 + b"\n\r\nX",
+                                  b"\r\n" * 32 + b"X"])
+def test_backup_key_rejects_malformed_legacy_files(tmp_path, stored):
+    """Compatibility must not accept truncated or noncanonical oversized keys."""
+    path = tmp_path / "agent-a.message-backup-dek-v1"
+    path.write_bytes(stored)
+    with pytest.raises(ValueError, match="invalid length"):
+        KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a")
+    assert path.read_bytes() == stored
 
 
 class TestKeyStore:
