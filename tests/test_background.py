@@ -21,8 +21,11 @@ from puffo_agent.portal.state import DaemonStartupState
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows venv redirector")
-def test_windows_venv_background_has_no_visible_console(tmp_path):
+def test_windows_venv_background_has_no_visible_console(tmp_path, monkeypatch):
     """The venv redirector must not give the real daemon a closable console."""
+    # Hosted runners prohibit job breakaway. This native case isolates console
+    # inheritance; the policy test separately guards production breakaway flags.
+    monkeypatch.setattr(bg, "_CREATE_BREAKAWAY_FROM_JOB", 0)
     environment = tmp_path / "venv"
     venv.EnvBuilder(with_pip=False).create(environment)
     result_path = tmp_path / "console.json"
@@ -74,7 +77,7 @@ def test_detach_kwargs_posix(monkeypatch):
 
 
 def test_detach_kwargs_windows(monkeypatch):
-    """Closing a Windows terminal must not terminate its background daemon."""
+    """Windowless launch must retain terminal-job breakaway and process grouping."""
     monkeypatch.setattr(bg.os, "name", "nt")
     kwargs = bg.detach_kwargs(log_handle="LOG")
     assert kwargs["creationflags"] == (
