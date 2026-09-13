@@ -228,6 +228,19 @@ def _classify_jsonrpc_error(error: Any) -> Exception:
     return ProviderFailureError(public_message, error_code=error_code)
 
 
+def _turn_failure_code(error: dict[str, Any]) -> str:
+    """Normalize app-server TurnError at the provider boundary."""
+    info = error.get("codexErrorInfo")
+    if info == "usageLimitExceeded":
+        return "plan_drained"
+    if info == "rateLimitExceeded":
+        return "rate_limit"
+    return classify_provider_failure(
+        status=_jsonrpc_error_status(error),
+        diagnostic=_jsonrpc_error_context(error),
+    )
+
+
 def _permission_response(
     method: str,
     params: dict[str, Any],
@@ -933,6 +946,14 @@ class CodexAppServerDriver(Driver):
             else "succeeded"
         )
         data: dict[str, Any] = {"outcome": outcome}
+        turn = params.get("turn")
+        error = turn.get("error") if isinstance(turn, dict) else params.get("error")
+        if outcome == "failed" and isinstance(error, dict):
+            data["error_code"] = _turn_failure_code(error)
+            logger.warning(
+                "codex turn failed (%s): %s", data["error_code"],
+                _safe_jsonrpc_error_message(error.get("message", "")),
+            )
         if self._usage_latest:
             data.update(self._usage_latest)
         await self._emit(
