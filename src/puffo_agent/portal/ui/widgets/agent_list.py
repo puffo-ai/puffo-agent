@@ -53,6 +53,7 @@ class AgentSummary:
     model: str
     slug: str
     avatar_url: str
+    activity: str | None = None
 
     @classmethod
     def for_id(cls, agent_id: str) -> AgentSummary:
@@ -83,6 +84,7 @@ class AgentSummary:
             model=model,
             slug=slug,
             avatar_url=avatar_url,
+            activity=rt.activity if rt else None,
         )
 
 
@@ -143,10 +145,16 @@ class _Row(QWidget):
         self._name_label.setText(name)
         runtime_blurb_parts = [p for p in (summary.harness, summary.model) if p]
         self._sub_label.setText(" · ".join(runtime_blurb_parts) or "—")
+        compacting = (
+            summary.activity == "compacting"
+            and summary.status in {"running", "starting"}
+        )
+        if compacting:
+            self._sub_label.setText("Compacting context… · " + self._sub_label.text())
         self._dot.setStyleSheet(
             f"color: {_STATUS_COLOUR.get(summary.status, '#9aa0a6')}; font-size: 14pt;"
         )
-        self._dot.setToolTip(summary.status)
+        self._dot.setToolTip("Compacting context" if compacting else summary.status)
 
 
 class AgentList(QWidget):
@@ -217,7 +225,11 @@ class AgentList(QWidget):
         loader = summaries_loader or _default_loader
         all_rows = loader()
         all_rows.sort(key=lambda s: (_STATUS_ORDER.get(s.status, 9), s.display_name.lower(), s.id))
-        rows = [r for r in all_rows if r.status == "running"] if self._running_only else all_rows
+        rows = [
+            r for r in all_rows
+            if r.status == "running"
+            or (r.status == "starting" and r.activity == "compacting")
+        ] if self._running_only else all_rows
 
         running_count = sum(1 for r in all_rows if r.status == "running")
         self._count_label.setText(f"{running_count} running / {len(all_rows)} total")

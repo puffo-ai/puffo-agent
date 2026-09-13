@@ -1026,6 +1026,7 @@ class RuntimeState:
     """
 
     status: str = "stopped"  # starting | running | paused | error | stopped
+    activity: str | None = None  # transient harness activity, independent of lifecycle
     started_at: int = 0
     updated_at: int = 0
     msg_count: int = 0
@@ -1104,6 +1105,7 @@ class RuntimeState:
             return None
         return cls(
             status=raw.get("status", "stopped"),
+            activity=raw.get("activity"),
             started_at=int(raw.get("started_at", 0)),
             updated_at=int(raw.get("updated_at", 0)),
             msg_count=int(raw.get("msg_count", 0)),
@@ -1121,6 +1123,8 @@ class RuntimeState:
     def save(self, agent_id: str) -> None:
         import json
 
+        if self.status not in {"starting", "running"}:
+            self.activity = None
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
         # CLI staleness gate is 30s; throttle pure-updated_at writes
