@@ -81,7 +81,7 @@ def test_detach_kwargs_windows(monkeypatch):
     monkeypatch.setattr(bg.os, "name", "nt")
     kwargs = bg.detach_kwargs(log_handle="LOG")
     assert kwargs["creationflags"] == (
-        bg._DETACHED_PROCESS
+        bg._CREATE_NO_WINDOW
         | bg._CREATE_NEW_PROCESS_GROUP
         | bg._CREATE_BREAKAWAY_FROM_JOB
     )

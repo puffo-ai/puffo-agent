@@ -3,8 +3,9 @@
 ``puffo-agent start --background`` re-spawns the CLI as a *detached*
 child running the tray (``start --tray-runner``), so the daemon
 outlives the terminal that launched it. POSIX puts the child in a new
-session (setsid); Windows uses ``DETACHED_PROCESS`` so it isn't tied to
-the console. The child's stdout/stderr go to ``background.log``.
+session (setsid); Windows uses ``CREATE_NO_WINDOW`` and job breakaway so
+the child outlives the terminal without opening another console window.
+The child's stdout/stderr go to ``background.log``.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from .state import (
 
 # Windows process-creation flags (kept as literals so this imports on
 # POSIX, where ``subprocess`` doesn't define them).
-_DETACHED_PROCESS = 0x00000008
+_CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
@@ -53,13 +54,14 @@ def detach_kwargs(log_handle) -> dict:
         "stderr": log_handle,
     }
     if os.name == "nt":
-        # DETACHED_PROCESS severs the console connection, but Windows children
-        # still inherit their parent's Job object by default.  Terminal hosts
-        # and managed launchers may configure that job to terminate its whole
-        # process tree when the window closes.  Break away as well so
-        # ``--background`` has the same lifetime contract as POSIX setsid().
+        # A venv python.exe is a redirector that launches the real interpreter.
+        # DETACHED_PROCESS leaves that second process free to create a visible
+        # console. CREATE_NO_WINDOW supplies a windowless console instead; do
+        # not combine it with DETACHED_PROCESS, which makes Windows ignore it.
+        # Keep job breakaway so terminal-owned jobs cannot kill the daemon
+        # when their window closes.
         kwargs["creationflags"] = (
-            _DETACHED_PROCESS
+            _CREATE_NO_WINDOW
             | _CREATE_NEW_PROCESS_GROUP
             | _CREATE_BREAKAWAY_FROM_JOB
         )
