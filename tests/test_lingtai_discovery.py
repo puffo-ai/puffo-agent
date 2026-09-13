@@ -191,6 +191,7 @@ def test_agent_metadata_permission_error_is_not_absence(tmp_path, monkeypatch):
     from puffo_agent.portal.control import lingtai_profile
 
     (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
+    (tmp_path / ".agent.json").write_text('{"agent_name":"Current"}')
     original_open = lingtai_profile.os.open
     def deny_source(path, flags):
         if path.name == ".agent.json":
@@ -202,6 +203,39 @@ def test_agent_metadata_permission_error_is_not_absence(tmp_path, monkeypatch):
     assert row["agent_name"] is None
     assert row["profile_read_error"] == "source_unreadable"
     assert row["import_display_name"] is None
+
+
+def test_source_read_without_posix_open_flags(tmp_path, monkeypatch):
+    """Windows must read source metadata without Unix-only open constants."""
+    import os
+    from types import SimpleNamespace
+    from puffo_agent.portal.control import lingtai_profile
+
+    portable_os = {key: value for key, value in vars(os).items()
+                   if key not in {"O_NONBLOCK", "O_NOFOLLOW"}}
+    monkeypatch.setattr(lingtai_profile, "os", SimpleNamespace(**portable_os))
+    path = tmp_path / "source.json"
+    path.write_bytes(b'{"agent_name":"Current"}\r\n')
+    assert lingtai_profile._read_source_object(path) == {"agent_name": "Current"}
+
+
+def test_source_replacement_during_open_is_rejected(tmp_path, monkeypatch):
+    """A changed file must not become authoritative after the pre-open check."""
+    import os
+    from types import SimpleNamespace
+    from puffo_agent.portal.control import lingtai_profile
+
+    path, replacement = tmp_path / "source.json", tmp_path / "replacement.json"
+    path.write_text('{"agent_name":"Original"}')
+    replacement.write_text('{"agent_name":"Replacement"}')
+    def replace_then_open(path, flags):
+        os.replace(replacement, path)
+        return os.open(path, flags)
+    monkeypatch.setattr(lingtai_profile, "os", SimpleNamespace(
+        **{**vars(os), "open": replace_then_open},
+    ))
+    with pytest.raises(ValueError, match="changed"):
+        lingtai_profile._read_source_object(path)
 
 
 def test_agent_metadata_symlink_is_not_a_fallback(tmp_path):

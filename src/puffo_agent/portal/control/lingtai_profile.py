@@ -23,10 +23,22 @@ class SourceProfile:
 
 
 def _read_source_object(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("source metadata must be a regular file")
+    # Windows has neither POSIX flag. Check the opened file's identity there
+    # too, and keep binary reads independent of the CRT's text-mode default.
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
+        flags |= getattr(os, name, 0)
+    fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ValueError("source metadata must be a regular file")
+        current = os.fstat(stream.fileno())
+        after = os.lstat(path)
+        if any(not stat.S_ISREG(item.st_mode)
+               or (item.st_dev, item.st_ino) != (before.st_dev, before.st_ino)
+               for item in (current, after)):
+            raise ValueError("source metadata changed while opening")
         data = stream.read(_MAX_INIT_BYTES + 1)
     if len(data) > _MAX_INIT_BYTES:
         raise ValueError("source metadata exceeds the size limit")
