@@ -775,7 +775,8 @@ async def _report_archived_before_revoke(server_url: str, slug: str, keystore: K
     try:
         await http.post("/agents/me/heartbeat", body)
     except HttpError as exc:
-        if not 400 <= exc.status < 500:
+        # Preserve the signing identity while timeout/rate-limit retries remain.
+        if exc.status in (408, 429) or not 400 <= exc.status < 500:
             raise
     finally:
         await http.close()

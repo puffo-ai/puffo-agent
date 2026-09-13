@@ -855,7 +855,7 @@ async def _report_lifecycle(
     itself; the daemon does it out-of-band. Returns True when the report is
     *settled* — delivered, or rejected with a permanent 4xx that retrying can't
     fix — so the caller stops re-reporting; False only on a transient failure
-    (5xx / network) worth retrying next tick."""
+    (408 / 429 / 5xx / network) worth retrying next tick."""
     from ..crypto.http_client import HttpError, PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
     from .control.store import current_machine_id
@@ -873,9 +873,9 @@ async def _report_lifecycle(
         await http.post("/agents/me/heartbeat", body)
         return True
     except HttpError as exc:
-        # 4xx is deterministic for this (agent, server) pair (bad certs / unknown
-        # status) — settle and stop retrying; only 5xx is worth a retry.
-        if 400 <= exc.status < 500:
+        # Timeouts and rate limits are transient even though they are 4xx.
+        # Other 4xx responses (bad certs / unknown status) remain settled.
+        if 400 <= exc.status < 500 and exc.status not in (408, 429):
             logger.warning(
                 "agent %s: lifecycle report %r rejected (HTTP %s); giving up: %s",
                 agent_cfg.id,
