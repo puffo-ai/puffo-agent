@@ -1,6 +1,7 @@
 """Discovery must preserve CLI state, existing folders, and operator isolation."""
 
 import json
+import os
 import sys
 from types import SimpleNamespace
 
@@ -17,7 +18,7 @@ async def test_discovery_cli_contract_and_hidden_root(tmp_path, monkeypatch):
     agent = root / ".lingtai" / "writer"
     agent.mkdir(parents=True)
     (agent / "init.json").write_text("{}")
-    executable = tmp_path / "lingtai-agent"
+    executable = tmp_path / "lingtai-agent.py"
     executable.write_text(
         f"#!{sys.executable}\nimport json, sys\n"
         "assert sys.argv[1:3] == ['puffo-v0', 'discover']\n"
@@ -28,10 +29,16 @@ async def test_discovery_cli_contract_and_hidden_root(tmp_path, monkeypatch):
         "print(json.dumps({'runtimes': rows}))\n"
     )
     executable.chmod(0o700)
+    # Run the Python CLI fixture explicitly; Windows does not execute shebangs.
+    create_process = discovery.asyncio.create_subprocess_exec
+    async def launch_fixture(program, *args, **kwargs):
+        assert program == sys.executable
+        return await create_process(program, str(executable), *args, **kwargs)
+    monkeypatch.setattr(discovery.asyncio, "create_subprocess_exec", launch_fixture)
     monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
     monkeypatch.setattr(discovery, "_executable_paths", lambda known: [])
     result = await discovery.discover_lingtai(
-        {"executable": str(executable), "root": str(root)}, operator="owner",
+        {"executable": sys.executable, "root": str(root)}, operator="owner",
     )
     assert result["warnings"] == []
     assert result["agents"][0]["workspace"] == str(agent)
@@ -53,12 +60,12 @@ def test_default_inventory_uses_only_owned_associations(tmp_path, monkeypatch):
         assert agent_id == "mine"
         return SimpleNamespace(
             runtime=SimpleNamespace(harness_command=[
-                "/mine/lingtai-agent", "acp", "--profile", "puffo-v1", "--runtime-id", "runtime-mine",
+                str(owned / "lingtai-agent"), "acp", "--profile", "puffo-v1", "--runtime-id", "runtime-mine",
             ]), resolve_workspace_dir=lambda: owned,
         )
     monkeypatch.setattr(discovery.AgentConfig, "load", config)
     executables, roots, warnings = discovery._known_paths("operator")
-    assert str(executables[0]) == "/mine/lingtai-agent"
+    assert executables == [owned / "lingtai-agent"]
     assert owned in roots and owned / ".lingtai" in roots
     assert other not in roots
 
@@ -241,7 +248,12 @@ def test_source_replacement_during_open_is_rejected(tmp_path, monkeypatch):
 def test_agent_metadata_symlink_is_not_a_fallback(tmp_path):
     """Unsafe source indirection must not import a different identity or use init fallback."""
     (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
-    (tmp_path / ".agent.json").symlink_to(tmp_path / "missing")
+    try:
+        (tmp_path / ".agent.json").symlink_to(tmp_path / "missing")
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("Windows account lacks symlink creation privilege")
+        raise
     row = discovery._normalize({"agent_dir": str(tmp_path), "display_name": "Label",
                                 "status": "available"}, tmp_path)
     assert row["profile_read_error"] == "source_unreadable"
@@ -264,7 +276,8 @@ def test_corrupt_marker_prevents_only_absent_primary_fallback(tmp_path, primary_
 
 
 @pytest.mark.asyncio
-async def test_executable_folder_search_is_scoped_and_does_not_run_candidates(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_directory_link", [False, True])
+async def test_executable_folder_search_is_scoped_and_does_not_run_candidates(tmp_path, monkeypatch, with_directory_link):
     """The executable field must search its folder, never run discoveries or follow directory links."""
     root = tmp_path / "selected"
     binary = root / ".venv" / "bin" / "lingtai-agent"
@@ -275,7 +288,13 @@ async def test_executable_folder_search_is_scoped_and_does_not_run_candidates(tm
     outside.mkdir()
     (outside / "lingtai-agent").write_text("#!/bin/sh\nexit 99\n")
     (outside / "lingtai-agent").chmod(0o700)
-    (root / "escape").symlink_to(outside, target_is_directory=True)
+    if with_directory_link:
+        try:
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and exc.winerror == 1314:
+                pytest.skip("Windows account lacks symlink creation privilege")
+            raise
     monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
     monkeypatch.setattr(discovery, "_executable_paths", lambda known: ["/unrelated/lingtai-agent"])
     async def forbidden(*args):
