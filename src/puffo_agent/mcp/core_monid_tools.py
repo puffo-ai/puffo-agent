@@ -8,13 +8,15 @@ Monid with the server as the spend-control middle layer:
 * ``monid_spend`` — PAID. Run the capability you prepared, with the ``input``
   you built from its schema.
 
-The agent never holds the Monid key or money: it forwards to the server via the
-native signed client, and the server discovers/inspects a capability, checks the
-budget, pays Monid, and returns the result. This two-step flow is what lets one
-generic tool reach any of Monid's endpoints — the agent reads each capability's
-own schema instead of us hardcoding a template per endpoint. Step one targets
-native (key-holding) agents; the keyless bridge transport is out of scope here
-(that path is unsigned and could not reach the subkey-gated routes).
+The agent never holds the Monid key or money. ``monid_prepare`` forwards to
+puffo-server (free lookup). ``monid_spend`` uses the adopted two-hop money path:
+the agent mints a short-lived spend token from puffo-server, then calls
+**puffo-billing directly** with it; billing holds the Monid key, checks the
+budget, pays Monid exactly once, and returns the result. One generic tool reaches
+any of Monid's endpoints because the agent reads each capability's own schema
+instead of hardcoding a template per endpoint. Native (key-holding) agents only:
+the mint is subkey-signed, so keyless bridge agents (unsigned) are out of scope
+here.
 """
 
 from __future__ import annotations
@@ -208,6 +210,10 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
                 "(1_000_000 = $1)"
             )
 
+        # Fresh short-lived spend token first (native mint), before touching idempotency
+        # state; fail closed if it fails — never fall back to any other spend path.
+        access_token, billing_url = await _fetch_spend_token(cfg.http_client)
+
         normalized_input = input if input is not None else {}
         signature = _spend_signature(
             provider, endpoint, normalized_input, max_cost_micro
@@ -221,20 +227,15 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
             "max_cost_micro": max_cost_micro,
             "idempotency_key": wire_key,
         }
+        # Direct to billing with the Bearer (billing verifies the JWT, holds the Monid
+        # key). Fresh-token-per-call: an ambiguous retry re-mints but reuses the same
+        # idempotency_key so billing dedupes; a 401 on a fresh token is a real auth
+        # fault, surfaced not re-minted.
         try:
-            data = await cfg.http_client.post("/v2/monid/spend", body)
+            data = await cfg.http_client.post_bearer(billing_url, access_token, body)
         except HttpError as exc:
-            ambiguous = retry_keys._finish_http_error(
-                signature, wire_key, automatic=automatic_key, status=exc.status
-            )
-            # A spend failure is usually a retryable input/schema mismatch — the
-            # error carries the schema to rebuild `input` and retry, so try that
-            # first. The label rule is the fallback: if you give up and answer
-            # from elsewhere, it must be marked non-Monid.
-            retry_guidance = _http_error_guidance(ambiguous, automatic_key, wire_key)
-            raise RuntimeError(
-                f"monid spend failed: {_monid_error_message(exc)}\n"
-                f"{retry_guidance}{_LABEL_NON_MONID}"
+            raise _spend_failure(
+                exc, retry_keys, signature, wire_key, automatic_key
             ) from exc
 
         if not isinstance(data, dict):
@@ -328,6 +329,41 @@ def _wire_idempotency_key(agent_slug: str, key: str) -> str:
     return f"{agent_slug}:{key}"
 
 
+def _spend_token_and_url(mint: Any) -> tuple[str, str]:
+    """Validate the `/v2/agent/spend-token` response and build the billing spend URL.
+
+    Fail closed: the Bearer only ever goes to the ``billing_base_url`` the *authenticated*
+    mint returned, and only over https (the mint itself only ever returns https — anything
+    else here is a misconfiguration and we refuse rather than send the token somewhere else).
+    """
+    if not isinstance(mint, dict):
+        raise RuntimeError("spend-token response was not an object")
+    token = mint.get("access_token")
+    base = mint.get("billing_base_url")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("spend-token response missing access_token")
+    if not isinstance(base, str) or not base.startswith("https://"):
+        raise RuntimeError(
+            "spend-token response missing a valid https billing_base_url"
+        )
+    return token, f"{base.rstrip('/')}/v2/monid/spend"
+
+
+async def _fetch_spend_token(http_client: Any) -> tuple[str, str]:
+    """Mint a fresh short-lived spend token; return (access_token, billing_spend_url).
+
+    Fail closed: a mint failure raises so the caller never spends. Body `{}` is signed
+    as-is via ``post_bytes`` (``post(path, {})`` would sign ``b""`` and the mint 401s)."""
+    try:
+        mint = await http_client.post_bytes("/v2/agent/spend-token", b"{}")
+    except HttpError as exc:
+        raise RuntimeError(
+            "monid spend unavailable: could not obtain a spend token "
+            f"({_monid_error_message(exc)}).\n{_LABEL_NON_MONID}"
+        ) from exc
+    return _spend_token_and_url(mint)
+
+
 def _spend_retry_guidance(wire_key: str) -> str:
     return (
         "Retry the same arguments to reuse idempotency key "
@@ -345,6 +381,28 @@ def _http_error_guidance(ambiguous: bool, automatic: bool, wire_key: str) -> str
             "spend; an immediate retry starts a new paid operation.\n"
         )
     return ""
+
+
+def _spend_failure(
+    exc: HttpError,
+    retry_keys: _SpendRetryKeys,
+    signature: str,
+    wire_key: str,
+    automatic_key: bool,
+) -> RuntimeError:
+    """Map a billing spend ``HttpError`` to the tool's error, updating retry-key state.
+
+    A spend failure is usually a retryable input/schema mismatch — the error carries the
+    schema to rebuild `input`, so try that first. The label rule is the fallback: a
+    non-Monid answer must be marked as such."""
+    ambiguous = retry_keys._finish_http_error(
+        signature, wire_key, automatic=automatic_key, status=exc.status
+    )
+    retry_guidance = _http_error_guidance(ambiguous, automatic_key, wire_key)
+    return RuntimeError(
+        f"monid spend failed: {_monid_error_message(exc)}\n"
+        f"{retry_guidance}{_LABEL_NON_MONID}"
+    )
 
 
 def _is_pending_spend_response(data: dict[str, Any]) -> bool:
