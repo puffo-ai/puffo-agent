@@ -313,15 +313,11 @@ class PuffoCoreHttpClient:
     ) -> Any:
         """POST to an absolute URL with a Bearer token — no subkey signature.
 
-        The monid agent-spend direct-connect path: the agent mints a short-lived
-        spend token from puffo-server, then calls billing DIRECTLY with it. Billing
-        verifies that JWT (not a subkey), so this path deliberately does NOT sign the
-        request, and it does NOT carry the keyless ``x-sandbox-token`` egress shim
-        (that belongs only to the unsigned ``server_url`` routes). The token rides the
-        ``Authorization`` header exclusively — never the URL, query, or body. ``url`` is
-        the full billing endpoint built from the ``billing_base_url`` the mint returned;
-        it MUST be https (the mint only ever returns https — anything else is rejected,
-        fail closed)."""
+        The monid direct-connect spend hop: billing verifies a minted JWT, not a
+        subkey, so this path deliberately does not sign, and omits the keyless
+        ``x-sandbox-token`` shim (which belongs to the ``server_url`` routes). The
+        token rides ``Authorization`` alone — never URL/query/body — and ``url``
+        must be https (fail closed; the mint only ever returns https)."""
         if not url.startswith("https://"):
             raise HttpError(0, "billing url must be https")
         raw = json.dumps(body).encode() if body else b""
