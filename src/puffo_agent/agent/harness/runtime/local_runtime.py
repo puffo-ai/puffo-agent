@@ -412,7 +412,7 @@ class LocalRuntimePreparer:
             # the life of the agent and look like success -- so refuse loudly.
             raise SubscriptionUnsupported(
                 f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
-                f"the 'generic' runtime path yet; only claude-code implements it."
+                f"the 'generic' runtime path yet; claude-code and codex implement it."
             )
         executable, launch_args = self._resolve_generic_command()
         controlled, opencode_config = self._prepare_executable_configuration(
@@ -827,14 +827,7 @@ class LocalRuntimePreparer:
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
-        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
-            # Only the claude-code spec resolves a plan credential. Running the
-            # api-gateway path here instead would bill the metered account for
-            # the life of the agent and look like success -- so refuse loudly.
-            raise SubscriptionUnsupported(
-                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
-                f"the 'codex' runtime path yet; only claude-code implements it."
-            )
+        subscription = self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION
         codex_home = agent_codex_user_dir(self.agent_id)
         codex_home.mkdir(parents=True, exist_ok=True)
         agents_md = codex_home / "AGENTS.md"
@@ -844,7 +837,12 @@ class LocalRuntimePreparer:
         host_mcps = read_host_codex_mcp_servers(host_home)
         extras = dict(self._desired_codex_extras)
         extras.update(host_mcps)
-        gateway = self._codex_gateway_provider()
+        # A plan credential supersedes the gateway rather than merging with
+        # it: codex prefers a configured provider over its own OAuth, so a
+        # leftover gateway block would route a subscription agent back through
+        # the metered account in silence -- the same rule the claude-code spec
+        # applies to ANTHROPIC_BASE_URL.
+        gateway = None if subscription else self._codex_gateway_provider()
         config_kwargs: dict[str, Any] = {
             "extra_servers": extras,
             "inference_level": self.agent_cfg.runtime.inference_level,
@@ -863,7 +861,21 @@ class LocalRuntimePreparer:
         # the child. Native OAuth uses the CODEX_HOME auth view instead, and
         # the gateway branch supplies its own key explicitly.
         controlled: dict[str, str] = {"CODEX_HOME": str(codex_home)}
-        if gateway:
+        if subscription:
+            # The plan's auth.json document, handed to the daemon by the
+            # provisioner, written at 0600 under this agent's CODEX_HOME
+            # (config.toml pins cli_auth_credentials_store = "file", so that is
+            # where codex looks). No host view: a sandbox has no operator
+            # login to mirror, and the refresher skips subscription agents.
+            creds = resolve_subscription_credentials(
+                "codex",
+                agent_home=self.agent_home,
+                token=subscription_token(self.daemon_cfg, "codex"),
+            )
+            for path, content in creds.files.items():
+                atomic_write_private(path, content)
+            controlled.update(creds.env)
+        elif gateway:
             controlled["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
         else:
             auth_mode = sync_host_codex_auth_view(host_home, codex_home)
