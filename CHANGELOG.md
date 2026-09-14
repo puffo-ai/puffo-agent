@@ -59,6 +59,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `runtime.auth_mode: subscription` for the **codex** harness: the plan's
+  `auth.json` document (delivered by the provisioner as
+  `CODEX_SUBSCRIPTION_AUTH_JSON`) is written under the agent's `CODEX_HOME`
+  and supersedes any configured gateway. Previously the codex spec refused the
+  mode outright; only claude-code implemented it (PUF-396 §4c).
+
 - **Monid paid-data tools, re-introduced behind a gate.**
   `monid_prepare` (free capability lookup) and `monid_spend` (paid, read-only
   data fetch) let a native agent reach paid external data through the server's
