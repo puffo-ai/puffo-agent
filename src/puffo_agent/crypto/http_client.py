@@ -308,6 +308,34 @@ class PuffoCoreHttpClient:
         _, data = await self._request("POST", path, body)
         return data
 
+    async def post_bearer(
+        self, url: str, token: str, body: dict | None = None
+    ) -> Any:
+        """POST to an absolute URL with a Bearer token — no subkey signature.
+
+        The monid direct-connect spend hop: billing verifies a minted JWT, not a
+        subkey, so this path deliberately does not sign, and omits the keyless
+        ``x-sandbox-token`` shim (which belongs to the ``server_url`` routes). The
+        token rides ``Authorization`` alone — never URL/query/body — and ``url``
+        must be https (fail closed; the mint only ever returns https)."""
+        if not url.startswith("https://"):
+            raise HttpError(0, "billing url must be https")
+        raw = json.dumps(body).encode() if body else b""
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+        }
+        async with self._healed_request(
+            "POST", url, data=raw, headers=headers
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
     async def put(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
         _, data = await self._request("PUT", path, raw)

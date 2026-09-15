@@ -177,6 +177,7 @@ class _WsLocalContextAdapter:
 
 
 def _build_tool_dispatch(point: AttachPoint, runtime=None):
+    from ...mcp.config import monid_tools_enabled
     from ...mcp.puffo_core_tools import PuffoCoreToolsConfig
 
     client = point.client
@@ -204,6 +205,7 @@ def _build_tool_dispatch(point: AttachPoint, runtime=None):
         message_client=client,
         send_coordinator=send_coordinator,
         inbox_runtime=inbox_runtime,
+        monid_tools_enabled=monid_tools_enabled(),
         # T23: the daemon owns the single per-agent bridge WS, so only
         # the in-process ws-local tools can drive it. None on native
         # agents → send_message keeps the signed-crypto path. The

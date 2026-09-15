@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Monid paid-data tools, re-introduced behind a default-off flag.**
+  `monid_prepare` (free capability lookup) and `monid_spend` (paid, read-only
+  data fetch) let a native agent reach paid external data through the server's
+  monid spend gateway, which holds the key, checks the per-agent budget, pays,
+  and returns the result. Registered only when `PUFFO_MONID_TOOLS_ENABLED=true`;
+  a stock agent advertises neither. Restores the tools reverted by #322, with
+  the new opt-in gate. (#308)
+
 ## [2.0.5a1] - 2026-09-12
 
 TestPyPI preview; native Windows and real-container acceptance remain pending.
