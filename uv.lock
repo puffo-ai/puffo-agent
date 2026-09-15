@@ -1049,7 +1049,7 @@ wheels = [
 
 [[package]]
 name = "puffo-agent"
-version = "2.0.5a4"
+version = "2.0.6a6"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
@@ -1059,10 +1059,11 @@ dependencies = [
     { name = "certifi" },
     { name = "cryptography" },
     { name = "mcp" },
+    { name = "packaging" },
     { name = "pillow" },
     { name = "psutil" },
     { name = "pyhpke" },
-    { name = "pyside6" },
+    { name = "pyside6", marker = "sys_platform == 'darwin' or sys_platform == 'win32'" },
     { name = "python-socks" },
     { name = "pyyaml" },
     { name = "tzdata" },
@@ -1075,9 +1076,13 @@ attachments = [
 ]
 dev = [
     { name = "pre-commit" },
+    { name = "pyside6" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+]
+gui = [
+    { name = "pyside6" },
 ]
 
 [package.metadata]
@@ -1089,12 +1094,15 @@ requires-dist = [
     { name = "certifi", specifier = ">=2024.2.2" },
     { name = "cryptography", specifier = ">=43.0" },
     { name = "mcp", specifier = ">=1.0,<2" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pillow", marker = "extra == 'attachments'", specifier = ">=10.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pyhpke", specifier = ">=0.6" },
-    { name = "pyside6", specifier = ">=6.7" },
+    { name = "pyside6", marker = "sys_platform == 'darwin' or sys_platform == 'win32'", specifier = ">=6.7" },
+    { name = "pyside6", marker = "extra == 'dev'", specifier = ">=6.7" },
+    { name = "pyside6", marker = "extra == 'gui'", specifier = ">=6.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-socks", specifier = ">=2.4" },
