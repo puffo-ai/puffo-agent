@@ -389,16 +389,23 @@ async def test_lingtai_cancel_closes_inherited_child_pipes(
                 while processes[0].returncode is None:
                     await asyncio.sleep(.01)
         child_process = psutil.Process(int(ready.read_text()))
+        deadline = asyncio.get_running_loop().time() + 11
         task.cancel("test cancellation")
         done, _ = await asyncio.wait({task}, timeout=11)
         assert task in done, "CLI cleanup hangs on a descendant's inherited pipe"
         with pytest.raises(asyncio.CancelledError, match="test cancellation") as cancelled:
             task.result()
         assert cleanup_errors(cancelled.value) == ()
-        try:
-            assert not child_process.is_running() or child_process.status() == psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            pass  # The child exited between the two process-state reads.
+        # Pipe EOF can precede the descendant's final process state: Linux
+        # closes file descriptors before publishing EXIT_ZOMBIE. Observe exit
+        # within the original cancellation budget, rather than racing that
+        # transition or accepting a child that continues running after cleanup.
+        async with asyncio.timeout_at(deadline):
+            try:
+                while child_process.is_running() and child_process.status() != psutil.STATUS_ZOMBIE:
+                    await asyncio.sleep(.01)
+            except psutil.NoSuchProcess:
+                pass  # The child exited between the two process-state reads.
         assert processes[0]._transport.is_closing()
     finally:
         if ready.exists():
