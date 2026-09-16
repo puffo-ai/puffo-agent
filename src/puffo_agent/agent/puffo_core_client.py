@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 from ..crypto import ws_client as _ws_config
@@ -1533,10 +1534,45 @@ class PuffoCoreMessageClient:
         space_id: str,
         channel_id: str,
     ) -> None:
-        """Sign + POST a ``leave_space`` / ``leave_channel`` event.
-        Mirrors ``_accept_invite``'s signing; the leave payload uses
-        ``effective_from`` (not ``accepted_at``) and the server rejects
-        unknown fields, so the shapes are exact."""
+        """Perform an operator-approved ``leave_space`` / ``leave_channel``.
+
+        Called from exactly one place — ``_maybe_handle_leave_reply``, after
+        the operator answers ``y`` — and that call site IS the approval gate.
+        Do not call this from the ``leave_space`` / ``leave_channel`` MCP
+        tools: those must keep going through ``request_leave_approval`` so a
+        human decides. Wiring a tool straight to the keyless route below
+        would remove the human from the loop.
+
+        Two transports, one call site:
+
+        * **native** — sign the event with the subkey from the local keystore
+          and POST it to ``/spaces/events``. Mirrors ``_accept_invite``'s
+          signing; the leave payload uses ``effective_from`` (not
+          ``accepted_at``) and the server rejects unknown fields, so the
+          shapes are exact.
+        * **keyless** — a cloud agent holds no local keystore session, so
+          ``load_session`` below would raise and the operator would get an
+          error in the very thread they just approved in. POST to the keyless
+          route instead and let the server emit the event in our name
+          (puffo-server PUF-395, marker
+          ``server-auto:agent-approved-leave-space``). Auth is the sandbox
+          token, injected by the E2B egress proxy — nothing to set here.
+        """
+        from .ingress_policy import signed_http_available
+
+        if not signed_http_available(self):
+            quoted_space = urllib.parse.quote(space_id, safe="")
+            if kind == EventKind.LEAVE_CHANNEL:
+                quoted_channel = urllib.parse.quote(channel_id, safe="")
+                path = (
+                    f"/v2/cloud-agents/spaces/{quoted_space}"
+                    f"/channels/{quoted_channel}/leave"
+                )
+            else:
+                path = f"/v2/cloud-agents/spaces/{quoted_space}/leave"
+            await self.http.post_unsigned(path)
+            return
+
         sess = self.keystore.load_session(self.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
             decode_secret(sess.subkey_secret_key)
