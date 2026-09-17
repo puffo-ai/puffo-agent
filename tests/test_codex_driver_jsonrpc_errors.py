@@ -111,6 +111,27 @@ def test_jsonrpc_model_selection_failures_keep_actionable_class(error, expected)
     assert exc.error_code == expected
 
 
+def test_jsonrpc_outdated_codex_reports_upgrade_instead_of_generic_failure():
+    """A CLI/model mismatch must give the operator the actual recovery action."""
+    exc = _classify_jsonrpc_error({
+        "code": -32603,
+        "message": json.dumps({
+            "type": "error", "status": 400,
+            "error": {"type": "invalid_request_error", "message": (
+                "The 'gpt-future' model requires a newer version of Codex. "
+                "Please upgrade to the latest app or CLI and try again."
+            )},
+        }),
+    })
+
+    assert isinstance(exc, ProviderFailureError)
+    assert exc.error_code == "codex_upgrade_required"
+    assert "Upgrade the Codex CLI used by Puffo" in str(exc)
+    assert "restart the agent" in str(exc)
+    # Public diagnostics are fixed operator guidance, not raw provider payloads.
+    assert "gpt-future" not in str(exc)
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -291,9 +312,13 @@ async def test_reader_loop_survives_malformed_and_unroutable_frames():
     ({"message": "Usage limit reached; retry shortly", "codexErrorInfo": "rateLimitExceeded"},
      "rate_limit"),
     ({"message": "rate limit exceeded", "codexErrorInfo": None}, "rate_limit"),
+    ({"message": "The 'gpt-future' model requires a newer version of Codex. "
+                 "Please upgrade to the latest app or CLI and try again.",
+      "codexErrorInfo": {"other": {"httpStatusCode": 400}}},
+     "codex_upgrade_required"),
 ])
 async def test_completed_failure_preserves_provider_recovery_class(error, expected):
-    """Quota terminals must park Inbox work instead of entering generic retries."""
+    """Failed turns must preserve actionable provider recovery classifications."""
     driver = CodexAppServerDriver()
     await driver._notification({
         "method": "turn/completed",

@@ -31,6 +31,11 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
             "The requested operation was not permitted.",
             runtime_event_code="permission_denied",
         ),
+        "codex_upgrade_required": ProviderFailure(
+            "The selected model requires a newer version of Codex. "
+            "Upgrade the Codex CLI used by Puffo, then restart the agent "
+            "to retry pending messages.",
+        ),
         "model_not_found": ProviderFailure(
             "The selected provider model was not found; choose another model ID.",
         ),
@@ -203,6 +208,8 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
         or re.search(r"\bquota\b", normalized) is not None
     ):
         return "quota_exhausted"
+    if "requires a newer version of codex" in normalized:
+        return "codex_upgrade_required"
     if _diagnostic_mentions_model_not_found(normalized):
         return "model_not_found"
     if _looks_like_model_entitlement_failure(normalized):
