@@ -250,7 +250,9 @@ async def dispatch_bridge_frame(
         # from boot (not only after the first inbound message there).
         # Scheduled async — awaiting send_list_spaces inline would deadlock
         # frames(), which must keep receiving to deliver the 'spaces' reply.
-        task = spawn(client._refresh_bridge_spaces(), name="client.refresh_bridge_spaces")
+        task = spawn(
+            client._refresh_bridge_spaces(), name="client.refresh_bridge_spaces"
+        )
         client._ack_tasks.add(task)
         task.add_done_callback(client._ack_tasks.discard)
         # Keep draining pages on this connection. Awaiting a correlated
@@ -260,7 +262,10 @@ async def dispatch_bridge_frame(
         if more is True and isinstance(count, int) and not isinstance(count, bool):
             if count > 0:
                 client._bridge_pending_nonprogress = False
-                task = spawn(client._bridge.send_fetch_pending(), name="bridge.send_fetch_pending")
+                task = spawn(
+                    client._bridge.send_fetch_pending(),
+                    name="bridge.send_fetch_pending",
+                )
                 client._ack_tasks.add(task)
                 task.add_done_callback(client._ack_tasks.discard)
             elif not client._bridge_pending_nonprogress:
@@ -283,7 +288,9 @@ async def dispatch_bridge_frame(
             "bridge: added to space %s — refreshing spaces",
             space_id or "<missing space_id>",
         )
-        task = spawn(client._refresh_bridge_spaces(space_id), name="client.refresh_bridge_spaces")
+        task = spawn(
+            client._refresh_bridge_spaces(space_id), name="client.refresh_bridge_spaces"
+        )
         client._ack_tasks.add(task)
         task.add_done_callback(client._ack_tasks.discard)
     elif kind == "error":
@@ -406,6 +413,53 @@ async def ack_bridge_envelope(client, envelope_ids: list[str]) -> None:
         )
 
 
+async def introduce_on_space_join(
+    client,
+    trigger_space_id: str,
+    intro_channel_id: str,
+) -> None:
+    """Enqueue a self-introduction when this agent was just added to a space.
+
+    A cloud agent joins silently otherwise (PUF-402). A *local* agent
+    introduces itself because it accepts its own invite and the accept routine
+    carries the nudge; the server auto-accepts for a cloud agent, so that
+    routine never runs. The only other route wants an ``ACCEPT_CHANNEL_INVITE``
+    carrying ``original_invite``, which the space auto-accept deliberately
+    omits — leaving the ``added_to_space`` push as the one join signal a cloud
+    agent actually receives, which is why the introduction belongs here.
+
+    Gated on ``trigger_space_id``: a bare refresh is the startup / reconnect
+    call, and introducing into every known space on every boot is precisely
+    what nobody wants. The nudge is separately idempotent
+    (``has_channel_intro_been_prompted``), so a repeated push for the same
+    space cannot introduce twice.
+
+    Fail-soft: the cache seed this follows is what lets the agent post at all,
+    and an introduction is a nicety — it must never take the refresh down.
+    """
+    if not trigger_space_id:
+        return
+    if not intro_channel_id:
+        client._log.info(
+            "added to space %s but it lists no visible channel yet; "
+            "no introduction enqueued",
+            trigger_space_id,
+        )
+        return
+    enqueue = getattr(client, "_enqueue_channel_intro_nudge", None)
+    if enqueue is None:
+        return
+    try:
+        await enqueue(space_id=trigger_space_id, channel_id=intro_channel_id)
+    except Exception:  # noqa: BLE001 — never break the refresh
+        client._log.warning(
+            "intro nudge after space join failed (space=%s channel=%s)",
+            trigger_space_id,
+            intro_channel_id,
+            exc_info=True,
+        )
+
+
 async def refresh_bridge_spaces(client, trigger_space_id: str = "") -> None:
     """Re-issue ``list_spaces`` over the bridge WS so the agent's known
     spaces + channels enter its caches eagerly rather than lazily on the
@@ -432,6 +486,7 @@ async def refresh_bridge_spaces(client, trigger_space_id: str = "") -> None:
         resp = await bridge.send_list_spaces()
         entries = resp.get("spaces") or []
         seeded_channels = 0
+        intro_channel_id = ""
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -455,6 +510,15 @@ async def refresh_bridge_spaces(client, trigger_space_id: str = "") -> None:
                     client._channel_space[cid] = sid
                     await client.store.mark_channel_space(cid, sid)
                     seeded_channels += 1
+                    # First channel of the space we were just added to. The
+                    # bridge's list_spaces has no ``is_public`` field, but the
+                    # server orders each space's channels ``is_public DESC``
+                    # then by name (``cloud_agent::bridge::handle_list_spaces``),
+                    # so the first entry is a public channel whenever the space
+                    # has one — the same "first public channel" rule the native
+                    # path's ``find_public_general_channel`` applies.
+                    if sid == trigger_space_id and not intro_channel_id:
+                        intro_channel_id = cid
         client._log.info(
             "bridge spaces refresh: %d spaces listed, %d channels seeded "
             "(trigger space_id=%s)",
@@ -462,6 +526,7 @@ async def refresh_bridge_spaces(client, trigger_space_id: str = "") -> None:
             seeded_channels,
             trigger_space_id or "<missing>",
         )
+        await introduce_on_space_join(client, trigger_space_id, intro_channel_id)
     except Exception:  # noqa: BLE001 — a failed refresh must not crash the loop
         client._log.warning(
             "bridge spaces refresh failed (trigger space_id=%s)",
@@ -663,18 +728,20 @@ def _reschedule_keyless_gated_record(client, payload, stored) -> None:
 
 async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]:
     dm_peer = (
-        payload.recipient_slug
-        if payload.sender_slug == client.slug
-        else payload.sender_slug
-    ) if payload.envelope_kind == "dm" else ""
-    thread_root_id, thread_root_unverified = (
-        await client._resolve_incoming_thread_root(
-            payload.thread_root_id,
-            payload.channel_id,
-            payload.space_id,
-            expected_envelope_kind=payload.envelope_kind,
-            expected_dm_peer=dm_peer,
+        (
+            payload.recipient_slug
+            if payload.sender_slug == client.slug
+            else payload.sender_slug
         )
+        if payload.envelope_kind == "dm"
+        else ""
+    )
+    thread_root_id, thread_root_unverified = await client._resolve_incoming_thread_root(
+        payload.thread_root_id,
+        payload.channel_id,
+        payload.space_id,
+        expected_envelope_kind=payload.envelope_kind,
+        expected_dm_peer=dm_peer,
     )
     return {
         "envelope_id": payload.envelope_id,
@@ -773,8 +840,7 @@ async def _keyless_operator_reply_gate(client, payload, row) -> GateVerdict | No
     already been decided by ``operator_control_gate`` before this runs.
     """
     if not (
-        payload.envelope_kind == "dm"
-        and payload.sender_slug == client.operator_slug
+        payload.envelope_kind == "dm" and payload.sender_slug == client.operator_slug
     ):
         return None
     # A fast operator reply can arrive before the prompt self-echo has been
@@ -811,7 +877,11 @@ async def _keyless_operator_reply_gate(client, payload, row) -> GateVerdict | No
 
 
 async def _finish_keyless_dm_operator_reply(
-    client, *, thread_root_id: str, text: str, envelope_id: str,
+    client,
+    *,
+    thread_root_id: str,
+    text: str,
+    envelope_id: str,
 ) -> None:
     """ACK an operator reply only after its approval decision is durable."""
     durable = await maybe_handle_operator_reply(
@@ -851,8 +921,7 @@ async def _keyless_invitation_reply_gate(client, payload, row) -> GateVerdict | 
     if flow is None:
         return None
     if not (
-        payload.envelope_kind == "dm"
-        and payload.sender_slug == client.operator_slug
+        payload.envelope_kind == "dm" and payload.sender_slug == client.operator_slug
     ):
         return None
     # A fast operator reply can arrive before the prompt self-echo has been
@@ -885,7 +954,12 @@ async def _keyless_invitation_reply_gate(client, payload, row) -> GateVerdict | 
 
 
 async def _finish_keyless_invitation_reply(
-    client, flow, *, thread_root_id: str, text: str, envelope_id: str,
+    client,
+    flow,
+    *,
+    thread_root_id: str,
+    text: str,
+    envelope_id: str,
 ) -> None:
     """ACK an operator reply only after its invitation decision is durable."""
     durable = await flow.handle_operator_reply(
@@ -936,11 +1010,10 @@ async def _commit_bridge_verdict(
             disposition=verdict.disposition,
             reason=verdict.reason,
         )
-    if (
-        verdict.disposition is ReceiptDisposition.FOREIGN_DM_GATED
-        and result.status
-        in {ReceiptWriteStatus.COMMITTED, ReceiptWriteStatus.IDEMPOTENT}
-    ):
+    if verdict.disposition is ReceiptDisposition.FOREIGN_DM_GATED and result.status in {
+        ReceiptWriteStatus.COMMITTED,
+        ReceiptWriteStatus.IDEMPOTENT,
+    }:
         _track_bridge_task(
             client,
             spawn(
@@ -1227,8 +1300,7 @@ async def save_inbound_bridge_attachments(
         return []
     if not is_safe_path_component(envelope_id):
         client._log.warning(
-            "bridge attachments skipped: envelope_id is not a safe path "
-            "component (%r)",
+            "bridge attachments skipped: envelope_id is not a safe path component (%r)",
             envelope_id,
         )
         return []
