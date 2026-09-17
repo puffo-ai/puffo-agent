@@ -148,6 +148,7 @@ class Daemon:
 
         self._usage_refresh = UsageRefresh()
         self._paused_reported: set[str] = set()
+        self._failed_start_reported: dict[str, tuple[Worker, str]] = {}
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
         self._stop = asyncio.Event()
@@ -509,6 +510,17 @@ class Daemon:
                 await self._start_worker(agent_cfg)
             else:
                 worker.agent_cfg = agent_cfg
+            current = self.workers.get(agent_id)
+            if current is not None and current.runtime.status == "error":
+                failure = (current, current.runtime.error)
+                if self._failed_start_reported.get(agent_id) != failure:
+                    if await _report_lifecycle(
+                        agent_cfg, "error", error_text=current.runtime.error,
+                        runtime=current._runtime_info(),
+                    ):
+                        self._failed_start_reported[agent_id] = failure
+            else:
+                self._failed_start_reported.pop(agent_id, None)
         elif desired_state == "paused":
             if worker is not None:
                 logger.info("agent %s: state=paused, stopping worker", agent_id)
@@ -787,6 +799,7 @@ class Daemon:
         return context.message_client if context is not None else None
 
     async def _stop_worker(self, agent_id: str) -> None:
+        self._failed_start_reported.pop(agent_id, None)
         worker = self.workers.pop(agent_id, None)
         if worker is not None:
             # Unregister from both refreshers — set ops are idempotent
@@ -966,8 +979,9 @@ class Daemon:
 
 async def _report_lifecycle(
     agent_cfg: AgentConfig, status: str, *, directory: Path | None = None,
+    error_text: str | None = None, runtime: dict[str, object] | None = None,
 ) -> bool:
-    """Report an operator lifecycle state (paused/archived) to the server as the
+    """Report lifecycle state or startup failure to the server as the
     agent. The worker is stopped at this point, so it can't heartbeat the state
     itself; the daemon does it out-of-band. Returns True when the report is
     *settled* — delivered, or rejected with a permanent 4xx that retrying can't
@@ -984,9 +998,15 @@ async def _report_lifecycle(
     http = PuffoCoreHttpClient(pc.server_url, keystore, pc.slug)
     try:
         body: dict = {"status": status}
+        if error_text is not None:
+            from ..agent.harness.support.redaction import safe_provider_message
+
+            body["error_text"] = safe_provider_message(error_text, max_length=1024)
         machine_id = current_machine_id()
         if machine_id:
             body["machine_id"] = machine_id
+            if runtime is not None:
+                body["runtime"] = runtime
         await http.post("/agents/me/heartbeat", body)
         return True
     except HttpError as exc:

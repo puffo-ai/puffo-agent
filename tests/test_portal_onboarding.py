@@ -376,3 +376,49 @@ def test_cmd_link_defaults_code_to_none(monkeypatch):
     monkeypatch.setattr(link, "run_link", _fake_run_link)
     assert cli.cmd_link(_link_ns()) == 0
     assert seen["code"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_start_publishes_machine_and_safe_error_without_worker_heartbeat(monkeypatch):
+    """An occupied provider must remain visible/recoverable before its first heartbeat."""
+    from puffo_agent.portal import daemon
+
+    _stub_http(monkeypatch)
+    monkeypatch.setattr("puffo_agent.portal.control.store.current_machine_id", lambda: "mac_X")
+    runtime = {"kind": "cli-local", "harness": "lingtai", "provider": "lingtai"}
+    assert await daemon._report_lifecycle(
+        _fake_cfg(state="running"), "error", runtime=runtime,
+        error_text="Working directory is already in use api_key=synthetic-private-value",
+    )
+    body = _RecordingHttp.posts[0][2]
+    assert body["status"] == "error"
+    assert body["machine_id"] == "mac_X"
+    assert body["runtime"] == runtime
+    assert "already in use" in body["error_text"]
+    assert "synthetic-private-value" not in body["error_text"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retries_failed_start_report_until_delivered(monkeypatch, tmp_path):
+    """No successful worker startup is needed; a transient reporting failure retries."""
+    from unittest.mock import AsyncMock
+    from puffo_agent.portal import daemon
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = AgentConfig(id="failed", state="running")
+    cfg.save()
+    d = daemon.Daemon(DaemonConfig())
+    worker = types.SimpleNamespace(
+        agent_cfg=cfg, restart_required=False,
+        runtime=types.SimpleNamespace(status="error", error="directory occupied"),
+        _runtime_info=lambda: {"kind": "cli-local", "harness": "lingtai"},
+    )
+    d.workers[cfg.id] = worker
+    report = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(daemon, "_report_lifecycle", report)
+    for _ in range(3):
+        await d._reconcile_agent(cfg.id)
+    assert report.await_count == 2
+    assert report.call_args.args == (cfg, "error")
+    assert report.call_args.kwargs["error_text"] == "directory occupied"
