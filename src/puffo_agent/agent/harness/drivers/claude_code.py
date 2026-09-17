@@ -589,9 +589,15 @@ class ClaudeCodeCliDriver(Driver):
             await self._proc.stdin.drain()
 
     async def _read_loop(self) -> None:
+        # close() detaches self._proc before awaiting process exit. Keep this
+        # reader bound to its original stream while buffered output drains.
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        stdout = proc.stdout
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                line = await stdout.readline()
                 if not line:
                     break
                 try:

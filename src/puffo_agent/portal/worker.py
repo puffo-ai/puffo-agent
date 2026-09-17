@@ -539,6 +539,10 @@ class Worker:
             self._withdraw_unsubstantiated_wedge(agent_id)
             return
         adapter, mgr, spec_gen, opened_at = subject
+        if rpc_service.rpc_listener_available() is False:
+            detail = "daemon RPC listener unavailable; daemon is recovering it; provider not recycled."
+            self._report_mcp_unreachable(agent_id, detail)
+            return
         now = time.monotonic()
         # Query exactly this spec's generation: hello state is keyed per
         # (agent, generation), so a surviving pre-recycle subprocess's
@@ -568,7 +572,10 @@ class Worker:
                 self.runtime.error = ""
                 self.runtime.save(agent_id)
             return
-        if now - opened_at < _MCP_PROBE_GRACE_SECONDS:
+        recovery = rpc_service.rpc_listener_recovered_at()
+        recovery_grace = _MCP_PROBE_GRACE_SECONDS + (beacon_interval or 0.0)
+        if (now - opened_at < _MCP_PROBE_GRACE_SECONDS
+                or recovery > 0 and now - recovery < recovery_grace):
             return
         if self._turn_active:
             # A reload would raise mid-turn; check again next beat.
@@ -589,18 +596,22 @@ class Worker:
                 agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
             )
             return
-        if self.runtime.health in _MCP_PROBE_OVERWRITABLE_HEALTH:
-            self.runtime.health = "mcp_unreachable"
-            self.runtime.error = (
-                "puffo MCP subprocess never reached the daemon RPC "
-                "service after a runtime recycle; tool calls are likely "
-                "timing out. Restart this worker."
-            )
-            self.runtime.save(agent_id)
-            logger.error(
-                "agent %s: MCP transport still unreachable after recycle; "
-                "runtime.health = mcp_unreachable", agent_id,
-            )
+        self._report_mcp_unreachable(
+            agent_id,
+            "puffo MCP subprocess never reached the daemon RPC "
+            "service after a runtime recycle; tool calls are likely "
+            "timing out. Restart this worker.",
+        )
+
+    def _report_mcp_unreachable(self, agent_id: str, detail: str) -> None:
+        if self.runtime.health not in (*_MCP_PROBE_OVERWRITABLE_HEALTH, "mcp_unreachable"):
+            return
+        if self.runtime.health == "mcp_unreachable" and self.runtime.error == detail:
+            return
+        self.runtime.health = "mcp_unreachable"
+        self.runtime.error = detail
+        self.runtime.save(agent_id)
+        logger.error("agent %s: %s", agent_id, detail)
 
     async def _recycle_wedged_mcp(
         self, agent_id: str, adapter, mgr, *, cause: str, spec_gen: str,

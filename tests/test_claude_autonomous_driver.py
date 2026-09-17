@@ -124,3 +124,44 @@ async def test_completed_assistant_identity_is_scoped_to_native_session():
     await driver._handle(frame)
     assert driver._active.value
     await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_close_while_read_loop_handles_buffered_output():
+    """Shutdown must not dereference a detached process after buffered output."""
+    import asyncio
+    from types import SimpleNamespace
+
+    driver = ClaudeCodeCliDriver()
+    stdout = asyncio.StreamReader()
+    stdout.feed_data(b'{}\n')
+    stdout.feed_eof()
+    handling = asyncio.Event()
+    resume = asyncio.Event()
+    terminated = asyncio.Event()
+    exited = asyncio.Event()
+
+    async def handle(frame):
+        handling.set()
+        await resume.wait()
+
+    async def wait():
+        await exited.wait()
+        return 0
+
+    driver._handle = handle
+    driver._proc = SimpleNamespace(
+        stdout=stdout, returncode=None, terminate=terminated.set,
+        wait=wait, kill=exited.set,
+    )
+    reader = driver._reader = asyncio.create_task(driver._read_loop())
+    await handling.wait()
+    closing = asyncio.create_task(driver.close())
+    await terminated.wait()
+    resume.set()
+    try:
+        await reader
+    finally:
+        exited.set()
+        await closing
+    assert reader.exception() is None
