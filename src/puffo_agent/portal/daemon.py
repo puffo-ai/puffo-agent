@@ -37,7 +37,9 @@ from .data_service import (
     stop_data_service,
 )
 from .host_mcp_handler import HostMcpContext
-from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .rpc_service import (
+    set_rpc_resolver, start_rpc_service, stop_rpc_service, supervise_rpc_service,
+)
 from .control.usage_snapshot import set_live_workers
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
@@ -256,6 +258,11 @@ class Daemon:
             self.daemon_cfg.data_service,
             fallback_start=max(63388, self.daemon_cfg.rpc_service.port + 1),
         )
+        if runtime.rpc_runner is not None:
+            runtime.runtime_tasks.append(spawn(
+                supervise_rpc_service(runtime.rpc_runner, self.daemon_cfg.rpc_service, self._stop),
+                name="rpc-service.supervisor",
+            ))
         runtime.runtime_tasks.extend(
             (
                 spawn(self.refresher.run_loop(self._stop), name="refresher.run_loop"),

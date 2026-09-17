@@ -679,3 +679,93 @@ async def test_covers_wrong_types_are_rejected_not_dropped(app_client_factory):
             json={"covers": bad},
         )
         assert response.status == 400, f"mark covers={bad!r} accepted"
+
+
+@pytest.mark.asyncio
+async def test_closed_rpc_socket_recovers_same_port_and_accepts_hello():
+    """A closed listening socket must recover without changing live MCP endpoints."""
+    import asyncio
+    import socket
+    import aiohttp
+
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    cfg = rpc_service.RpcServiceConfig(port=port)
+    runner = await rpc_service.start_rpc_service(cfg)
+    stop = asyncio.Event()
+    supervise = None
+    try:
+        supervise = asyncio.create_task(rpc_service.supervise_rpc_service(runner, cfg, stop))
+        for site in tuple(runner.sites):
+            site._server.close()
+            await site._server.wait_closed()
+        assert rpc_service.rpc_listener_available() is False
+        async with aiohttp.ClientSession() as client:
+            deadline = asyncio.get_running_loop().time() + 8
+            while True:
+                try:
+                    response = await client.post(
+                        f"http://127.0.0.1:{port}/v1/rpc/recovery-agent/mcp-hello",
+                        headers=local_service_headers(issue_local_service_token("recovery-agent")),
+                        json={"generation": "recovered-generation", "beacon_interval": 60},
+                    )
+                    assert response.status == 200
+                    await response.read()
+                    break
+                except aiohttp.ClientConnectionError:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.05)
+        assert cfg.port == port
+        assert rpc_service.rpc_listener_available() is True
+        assert rpc_service.mcp_hello_state("recovery-agent", "recovered-generation")[0] > 0
+    finally:
+        stop.set()
+        if supervise is not None:
+            await supervise
+        await rpc_service.stop_rpc_service(runner)
+        rpc_service.clear_mcp_hello("recovery-agent")
+
+
+@pytest.mark.asyncio
+async def test_rpc_recovery_retries_occupied_port_without_fallback(caplog):
+    """Live subprocesses keep their endpoint when recovery finds another listener."""
+    import asyncio
+    import socket
+
+    cfg = rpc_service.RpcServiceConfig(port=0)
+    runner = await rpc_service.start_rpc_service(cfg)
+    port = cfg.port
+    stop = asyncio.Event()
+    supervisor = None
+    blocker = socket.socket()
+    try:
+        for site in tuple(runner.sites):
+            site._server.close()
+            await site._server.wait_closed()
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen()
+        supervisor = asyncio.create_task(rpc_service.supervise_rpc_service(runner, cfg, stop))
+        deadline = asyncio.get_running_loop().time() + 8
+        while "recovery failed" not in caplog.text:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert cfg.port == port
+        assert rpc_service.rpc_listener_available() is False
+        assert not supervisor.done()
+        blocker.close()
+        while rpc_service.rpc_listener_available() is not True:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert cfg.port == port
+        stop.set()
+        await supervisor
+        await rpc_service.stop_rpc_service(runner)
+        assert not runner.sites
+        assert rpc_service.rpc_listener_available() is None
+    finally:
+        blocker.close()
+        stop.set()
+        if supervisor is not None:
+            await supervisor
+        await rpc_service.stop_rpc_service(runner)

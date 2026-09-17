@@ -7,6 +7,7 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
@@ -28,6 +29,64 @@ from .local_service_auth import require_local_service_auth
 from .state import RpcServiceConfig
 
 logger = logging.getLogger(__name__)
+
+# The daemon owns one RPC runner. Workers consult the listener before blaming
+# missing hello beacons on a provider. None means this service is not managed
+# in this process (e.g. standalone worker embeddings).
+_RPC_RUNNER: web.AppRunner | None = None
+_RPC_RECOVERED_AT = 0.0
+
+
+def rpc_listener_available() -> bool | None:
+    if _RPC_RUNNER is None:
+        return None
+    return _rpc_runner_serving(_RPC_RUNNER)
+
+
+def _rpc_runner_serving(runner: web.AppRunner) -> bool:
+    # aiohttp compatibility boundary: BaseSite exposes no public serving
+    # predicate; its asyncio.Server does. A runner/site can outlive its socket.
+    return any(
+        site._server is not None and site._server.is_serving()
+        for site in runner.sites
+    )
+
+
+def rpc_listener_recovered_at() -> float:
+    """Recovery watermark used to allow existing MCP beacons to reconnect."""
+    return _RPC_RECOVERED_AT
+
+
+async def supervise_rpc_service(
+    runner: web.AppRunner, cfg: RpcServiceConfig, stop: asyncio.Event,
+) -> None:
+    """Restore lost listeners on the same endpoint; never redirect live MCPs."""
+    global _RPC_RECOVERED_AT
+    outage_logged = False
+    while not stop.is_set():
+        try:
+            if not _rpc_runner_serving(runner):
+                if not outage_logged:
+                    logger.error(
+                        "rpc-service: listener lost on %s:%d; recovering same endpoint",
+                        cfg.bind_host, cfg.port,
+                    )
+                    outage_logged = True
+                for site in tuple(runner.sites):
+                    await site.stop()
+                if stop.is_set():
+                    return
+                site = web.TCPSite(runner, host=cfg.bind_host, port=cfg.port)
+                await site.start()
+                _RPC_RECOVERED_AT = time.monotonic()
+                outage_logged = False
+                logger.info("rpc-service: listener recovered on %s:%d", cfg.bind_host, cfg.port)
+        except Exception:
+            logger.exception("rpc-service: listener recovery failed; will retry same endpoint")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 # Returns None when the worker isn't warm yet — handlers 404 and the
@@ -792,6 +851,7 @@ async def start_rpc_service(
     """``None`` on disabled / bind-window-exhausted. On fallback,
     mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
     sees the resolved port."""
+    global _RPC_RUNNER, _RPC_RECOVERED_AT
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
@@ -816,19 +876,29 @@ async def start_rpc_service(
         except Exception:
             pass
         return None
+    # Port zero is useful for isolated embeddings; record its actual endpoint.
+    if bound_port == 0:
+        bound_port = runner.addresses[0][1]
     if bound_port != requested_port:
         logger.info(
             "rpc-service: port %d in use; fell back to %d",
             requested_port, bound_port,
         )
         cfg.port = bound_port
+    _RPC_RUNNER = runner
+    _RPC_RECOVERED_AT = 0.0
     logger.info("rpc-service: listening on %s:%d", cfg.bind_host, cfg.port)
     return runner
 
 
 async def stop_rpc_service(runner: web.AppRunner | None) -> None:
+    global _RPC_RUNNER, _RPC_RECOVERED_AT
     if runner is None:
         return
+    if _RPC_RUNNER is runner:
+        _RPC_RUNNER = None
+        _RPC_RECOVERED_AT = 0.0
+    logger.info("rpc-service: stopping listener")
     try:
         await runner.cleanup()
     except Exception:
