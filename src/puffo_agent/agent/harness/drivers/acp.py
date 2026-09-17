@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -79,6 +80,24 @@ from ..support.subprocess_io import (
     process_group_spawn_kwargs,
     shutdown_process_tree,
 )
+
+
+def _startup_diagnostic(stderr: bytes) -> tuple[str, bool]:
+    """Select the terminal error before bounded redaction discards reader noise."""
+    lines = [line.strip() for line in stderr.decode("utf-8", errors="replace").splitlines()
+             if line.strip()]
+    selected = lines[-1]
+    for line in reversed(lines):
+        if re.match(r"(?:[\w.]+(?:Error|Exception)|error):", line, re.IGNORECASE):
+            selected = line
+            break
+    lower = selected.lower()
+    occupied = (
+        "another lingtai agent is already running" in lower
+        or (lower.startswith("runtimeerror: working directory ")
+            and "is already in use by another agent" in lower)
+    )
+    return safe_provider_message(selected), occupied
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,9 +393,9 @@ class AcpDriver(Driver):
                     pass
             if not tail.strip():
                 raise
-            detail = safe_provider_message(tail.decode("utf-8", errors="replace"))
+            detail, occupied = _startup_diagnostic(tail)
             hint = ""
-            if "another lingtai agent is already running" in detail.lower():
+            if occupied:
                 hint = " Close the active LingTai TUI for this source, then resume this Agent."
             raise RuntimeError(f"ACP initialization failed: {detail}.{hint}") from exc
 

@@ -966,14 +966,19 @@ def test_both_runtimes_agree_on_which_permission_modes_exist():
     )
 
 
+@pytest.mark.parametrize("diagnostic,occupied", [
+    ("error: another lingtai agent is already running in /workspace", True),
+    ("RuntimeError: Working directory '/workspace' is already in use by another agent. Each agent needs its own directory.", True),
+    ("ValueError: Invalid model configuration", False),
+])
 @pytest.mark.asyncio
-async def test_initialize_exit_preserves_safe_stderr(tmp_path):
+async def test_initialize_exit_preserves_safe_stderr(tmp_path, diagnostic, occupied):
     """An ACP child refusing an occupied source must not become 'Connection closed'."""
     script = tmp_path / "refuse.py"
     script.write_text(
         "import sys\n"
-        "print('error: another lingtai agent is already running in /workspace; '"
-        "'api_key=private-test-value', file=sys.stderr)\n"
+        "print('init.json reader: ' + 'synthetic normal output ' * 40, file=sys.stderr)\n"
+        f"print({(diagnostic + '; api_key=private-test-value')!r}, file=sys.stderr)\n"
         "sys.exit(1)\n"
     )
     driver = AcpDriver()
@@ -983,7 +988,9 @@ async def test_initialize_exit_preserves_safe_stderr(tmp_path):
                 str(tmp_path), executable=sys.executable, launch_args=(str(script),),
             ))
         message = str(caught.value)
-        assert "another lingtai agent is already running" in message
+        assert diagnostic in message
+        assert "init.json reader" not in message
+        assert ("Close the active LingTai" in message) is occupied
         assert "private-test-value" not in message
         assert "[REDACTED]" in message
     finally:
