@@ -1177,8 +1177,6 @@ class PuffoCoreMessageClient:
     def _invite_target_label(meta: dict) -> str:
         return invite_target_label(meta)
 
-    # ── cli-local command permission (operator-gated) ─────────────────
-
     async def request_command_permission(
         self,
         *,
@@ -1262,8 +1260,6 @@ class PuffoCoreMessageClient:
         except Exception:
             self._log.exception("permission: failed to confirm decision")
         return True
-
-    # ── Agent-initiated leave (operator-gated, mirrors invite) ────────
 
     async def request_leave_approval(
         self,
@@ -1392,8 +1388,6 @@ class PuffoCoreMessageClient:
                 "failed to confirm leave-reply outcome to operator",
             )
         return True
-
-    # ─── auto_accept_dm gate ──────────────────────────────────────
 
     async def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
         # Operator, self, and co-owned agents are trusted; everyone else
