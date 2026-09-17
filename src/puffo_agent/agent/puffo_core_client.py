@@ -1856,6 +1856,36 @@ class PuffoCoreMessageClient:
         text: str,
         root_id: str,
     ) -> dict[str, Any] | None:
+        """Send an operator-facing DM.
+
+        Every path that needs human attention funnels through here — the leave
+        approval prompt, invite prompts, permission prompts. ``send_direct_message``
+        signs with the subkey in the local keystore, which a keyless cloud agent
+        does not have: ``keystore.load_session`` raises ``session not found:
+        <slug>``, the tool returns that string to the model, and the operator is
+        never asked anything.
+
+        So a keyless client sends the same DM over the bridge instead and lets the
+        server seal it. This mirrors ``_bridge_invite_prompt_send`` in
+        ``client_setup``: "a keyless bridge prompt is a plain ``send_send`` DM to
+        the configured operator — never a signed HTTP route."
+
+        The bridge ``Ack`` carries ``envelope_id``, which is what callers key
+        their pending-prompt records on (``_pending_leave_dms``), so the return
+        shape matches the signed path.
+        """
+        bridge = getattr(self, "_bridge", None)
+        if bridge is not None:
+            frame = await bridge.send_send(
+                plaintext=text,
+                recipient_slug=recipient_slug,
+                # A DM prompt is always a root post: the operator's reply is
+                # what creates the thread, and the ack's envelope_id becomes
+                # that thread's root.
+                thread_root_id=root_id or None,
+            )
+            return frame or None
+
         return await send_direct_message(
             slug=self.slug,
             recipient_slug=recipient_slug,
