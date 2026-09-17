@@ -58,7 +58,9 @@ def runtime_events(caplog):
 
 def projection_metadata(block: str) -> dict[str, object]:
     """Extract stable facts from a context-versioned semantic row."""
-    row = next(line for line in block.splitlines() if line.startswith("[message "))
+    row = next(
+        line for line in block.splitlines() if line.startswith("[message ")
+    )
     return {
         "envelope_id": re.search(r'\bmessage_id="([^"]+)"', row).group(1),
         "sender_slug": re.search(r'\bsender_identity="@([^"]+)"', row).group(1),
@@ -67,8 +69,7 @@ def projection_metadata(block: str) -> dict[str, object]:
 
 
 def test_runtime_event_helper_fails_open_and_omits_unavailable(
-    caplog,
-    monkeypatch,
+    caplog, monkeypatch,
 ):
     caplog.set_level(
         logging.INFO,
@@ -77,19 +78,13 @@ def test_runtime_event_helper_fails_open_and_omits_unavailable(
     target = logging.getLogger(__name__)
     log_runtime_event(target, "unknown_event", agent_id="agent")
     log_runtime_event(
-        target,
-        "batch.planned",
-        unknown_field=["ignored"],
+        target, "batch.planned", unknown_field=["ignored"],
     )
     log_runtime_event(
-        target,
-        "batch.planned",
-        agent_id=object(),
-        first_seq=float("nan"),
+        target, "batch.planned", agent_id=object(), first_seq=float("nan"),
     )
 
     import puffo_agent.agent._logging as logging_module
-
     original_dumps = logging_module.json.dumps
     monkeypatch.setattr(
         logging_module.json,
@@ -123,15 +118,13 @@ def test_runtime_event_helper_fails_open_and_omits_unavailable(
         target,
         "batch.planned",
         envelope_ids=["env-1"],
-        routes=[
-            {
-                "space_id": "sp-1",
-                "channel_id": "ch-1",
-                "count": 1,
-                "min_seq": 2,
-                "max_seq": 2,
-            }
-        ],
+        routes=[{
+            "space_id": "sp-1",
+            "channel_id": "ch-1",
+            "count": 1,
+            "min_seq": 2,
+            "max_seq": 2,
+        }],
     )
     log_runtime_event(
         target,
@@ -148,15 +141,13 @@ def test_runtime_event_helper_fails_open_and_omits_unavailable(
         {
             "event": "batch.planned",
             "envelope_ids": ["env-1"],
-            "routes": [
-                {
-                    "channel_id": "ch-1",
-                    "count": 1,
-                    "max_seq": 2,
-                    "min_seq": 2,
-                    "space_id": "sp-1",
-                }
-            ],
+            "routes": [{
+                "channel_id": "ch-1",
+                "count": 1,
+                "max_seq": 2,
+                "min_seq": 2,
+                "space_id": "sp-1",
+            }],
         },
         {"event": "batch.planned"},
     ]
@@ -167,7 +158,8 @@ def test_runtime_event_helper_fails_open_and_omits_unavailable(
     ]
     assert warnings
     assert all(
-        "unknown_event" not in warning and "unknown_field" not in warning
+        "unknown_event" not in warning
+        and "unknown_field" not in warning
         for warning in warnings
     )
 
@@ -194,8 +186,7 @@ class _ListenKeyCache:
 class _ListenKeyStore:
     def __init__(self):
         self.identity = SimpleNamespace(
-            kem_secret_key="ignored",
-            identity_cert_json="{}",
+            kem_secret_key="ignored", identity_cert_json="{}",
             server_url="https://example.test",
         )
 
@@ -254,7 +245,6 @@ def _install_listen_stubs(client, gate_foreign_dm):
     def returns(value):
         async def stub(*_args, **_kwargs):
             return value
-
         return stub
 
     none, false, empty = returns(None), returns(False), returns({})
@@ -273,15 +263,13 @@ def _install_listen_stubs(client, gate_foreign_dm):
     client._fetch_display_name = lambda slug: asyncio.sleep(0, result=slug.title())
     client._fetch_owner_slug = lambda _slug: asyncio.sleep(0, result="")
     client._is_foreign_dm_sender = lambda _slug: asyncio.sleep(
-        0,
-        result=gate_foreign_dm,
+        0, result=gate_foreign_dm,
     )
     client._ensure_trusted_contact = none
     client._maybe_send_dm_notice = none
     client._shares_space_with = false
     client._maybe_gate_foreign_dm = lambda **_kwargs: asyncio.sleep(
-        0,
-        result=gate_foreign_dm,
+        0, result=gate_foreign_dm,
     )
     client._invite_poll_loop = lambda: asyncio.sleep(3600)
     client._on_ws_connect = none
@@ -289,14 +277,8 @@ def _install_listen_stubs(client, gate_foreign_dm):
 
 
 async def listen_delivery(
-    monkeypatch,
-    tmp_path,
-    *,
-    payload: MessagePayload,
-    seq: int,
-    blocked: bool = False,
-    gate_foreign_dm: bool = False,
-    setup=None,
+    monkeypatch, tmp_path, *, payload: MessagePayload, seq: int,
+    blocked: bool = False, gate_foreign_dm: bool = False, setup=None,
 ):
     """Drive the production listen callback with a complete wrapper."""
     import puffo_agent.agent.puffo_core_client as client_mod
@@ -312,20 +294,14 @@ async def listen_delivery(
         return result
 
     store.store_receipt = ordered_store
-    delivery = {
-        "seq": seq,
-        "envelope": {
-            "envelope_id": payload.envelope_id,
-            "sender_slug": payload.sender_slug,
-            "type": "encrypted_message_envelope",
-        },
-    }
+    delivery = {"seq": seq, "envelope": {
+        "envelope_id": payload.envelope_id, "sender_slug": payload.sender_slug,
+        "type": "encrypted_message_envelope",
+    }}
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     _configure_listen_client(client, store, tmp_path, events, blocked)
     _install_listen_stubs(client, gate_foreign_dm)
-    monkeypatch.setattr(
-        client_mod, "PuffoCoreWsClient", _listen_ws_type(delivery, events)
-    )
+    monkeypatch.setattr(client_mod, "PuffoCoreWsClient", _listen_ws_type(delivery, events))
     monkeypatch.setattr(client_mod, "decrypt_message", lambda *_args: payload)
     monkeypatch.setattr(client_mod, "decode_secret", lambda _value: b"secret")
     monkeypatch.setattr(client_mod.KemKeyPair, "from_secret_bytes", lambda _v: object())
@@ -369,23 +345,16 @@ async def test_receipt_commit_before_ack_and_wake_without_admission(tmp_path):
     assert [item.envelope_id for item in pending] == ["m1"]
     assert pending[0].model_visible_at is None
     await store.close()
-
-
 @pytest.mark.asyncio
 async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
-    monkeypatch,
-    tmp_path,
-    caplog,
+    monkeypatch, tmp_path, caplog,
 ):
     caplog.set_level(
         logging.DEBUG,
         logger="receipt-listen",
     )
     _client, store, events, _delivery = await listen_delivery(
-        monkeypatch,
-        tmp_path,
-        payload=payload_for("eligible"),
-        seq=11,
+        monkeypatch, tmp_path, payload=payload_for("eligible"), seq=11,
     )
     assert events == [
         "committed",
@@ -397,8 +366,7 @@ async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
     assert row.envelope_id == "eligible"
     assert row.model_visible_at is None
     receipt_event = next(
-        item
-        for item in runtime_events(caplog)
+        item for item in runtime_events(caplog)
         if item["event"] == "inbox.receipt_committed"
     )
     assert receipt_event == {
@@ -408,10 +376,10 @@ async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
         "envelope_id": "eligible",
         "space_id": "sp-1",
         "channel_id": "ch-1",
-        "seq": 11,
-        "server_seq": 11,
-        "message_id": "eligible",
-        "mode": "transport_receipt",
+            "seq": 11,
+            "server_seq": 11,
+            "message_id": "eligible",
+            "mode": "transport_receipt",
         "state": "eligible",
     }
     await store.close()
@@ -419,8 +387,7 @@ async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
 
 @pytest.mark.asyncio
 async def test_receipt_listen_blocked_tombstone_never_persists_plaintext(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     secret = "blocked-secret-that-must-not-persist"
     _client, store, events, _delivery = await listen_delivery(
@@ -443,8 +410,7 @@ async def test_receipt_listen_blocked_tombstone_never_persists_plaintext(
 
 @pytest.mark.asyncio
 async def test_terminal_channel_delivery_wake_releases_exact_watermark_waiter(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     async def setup(client, store, _events, _delivery):
         runtime = GlobalInboxRuntime(
@@ -477,8 +443,7 @@ async def test_terminal_channel_delivery_wake_releases_exact_watermark_waiter(
 
 @pytest.mark.asyncio
 async def test_idempotent_terminal_channel_delivery_wake_releases_waiter(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     async def setup(client, store, events, _delivery):
         runtime = GlobalInboxRuntime(
@@ -521,7 +486,9 @@ async def test_idempotent_terminal_channel_delivery_wake_releases_waiter(
     _client, store, events, _delivery, waiter = await listen_delivery(
         monkeypatch,
         tmp_path,
-        payload=payload_for("idempotent-terminal", sender="agent", content="hello"),
+        payload=payload_for(
+            "idempotent-terminal", sender="agent", content="hello"
+        ),
         seq=15,
         setup=setup,
     )
@@ -546,14 +513,10 @@ async def test_idempotent_terminal_channel_delivery_wake_releases_waiter(
     ],
 )
 async def test_notification_matrix_dm_and_conflict(
-    monkeypatch,
-    tmp_path,
-    kind,
-    expected_events,
+    monkeypatch, tmp_path, kind, expected_events,
 ):
     async def setup(_client, store, events, _delivery):
         if kind == "conflict":
-
             async def conflict(*_args, **_kwargs):
                 events.append("write-conflict")
                 return ReceiptResult(
@@ -582,8 +545,7 @@ async def test_notification_matrix_dm_and_conflict(
 
 @pytest.mark.asyncio
 async def test_notification_matrix_raised_write_wakes_neither(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     captured = {}
 
@@ -611,8 +573,7 @@ async def test_notification_matrix_raised_write_wakes_neither(
 
 @pytest.mark.asyncio
 async def test_gated_receipt_listen_holds_then_exact_wrapper_promotion_acks_once(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     client, store, events, delivery = await listen_delivery(
         monkeypatch,
@@ -654,8 +615,7 @@ async def test_gated_receipt_listen_holds_then_exact_wrapper_promotion_acks_once
 
 @pytest.mark.asyncio
 async def test_legacy_gated_receipt_backfills_then_promotes_and_acks(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     payload = payload_for("legacy-gated", kind="dm", sender="foreign")
 
@@ -678,7 +638,9 @@ async def test_legacy_gated_receipt_backfills_then_promotes_and_acks(
     assert legacy.processing_state is None
 
     client._is_foreign_dm_sender = lambda _slug: asyncio.sleep(0, result=True)
-    client._maybe_gate_foreign_dm = lambda **_kwargs: asyncio.sleep(0, result=False)
+    client._maybe_gate_foreign_dm = lambda **_kwargs: asyncio.sleep(
+        0, result=False
+    )
     client._contacts.is_allowed = lambda _slug: asyncio.sleep(0, result=True)
     posts = []
 
@@ -693,7 +655,9 @@ async def test_legacy_gated_receipt_backfills_then_promotes_and_acks(
     client.http = ApprovalHttp()
     await client._drain_pending_from_sender("foreign")
 
-    assert [row.envelope_id for row in await store.get_pending()] == ["legacy-gated"]
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "legacy-gated"
+    ]
     assert posts == [
         ("/messages/ack", {"envelope_ids": ["legacy-gated"]}),
     ]
@@ -713,8 +677,8 @@ async def test_local_event_introduction_has_no_server_seq_and_wakes_scheduler(
     wakes = []
     client.global_runtime = SimpleNamespace(notify=lambda: wakes.append("wake"))
     client._resolve_space_name = lambda _space: asyncio.sleep(0, result="Space")
-    client._resolve_channel_name = lambda *_args, **_kwargs: asyncio.sleep(
-        0, result="General"
+    client._resolve_channel_name = (
+        lambda *_args, **_kwargs: asyncio.sleep(0, result="General")
     )
     await client._enqueue_channel_intro_nudge(space_id="sp", channel_id="ch")
     rows = await store.get_pending()
@@ -727,10 +691,7 @@ async def test_local_event_introduction_has_no_server_seq_and_wakes_scheduler(
 async def test_gated_promotion_exact_wrapper_ack_only_after_promotion(tmp_path):
     store = await make_store(tmp_path)
     gated = await receipt(
-        store,
-        "dm1",
-        7,
-        kind="dm",
+        store, "dm1", 7, kind="dm",
         disposition=ReceiptDisposition.FOREIGN_DM_GATED,
     )
     assert not gated.acknowledge
@@ -760,9 +721,7 @@ async def test_local_event_has_no_fabricated_server_seq_and_global_order(tmp_pat
     await receipt(store, "m2", 2)
     assert local.server_seq is None
     assert [m.envelope_id for m in await store.get_pending()] == [
-        "m1",
-        "local-1",
-        "m2",
+        "m1", "local-1", "m2",
     ]
     await store.close()
 
@@ -877,12 +836,10 @@ async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
     ]
 
     for notice in notices:
-        await agent.handle_global_inbox_turn(
-            SimpleNamespace(
-                provider_input=notice,
-                targets=(),
-            )
-        )
+        await agent.handle_global_inbox_turn(SimpleNamespace(
+            provider_input=notice,
+            targets=(),
+        ))
 
     assert [messages[-1]["content"] for messages in received] == notices
     assert all(messages[:-1] == [ordinary] for messages in received)
@@ -892,8 +849,7 @@ async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
 
 @pytest.mark.asyncio
 async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
-    tmp_path,
-    caplog,
+    tmp_path, caplog,
 ):
     caplog.set_level(logging.INFO)
     store = await make_store(tmp_path)
@@ -908,15 +864,14 @@ async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
         raise RuntimeError("provider failed before admission")
 
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=fail,
-        workspace=tmp_path,
+        store=store, adapter=adapter, run_turn=fail, workspace=tmp_path,
     )
     assert await runtime.process_once()
     assert not await runtime.process_once()
     assert calls == 1
-    assert runtime.health == RuntimeHealth("degraded", "turn failed and was requeued")
+    assert runtime.health == RuntimeHealth(
+        "degraded", "turn failed and was requeued"
+    )
     assert runtime._degraded is True
     assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
     assert not (tmp_path / ".puffo-agent/current_turn.json").exists()
@@ -930,9 +885,7 @@ async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
 
 
 @pytest.mark.asyncio
-async def test_admission_failure_requeues_exact_union_and_provider_session_clears(
-    tmp_path,
-):
+async def test_admission_failure_requeues_exact_union_and_provider_session_clears(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "m1", 1)
     adapter = Adapter()
@@ -948,10 +901,7 @@ async def test_admission_failure_requeues_exact_union_and_provider_session_clear
         raise RuntimeError("unsafe recovery")
 
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=fail,
-        workspace=tmp_path,
+        store=store, adapter=adapter, run_turn=fail, workspace=tmp_path,
         coordinator=coordinator,
     )
     await runtime.process_once()
@@ -981,7 +931,6 @@ async def test_baseline_boundary_stateless_and_same_channel_advance(tmp_path):
 @pytest.mark.asyncio
 async def test_active_boundary_safe_prefix_matrix(tmp_path):
     """The active proof is current-turn scoped and independent of baseline."""
-
     async def visible(case, setup):
         store = await make_store(tmp_path / case)
         try:
@@ -994,76 +943,54 @@ async def test_active_boundary_safe_prefix_matrix(tmp_path):
     async def lower_pending(store, boundary):
         await receipt(store, "pending", 11)
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         # A lower same-channel pending row blocks a later current-turn row.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
-
     await visible("lower-pending", lower_pending)
 
     async def foreign_turn(store, boundary):
         await receipt(store, "foreign", 11)
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["foreign"], turn_id="foreign", provider_session_id=None
-        )
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["foreign"], turn_id="foreign", provider_session_id=None)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         # A foreign turn likewise cannot establish this active boundary.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
-
     await visible("foreign-turn", foreign_turn)
 
     async def sparse_other_channel(store, boundary):
         await receipt(store, "other-sparse", 12, channel="other")
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         # Globally sparse sequences in another channel are irrelevant.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
-
     await visible("sparse-other-channel", sparse_other_channel)
 
     async def resolution(store, boundary):
         await receipt(store, "earlier", 11)
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
-        await store.admit_messages(
-            ["earlier"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["earlier"], turn_id="active", provider_session_id=None)
         # Resolving the blocker advances by observed sequence, not N+1 adjacency.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
-
     await visible("resolution", resolution)
 
     async def candidate_ceiling(store, boundary):
         await receipt(store, "history", 12)
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         await boundary.advance_active_turn_through_seq("sp-1", "ch-1", 12)
         # Candidate N is exact history evidence and cannot prove > N.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 12
-
     await visible("candidate-ceiling", candidate_ceiling)
 
     async def trusted_baseline(store, boundary):
         await store.set_context_baseline("sp-1", "ch-1", 10)
         await receipt(store, "old-pending", 5)
         await receipt(store, "current", 30)
-        await store.admit_messages(
-            ["current"], turn_id="active", provider_session_id=None
-        )
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
         # Retained pending/history rows at or below baseline never block again.
         assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
-
     await visible("trusted-baseline", trusted_baseline)
 
 
@@ -1073,37 +1000,21 @@ class _ContinuationAdapter(Adapter):
         self.continuations = []
 
     def register_continuation_callback(
-        self,
-        callback,
-        planning_cycle_key="",
-        *,
-        channel_id="",
-        tool_names=(),
-        tool_arguments=None,
-        correlation_receipt="",
+        self, callback, planning_cycle_key="", *, channel_id="",
+        tool_names=(), tool_arguments=None, correlation_receipt="",
     ):
-        self.continuations.append(
-            (
-                callback,
-                planning_cycle_key,
-                channel_id,
-                tool_names,
-                tool_arguments,
-                correlation_receipt,
-            )
-        )
+        self.continuations.append((
+            callback, planning_cycle_key, channel_id, tool_names,
+            tool_arguments, correlation_receipt,
+        ))
 
     async def admit_continuation(self):
         callback, key, *_ = self.continuations[0]
-        await callback(
-            ProviderAdmissionEvent(
-                planning_cycle_key=key,
-                provider_session_id="provider-1",
-                provider_turn_id="provider-turn",
-                tool_call_id="tool-call-history",
-                admitted_at=datetime.now(timezone.utc),
-            )
-        )
+        await callback(ProviderAdmissionEvent(
+            planning_cycle_key=key, provider_session_id="provider-1",
+            provider_turn_id="provider-turn", tool_call_id="tool-call-history",
+            admitted_at=datetime.now(timezone.utc),
+        ))
 
 
 async def _visible_read_runtime(store, tmp_path):
@@ -1130,13 +1041,9 @@ async def _visible_read_runtime(store, tmp_path):
 
 async def _stage_visible_read(runtime, boundary, adapter, caplog):
     result = await runtime.stage_model_visible_read(
-        space_id="sp-1",
-        channel_id="ch-1",
-        through_seq=2,
-        through_envelope_id="history-2",
-        tool_name="get_channel_history",
-        tool_arguments={"channel": "ch-1"},
-        visible_message_ids=["history-2"],
+        space_id="sp-1", channel_id="ch-1", through_seq=2,
+        through_envelope_id="history-2", tool_name="get_channel_history",
+        tool_arguments={"channel": "ch-1"}, visible_message_ids=["history-2"],
     )
     assert result["state"] == "staged"
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
@@ -1162,13 +1069,10 @@ async def _admit_and_assert_visible_read(runtime, boundary, adapter, caplog):
     assert runtime.active.visible_message_ids == ["history-2"]
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
     history_events = [
-        event
-        for event in runtime_events(caplog)
-        if event["event"].startswith("history.")
+        event for event in runtime_events(caplog) if event["event"].startswith("history.")
     ]
     assert [event["event"] for event in history_events] == [
-        "history.read_staged",
-        "history.read_admitted",
+        "history.read_staged", "history.read_admitted",
     ]
     assert history_events[0]["correlation_key"] == history_events[1]["correlation_key"]
     assert history_events[1]["provider_turn_id"] == "provider-turn"
@@ -1181,20 +1085,14 @@ async def _assert_visible_read_send_correlation(runtime, boundary, caplog):
             seen_seq = await boundary.get_active_turn_through_seq("sp-1", "ch-1")
             return {"state": "held", "seen_seq": seen_seq, "latest_seq": 3}
 
-    delegate = TrackingSendDelegate(
-        BoundaryCoordinator(), SendAttemptState(), runtime=runtime
-    )
+    delegate = TrackingSendDelegate(BoundaryCoordinator(), SendAttemptState(), runtime=runtime)
     await delegate.send({"destination": "ch-1"})
     correlated = [
-        event
-        for event in runtime_events(caplog)
-        if event["event"]
-        in {"history.read_staged", "history.read_admitted", "send.attempted"}
+        event for event in runtime_events(caplog)
+        if event["event"] in {"history.read_staged", "history.read_admitted", "send.attempted"}
     ]
     assert [event["event"] for event in correlated] == [
-        "history.read_staged",
-        "history.read_admitted",
-        "send.attempted",
+        "history.read_staged", "history.read_admitted", "send.attempted",
     ]
     attempted = correlated[-1]
     assert attempted["turn_id"] == "turn"
@@ -1207,11 +1105,8 @@ async def _assert_visible_read_send_correlation(runtime, boundary, caplog):
 async def _assert_invalid_visible_watermark(runtime, caplog):
     with pytest.raises(RuntimeError, match="does not match local storage"):
         await runtime.stage_model_visible_read(
-            space_id="sp-1",
-            channel_id="ch-1",
-            through_seq=3,
-            through_envelope_id="history-2",
-            tool_name="get_channel_history",
+            space_id="sp-1", channel_id="ch-1", through_seq=3,
+            through_envelope_id="history-2", tool_name="get_channel_history",
             tool_arguments={"channel": "ch-1"},
         )
     assert any(
@@ -1224,8 +1119,7 @@ async def _assert_invalid_visible_watermark(runtime, caplog):
 
 @pytest.mark.asyncio
 async def test_model_visible_read_advances_only_after_exact_tool_result_admission(
-    tmp_path,
-    caplog,
+    tmp_path, caplog,
 ):
     caplog.set_level(logging.DEBUG, logger="puffo_agent.agent.global_inbox_runtime")
     store = await make_store(tmp_path)
@@ -1239,85 +1133,48 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
 
 
 @pytest.mark.asyncio
-async def test_initial_admission_visibility_is_exact_deduplicated_and_memory_only(
-    tmp_path,
-):
+async def test_initial_admission_visibility_is_exact_deduplicated_and_memory_only(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial-visible-1", 1)
     await receipt(store, "initial-visible-2", 2)
     rows = tuple(await store.get_pending())
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=Adapter(),
-        run_turn=lambda _planned: None,
+        store=store, adapter=Adapter(), run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
     planned = PlannedTurn(
-        turn_id="initial-visible-turn",
-        planning_cycle_key="initial-visible-key",
-        message_ids=("initial-visible-1", "initial-visible-2"),
-        items=rows,
-        routes=tuple(route_for(row) for row in rows),
-        targets=(),
-        pending_targets=(),
-        target_summary="",
-        formatted_blocks=(),
-        provider_input="",
-        formatted_tokens=0,
-        wrapper_overhead_tokens=0,
-        formatted_bytes=0,
-        wrapper_overhead_bytes=0,
+        turn_id="initial-visible-turn", planning_cycle_key="initial-visible-key",
+        message_ids=("initial-visible-1", "initial-visible-2"), items=rows,
+        routes=tuple(route_for(row) for row in rows), targets=(), pending_targets=(),
+        target_summary="", formatted_blocks=(), provider_input="", formatted_tokens=0,
+        wrapper_overhead_tokens=0, formatted_bytes=0, wrapper_overhead_bytes=0,
     )
     await runtime._start_local_turn(planned)
-    await runtime._admit(
-        planned,
-        ProviderAdmissionEvent(
-            planning_cycle_key="initial-visible-key",
-            provider_session_id="provider-1",
-            provider_turn_id="provider-turn",
-            admitted_at=datetime.now(timezone.utc),
-        ),
-    )
+    await runtime._admit(planned, ProviderAdmissionEvent(
+        planning_cycle_key="initial-visible-key", provider_session_id="provider-1",
+        provider_turn_id="provider-turn", admitted_at=datetime.now(timezone.utc),
+    ))
     assert runtime.active.message_ids == ["initial-visible-1", "initial-visible-2"]
-    assert runtime.active.visible_message_ids == [
-        "initial-visible-1",
-        "initial-visible-2",
-    ]
-    await runtime._add_visible_message_ids(
-        [
-            "initial-visible-2",
-            "initial-visible-1",
-            "initial-visible-2",
-        ]
-    )
-    assert runtime.active.visible_message_ids == [
-        "initial-visible-1",
-        "initial-visible-2",
-    ]
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
+    await runtime._add_visible_message_ids([
+        "initial-visible-2", "initial-visible-1", "initial-visible-2",
+    ])
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
     with pytest.raises(RuntimeError, match="does not resolve locally"):
         await runtime._add_visible_message_ids(["initial-visible-1", "unknown-visible"])
-    assert runtime.active.visible_message_ids == [
-        "initial-visible-1",
-        "initial-visible-2",
-    ]
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
     runtime.active.clear()
     assert runtime.active.visible_message_ids == []
     await store.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "visible_ids",
-    [
-        ["unknown-visible"],
-        ["visible-dm"],
-        ["visible-cross-channel"],
-        ["visible-beyond-watermark"],
-    ],
-)
+@pytest.mark.parametrize("visible_ids", [
+    ["unknown-visible"], ["visible-dm"], ["visible-cross-channel"],
+    ["visible-beyond-watermark"],
+])
 async def test_model_visible_read_rejects_invalid_local_ids_before_callback_registration(
-    tmp_path,
-    visible_ids,
+    tmp_path, visible_ids,
 ):
     store = await make_store(tmp_path)
     await receipt(store, "visible-watermark", 2)
@@ -1335,21 +1192,16 @@ async def test_model_visible_read_rejects_invalid_local_ids_before_callback_regi
 
     adapter = RecordingAdapter()
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=lambda _planned: None,
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
     runtime.active.turn_id = "visible-validation-turn"
     runtime.active.provider_session_id = "provider-1"
     with pytest.raises(RuntimeError, match="visible message ID"):
         await runtime.stage_model_visible_read(
-            space_id="sp-1",
-            channel_id="ch-1",
-            through_seq=2,
+            space_id="sp-1", channel_id="ch-1", through_seq=2,
             through_envelope_id="visible-watermark",
-            tool_name="get_channel_history",
-            tool_arguments={"channel": "ch-1"},
+            tool_name="get_channel_history", tool_arguments={"channel": "ch-1"},
             visible_message_ids=visible_ids,
         )
     assert adapter.callbacks == []
@@ -1398,16 +1250,16 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 7
     assert runtime.active.visible_message_ids == ["history-tool-return"]
     history_events = [
-        event
-        for event in runtime_events(caplog)
+        event for event in runtime_events(caplog)
         if event["event"].startswith("history.")
     ]
     assert [event["event"] for event in history_events] == [
-        "history.read_staged",
-        "history.read_admitted",
+        "history.read_staged", "history.read_admitted",
     ]
     assert history_events[0]["state"] == "tool_return"
-    assert history_events[1]["provider_turn_id"] == ("provider-turn-tool-return")
+    assert history_events[1]["provider_turn_id"] == (
+        "provider-turn-tool-return"
+    )
     await store.close()
 
 
@@ -1423,7 +1275,6 @@ async def test_coordinator_exception_is_tracked_and_re_raised(caplog):
             raise RuntimeError("coordinator failed")
 
     from puffo_agent.agent.global_inbox_runtime import SendAttemptState
-
     attempts = SendAttemptState()
     delegate = TrackingSendDelegate(Coordinator(), attempts)
     with pytest.raises(RuntimeError, match="coordinator failed"):
@@ -1458,15 +1309,14 @@ async def test_send_events_use_only_active_resolved_route(caplog, tmp_path):
         MessageRoute("incoming", "channel", "sp-1", "resolved-channel"),
     ]
     delegate = TrackingSendDelegate(
-        Coordinator(),
-        SendAttemptState(),
-        runtime=runtime,
+        Coordinator(), SendAttemptState(), runtime=runtime,
     )
     await delegate.send({"destination": "resolved-channel"})
     await delegate.send({"destination": "model-only-destination"})
 
     attempted = [
-        event for event in runtime_events(caplog) if event["event"] == "send.attempted"
+        event for event in runtime_events(caplog)
+        if event["event"] == "send.attempted"
     ]
     assert attempted[0]["space_id"] == "sp-1"
     assert attempted[0]["channel_id"] == "resolved-channel"
@@ -1477,8 +1327,7 @@ async def test_send_events_use_only_active_resolved_route(caplog, tmp_path):
 
 @pytest.mark.asyncio
 async def test_coordinator_worker_host_context_shares_failed_held_attachment_attempts(
-    tmp_path,
-    monkeypatch,
+    tmp_path, monkeypatch,
 ):
     from puffo_agent.agent.global_inbox_runtime import SendAttemptState
     from puffo_agent.portal.worker import Worker
@@ -1501,24 +1350,17 @@ async def test_coordinator_worker_host_context_shares_failed_held_attachment_att
     worker = Worker.__new__(Worker)
     worker._client = client
     worker.agent_cfg = SimpleNamespace(
-        id="agent-id",
-        runtime=SimpleNamespace(harness="claude-code"),
+        id="agent-id", runtime=SimpleNamespace(harness="claude-code"),
     )
     monkeypatch.setattr(state_mod, "agent_home_dir", lambda _id: tmp_path)
     context = worker.host_mcp_context()
     assert context.send_coordinator is delegate
-    await context.send_coordinator.send(
-        {
-            "destination": "failed",
-            "text": "text",
-        }
-    )
-    await context.send_coordinator.send(
-        {
-            "destination": "held",
-            "attachment_paths": ["/tmp/file"],
-        }
-    )
+    await context.send_coordinator.send({
+        "destination": "failed", "text": "text",
+    })
+    await context.send_coordinator.send({
+        "destination": "held", "attachment_paths": ["/tmp/file"],
+    })
     assert context.send_coordinator.attempts is attempts
     assert attempts.states == ["failed", "held"]
 
@@ -1528,29 +1370,18 @@ async def test_crash_join_mismatched_or_stateless_session_requeues(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "m1", 1)
     await store.admit_messages(
-        ["m1"],
-        turn_id="turn-1",
-        provider_session_id="old-session",
+        ["m1"], turn_id="turn-1", provider_session_id="old-session",
     )
     path = tmp_path / ".puffo-agent/current_turn.json"
     path.parent.mkdir()
-    path.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                "turn_id": "turn-1",
-                "message_ids": ["m1"],
-                "targets": [["channel", "sp-1", "ch-1"]],
-                "routes": [],
-            }
-        )
-    )
+    path.write_text(json.dumps({
+        "version": 2, "turn_id": "turn-1", "message_ids": ["m1"],
+        "targets": [["channel", "sp-1", "ch-1"]], "routes": [],
+    }))
     adapter = Adapter()
     adapter.session = None
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=lambda _p: None,
+        store=store, adapter=adapter, run_turn=lambda _p: None,
         workspace=tmp_path,
     )
     assert not await runtime.recover_current_turn()
@@ -1574,21 +1405,17 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
 
         async def admit_continuation(self):
             callback, self.continuation = self.continuation, None
-            await callback(
-                ProviderAdmissionEvent(
-                    planning_cycle_key=self.continuation_key,
-                    provider_session_id=self.session,
-                    provider_turn_id="provider-turn",
-                    tool_call_id="tool-recovery",
-                    admitted_at=datetime.now(timezone.utc),
-                )
-            )
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=self.continuation_key,
+                provider_session_id=self.session,
+                provider_turn_id="provider-turn",
+                tool_call_id="tool-recovery",
+                admitted_at=datetime.now(timezone.utc),
+            ))
 
     seed_adapter = RecoveryAdapter()
     seed = GlobalInboxRuntime(
-        store=store,
-        adapter=seed_adapter,
-        run_turn=lambda _planned: None,
+        store=store, adapter=seed_adapter, run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
     planned = await seed.plan_pending()
@@ -1606,19 +1433,15 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
 
     outbox = RuntimeEventOutbox(tmp_path / "state" / "runtime_events.db")
     outbox.set_active_turn(
-        "public_old_turn",
-        session_ref="logical_session",
+        "public_old_turn", session_ref="logical_session",
         native_session_id=str(seed_adapter.session),
     )
     crashed_adapter = Adapter()
     crashed_adapter.session = None
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=crashed_adapter,
-        run_turn=lambda _planned: None,
-        workspace=tmp_path,
-        agent_id="agent",
-        runtime_event_outbox=outbox,
+        store=store, adapter=crashed_adapter,
+        run_turn=lambda _planned: None, workspace=tmp_path,
+        agent_id="agent", runtime_event_outbox=outbox,
     )
     assert not await runtime.recover_current_turn()
     rows = outbox.prefix()
@@ -1626,18 +1449,12 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     assert rows[0].event["type"] == "turn.finished"
     assert rows[0].event["payload"]["outcome"] == "abandoned"
     assert [item.envelope_id for item in await store.get_pending()] == [
-        "first",
-        "second",
+        "first", "second",
     ]
-    await outbox.enqueue(
-        RuntimeEvent(
-            agent_id="agent",
-            session_ref="logical_session",
-            turn_ref="public_replacement_turn",
-            type="turn.started",
-            payload={},
-        )
-    )
+    await outbox.enqueue(RuntimeEvent(
+        agent_id="agent", session_ref="logical_session",
+        turn_ref="public_replacement_turn", type="turn.started", payload={},
+    ))
     rows = outbox.prefix()
     assert rows[0].sequence < rows[1].sequence
     assert rows[1].event["turn_ref"] == "public_replacement_turn"
@@ -1653,10 +1470,7 @@ class ScriptedContext:
         self.on_replan = on_replan
         self.calls = 0
         self.snapshot = ContextSnapshot(
-            0,
-            200_000,
-            "scripted",
-            datetime.now(timezone.utc),
+            0, 200_000, "scripted", datetime.now(timezone.utc),
         )
 
     async def decide(self, candidate, replan):
@@ -1736,9 +1550,9 @@ async def test_global_turn_plain_output_is_internal_not_an_implicit_message(tmp_
             )
 
         # Since PUF-400 a plain answer earns one corrective ask naming the
-        # tool. This stub refuses to take it, which keeps the original
-        # assertion of this test exactly as it was: plain output is internal
-        # and never becomes an implicit message.
+        # tool. This stub refuses to take it, so the assertions below stand
+        # exactly as they did: plain output is internal and never becomes an
+        # implicit message.
         async def run_retry_turn(self, _kick, _fallback, _ctx):
             return TurnResult(
                 reply="No further reply is needed.",
@@ -1794,27 +1608,22 @@ async def test_global_retry_plain_output_is_internal_not_an_implicit_message(tmp
     ],
 )
 async def test_admission_retry_auth_unsafe_or_exhaustion_requeues(
-    tmp_path,
-    error,
+    tmp_path, error,
 ):
     store = await make_store(tmp_path)
     await receipt(store, "retry", 1)
     adapter = Adapter()
     if isinstance(error, AgentAPIError) and error.is_auth:
-
         class Runner(RetryingRunner):
             async def __call__(self, _planned):
                 await self.adapter.admit()
                 raise error
-
         runner = Runner(adapter, [])
     elif isinstance(error, RuntimeError):
-
         class Runner(RetryingRunner):
             async def __call__(self, _planned):
                 await self.adapter.admit()
                 raise error
-
         runner = Runner(adapter, [])
     else:
         runner = RetryingRunner(adapter, [error, error])
@@ -1847,10 +1656,7 @@ async def test_success_without_inbox_read_leaves_messages_pending(
         return None
 
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=run,
-        workspace=tmp_path,
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
     )
     await runtime.process_once()
     assert runtime.health.state == "idle"
@@ -1862,8 +1668,7 @@ async def test_success_without_inbox_read_leaves_messages_pending(
 
 @pytest.mark.asyncio
 async def test_repeated_empty_notice_turns_warn_of_possible_mcp_failure(
-    tmp_path,
-    caplog,
+    tmp_path, caplog,
 ):
     """A wedged MCP lane must not leave repeated empty turns log-silent."""
     caplog.set_level(logging.WARNING)
@@ -1913,9 +1718,7 @@ async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_adm
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
-        ["initial"],
-        turn_id="turn",
-        provider_session_id="provider-1",
+        ["initial"], turn_id="turn", provider_session_id="provider-1",
     )
     adapter = Adapter()
     runtime = GlobalInboxRuntime(
@@ -1938,11 +1741,7 @@ async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_adm
     assert await waiter
 
     rows = await source.query_held_messages(
-        "sp-1",
-        "ch-1",
-        3,
-        "watermark",
-        "provider-1",
+        "sp-1", "ch-1", 3, "watermark", "provider-1",
     )
     assert [row["envelope_id"] for row in rows] == ["watermark"]
     assert rows[0]["content"] == "text-watermark"
@@ -1951,12 +1750,9 @@ async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_adm
     staged = runtime.held[("sp-1", "ch-1")]
     assert staged.synchronized
     assert staged.message_ids == ("watermark",)
-    assert (
-        await ActiveBoundaryAdapter(store, runtime.active).get_active_turn_through_seq(
-            "sp-1", "ch-1"
-        )
-        == 1
-    )
+    assert await ActiveBoundaryAdapter(
+        store, runtime.active
+    ).get_active_turn_through_seq("sp-1", "ch-1") == 1
     await store.close()
 
 
@@ -1999,9 +1795,7 @@ async def test_held_sync_proof_cannot_mutate_a_replacement_turn(tmp_path):
     await receipt(store, "initial", 1)
     await receipt(store, "held", 2)
     await store.admit_messages(
-        ["initial"],
-        turn_id="old-turn",
-        provider_session_id="provider-1",
+        ["initial"], turn_id="old-turn", provider_session_id="provider-1",
     )
     adapter = Adapter()
     runtime = GlobalInboxRuntime(
@@ -2015,11 +1809,7 @@ async def test_held_sync_proof_cannot_mutate_a_replacement_turn(tmp_path):
     runtime.active.provider_session_id = "provider-1"
     runtime.active.provider_turn_id = "old-provider-turn"
     rows = await runtime.held_recovery_source.query_held_messages(
-        "sp-1",
-        "ch-1",
-        2,
-        "held",
-        "provider-1",
+        "sp-1", "ch-1", 2, "held", "provider-1",
     )
     assert [row["envelope_id"] for row in rows] == ["held"]
 
@@ -2033,7 +1823,9 @@ async def test_held_sync_proof_cannot_mutate_a_replacement_turn(tmp_path):
     assert [row.envelope_id for row in await store.get_pending()] == ["held"]
     assert [
         row.envelope_id
-        for row in await store.get_in_turn_messages("old-turn", "provider-1")
+        for row in await store.get_in_turn_messages(
+            "old-turn", "provider-1"
+        )
     ] == ["initial"]
     assert not runtime.current_turn_path.exists()
     await store.close()
@@ -2055,25 +1847,14 @@ async def test_held_timeout_mismatch_and_context_pressure_stage_nothing(
     runtime.active.provider_session_id = "provider-1"
     source = HeldRecoverySource(runtime, wait_timeout_s=0.01)
     assert not await source.wait_for_held_delivery("sp", "ch", 9, "missing")
-    assert (
-        await source.query_held_messages(
-            "sp",
-            "ch",
-            9,
-            "missing",
-            None,
-        )
-        == ()
-    )
+    assert await source.query_held_messages(
+        "sp", "ch", 9, "missing", None,
+    ) == ()
     assert runtime.held[("sp", "ch")].message_ids == ()
     await receipt(store, "rejected", 10)
     runtime.active.provider_session_id = "provider-1"
     metadata = await source.query_held_messages(
-        "sp-1",
-        "ch-1",
-        10,
-        "rejected",
-        "provider-1",
+        "sp-1", "ch-1", 10, "rejected", "provider-1",
     )
     assert metadata
     staged = runtime.held[("sp-1", "ch-1")]
@@ -2105,10 +1886,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
         catchup_pending=catchup,
     )
     assert await source.wait_for_held_delivery(
-        "sp-1",
-        "ch-1",
-        9,
-        "late-watermark",
+        "sp-1", "ch-1", 9, "late-watermark",
     )
     assert runtime.held == {}
     await store.close()
@@ -2116,8 +1894,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
 
 @pytest.mark.asyncio
 async def test_ordinary_human_channel_sender_projects_as_human(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path,
 ):
     """An ordinary human in a channel used to reach the model as
     ``sender_type: unknown`` — only the operator was ever classified
@@ -2146,14 +1923,8 @@ async def test_ordinary_human_channel_sender_projects_as_human(
     assert not content["is_from_operator"]
 
     lines = _user_metadata_lines(
-        channel_name="Channel",
-        channel_id="ch-1",
-        root_id="",
-        post_id="human-1",
-        space_id="sp-1",
-        space_name="Space",
-        create_at=1,
-        sender="alice",
+        channel_name="Channel", channel_id="ch-1", root_id="", post_id="human-1",
+        space_id="sp-1", space_name="Space", create_at=1, sender="alice",
         sender_display_name=content["sender_display_name"],
         sender_is_agent=content["sender_is_agent"],
         sender_owner_slug=content["sender_owner_slug"],
@@ -2163,153 +1934,3 @@ async def test_ordinary_human_channel_sender_projects_as_human(
     )
     assert "- sender_type: human" in lines
     await store.close()
-
-
-# ── PUF-400: a produced answer must not be binned in silence ────────────────
-#
-# A channel message reaches the agent as a global-inbox notice, which sets
-# ``allow_plain_fallback=False`` because a multi-target notice has no single
-# place to post loose prose. When the model answered in prose instead of
-# calling ``send_message``, the router logged ``[no-send]`` at INFO and threw
-# the answer away — indistinguishable, from the channel, from an agent that
-# ignored the room. Observed on staging 2026-09-17: three agents woken, three
-# turns run, one answer delivered.
-
-
-def _planned_one_channel():
-    return SimpleNamespace(
-        provider_input="<exact-global-input>",
-        targets=(("sp_axe", "ch_general"),),
-    )
-
-
-@pytest.mark.asyncio
-async def test_plain_global_output_is_corrected_and_then_delivered(tmp_path):
-    """The model answers in prose; one corrective ask makes it use the tool."""
-
-    class CorrectableAdapter:
-        def __init__(self):
-            self.kicks: list[str] = []
-
-        async def run_turn(self, _ctx):
-            return TurnResult(
-                reply="Tokyo.",
-                metadata={"assistant_text_parts": ["Tokyo."]},
-            )
-
-        async def run_retry_turn(self, kick, _fallback, _ctx):
-            self.kicks.append(kick)
-            return TurnResult(
-                reply="sent",
-                metadata={"send_message_targets": ["ch_general"]},
-            )
-
-    adapter = CorrectableAdapter()
-    agent = PuffoAgent(
-        adapter=adapter,
-        system_prompt="system",
-        memory_dir=str(tmp_path / "memory"),
-    )
-
-    assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
-    assert len(adapter.kicks) == 1, "exactly one corrective ask, never a loop"
-    kick = adapter.kicks[0]
-    assert "send_message" in kick, "the correction must name the tool"
-    assert "ch_general" in kick, "and the target it should go to"
-    # The delivered reply is retained; the dropped prose never becomes a post.
-    assert [e["role"] for e in agent.log if e["role"] == "assistant"] == ["assistant"]
-
-
-@pytest.mark.asyncio
-async def test_plain_global_output_twice_is_surfaced_not_swallowed(tmp_path, caplog):
-    """If the correction fails too, the give-up is loud and leaves a trace."""
-
-    class StubbornAdapter:
-        def __init__(self):
-            self.retries = 0
-
-        async def run_turn(self, _ctx):
-            return TurnResult(
-                reply="Tokyo.",
-                metadata={"assistant_text_parts": ["Tokyo."]},
-            )
-
-        async def run_retry_turn(self, _kick, _fallback, _ctx):
-            self.retries += 1
-            return TurnResult(
-                reply="Tokyo, again.",
-                metadata={"assistant_text_parts": ["Tokyo, again."]},
-            )
-
-    adapter = StubbornAdapter()
-    agent = PuffoAgent(
-        adapter=adapter,
-        system_prompt="system",
-        memory_dir=str(tmp_path / "memory"),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
-
-    assert adapter.retries == 1, "corrected once, not repeatedly"
-    assert any("plain_output_undelivered" in r.getMessage() for r in caplog.records), (
-        "an answer that could not be routed must never be dropped without a trace"
-    )
-    assert all(e["role"] != "assistant" for e in agent.log)
-
-
-@pytest.mark.asyncio
-async def test_silence_on_the_corrective_ask_is_respected(tmp_path, caplog):
-    """[SILENT] on the second ask is a decision, not a failure."""
-
-    class SilentOnRetryAdapter:
-        async def run_turn(self, _ctx):
-            return TurnResult(
-                reply="thinking out loud",
-                metadata={"assistant_text_parts": ["thinking out loud"]},
-            )
-
-        async def run_retry_turn(self, _kick, _fallback, _ctx):
-            return TurnResult(reply="[SILENT]", metadata={})
-
-    agent = PuffoAgent(
-        adapter=SilentOnRetryAdapter(),
-        system_prompt="system",
-        memory_dir=str(tmp_path / "memory"),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
-
-    assert not any(
-        "plain_output_undelivered" in r.getMessage() for r in caplog.records
-    ), "choosing silence is not an undelivered answer"
-
-
-@pytest.mark.asyncio
-async def test_a_turn_that_calls_send_message_is_never_corrected(tmp_path):
-    """The happy path must not pay for a second turn."""
-
-    class ToolCallingAdapter:
-        def __init__(self):
-            self.retries = 0
-
-        async def run_turn(self, _ctx):
-            return TurnResult(
-                reply="sent",
-                metadata={"send_message_targets": ["ch_general"]},
-            )
-
-        async def run_retry_turn(self, _kick, _fallback, _ctx):
-            self.retries += 1
-            return TurnResult(reply="", metadata={})
-
-    adapter = ToolCallingAdapter()
-    agent = PuffoAgent(
-        adapter=adapter,
-        system_prompt="system",
-        memory_dir=str(tmp_path / "memory"),
-    )
-
-    assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
-    assert adapter.retries == 0
