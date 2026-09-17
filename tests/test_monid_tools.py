@@ -32,6 +32,9 @@ class _FakeHttp:
         # `mint_calls` so the existing spend assertions still see the billing call last.
         self.calls: list[tuple] = []
         self.mint_calls: list[tuple[str, bytes]] = []
+        # Keyless (bridge) mints go through post_unsigned; tracked apart from the
+        # native post_bytes mints so a test can assert which endpoint was used.
+        self.unsigned_mint_calls: list[tuple] = []
         self.keyless = False
         self._response = response if response is not None else {"ok": True}
         self._post_error = post_error
@@ -56,6 +59,14 @@ class _FakeHttp:
     async def post_bytes(self, path, body):
         # The native subkey-signed spend-token mint (POST /v2/agent/spend-token, body b"{}").
         self.mint_calls.append((path, body))
+        if self._mint_error is not None:
+            raise self._mint_error
+        return self._mint
+
+    async def post_unsigned(self, path, body=None):
+        # The keyless spend-token mint (POST /v2/cloud-agents/spend-token, unsigned;
+        # the runtime egress proxy injects x-sandbox-token). Same response shape.
+        self.unsigned_mint_calls.append((path, body))
         if self._mint_error is not None:
             raise self._mint_error
         return self._mint
@@ -816,21 +827,48 @@ async def test_spend_surfaces_input_schema_so_the_model_can_retry():
 
 
 @pytest.mark.asyncio
-async def test_tools_not_registered_for_keyless_agents():
-    # A keyless bridge agent cannot reach the subkey-gated routes, so neither
-    # tool is exposed for it — not registered, no error path.
+async def test_tools_registered_for_keyless_agents():
+    # A keyless bridge agent gets both tools too (when the flag is on): it mints
+    # from the server-attested `/v2/cloud-agents/spend-token` instead of signing.
     http = _FakeHttp()
     http.keyless = True
     mcp = _tools(http)
     tool_names = {t.name for t in await mcp.list_tools()}
-    assert "monid_spend" not in tool_names
-    assert "monid_prepare" not in tool_names
+    assert "monid_spend" in tool_names
+    assert "monid_prepare" in tool_names
 
-    # Native agents DO get both.
+    # Native agents get both as well.
     native = _tools(_FakeHttp())
     native_names = {t.name for t in await native.list_tools()}
     assert "monid_spend" in native_names
     assert "monid_prepare" in native_names
+
+
+@pytest.mark.asyncio
+async def test_keyless_spend_mints_from_the_cloud_agents_endpoint():
+    # A keyless agent's spend must mint via the unsigned server-attested endpoint,
+    # NOT the subkey-signed native one, then spend directly against billing.
+    http = _FakeHttp()
+    http.keyless = True
+    mcp = _tools(http)
+    await _call(
+        mcp,
+        "monid_spend",
+        {
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "input": {"queryParams": {"name": "acme"}},
+            "max_cost_micro": 5000,
+        },
+    )
+    # Minted from the keyless endpoint only — never the signed native path.
+    assert http.unsigned_mint_calls == [("/v2/cloud-agents/spend-token", None)]
+    assert not http.mint_calls
+    # Then the Bearer went directly to billing, token on the Authorization header.
+    spend_call = http.calls[-1]
+    assert spend_call[0] == "POST"
+    assert spend_call[1] == "https://billing.example/v2/monid/spend"
+    assert spend_call[3] == "tok_fake"
 
 
 @pytest.mark.asyncio

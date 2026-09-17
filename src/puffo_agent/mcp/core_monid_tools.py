@@ -14,9 +14,11 @@ the agent mints a short-lived spend token from puffo-server, then calls
 **puffo-billing directly** with it; billing holds the Monid key, checks the
 budget, pays Monid exactly once, and returns the result. One generic tool reaches
 any of Monid's endpoints because the agent reads each capability's own schema
-instead of hardcoding a template per endpoint. Native (key-holding) agents only:
-the mint is subkey-signed, so keyless bridge agents (unsigned) are out of scope
-here.
+instead of hardcoding a template per endpoint. Both native and keyless (bridge)
+agents are supported: a native agent mints from the subkey-signed
+``/v2/agent/spend-token``, a keyless one from the unsigned, server-attested
+``/v2/cloud-agents/spend-token`` (its identity is the ``x-sandbox-token`` the
+server resolves). The minted token is identical either way, so billing is unchanged.
 """
 
 from __future__ import annotations
@@ -85,14 +87,15 @@ def register_monid_tools(mcp: FastMCP, cfg: Any) -> None:
     # it only surfaces the tools; the money gates are server-side (the billing
     # flag + the per-agent budget).
     #
-    # Native-only even when enabled. A keyless (T23 bridge) agent authenticates
-    # via the unsigned `/v2/cloud-agents/*` proxy and holds no subkey, so it
-    # cannot reach the subkey-gated `/v2/monid/*` routes. Rather than expose
-    # tools that would only ever error there (and to avoid opening any second
-    # auth path), they are not registered for keyless agents — the same
-    # conditional-registration pattern `register_core_tools` uses for the bridge
-    # lifecycle tools. Cloud/keyless Monid is out of scope for step one.
-    if not getattr(cfg, "monid_tools_enabled", False) or cfg.keyless:
+    # Registered for both native and keyless (bridge) agents. Each mints from
+    # its own spend-token endpoint (see `_fetch_spend_token`): a native agent
+    # signs `/v2/agent/spend-token`; a keyless one, holding no subkey, uses the
+    # unsigned server-attested `/v2/cloud-agents/spend-token`, where the server
+    # resolves its `x-sandbox-token` to the same slug and mints the identical
+    # token. The identity a keyless agent spends under is thus server-attested,
+    # never self-asserted — the registration opens no new trust, only the token
+    # transport differs.
+    if not getattr(cfg, "monid_tools_enabled", False):
         return
     _register_monid_prepare(mcp, cfg)
     _register_monid_spend(mcp, cfg)
@@ -210,8 +213,8 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
                 "(1_000_000 = $1)"
             )
 
-        # Fresh short-lived spend token first (native mint), before touching idempotency
-        # state; fail closed if it fails — never fall back to any other spend path.
+        # Fresh short-lived spend token first (native or keyless mint), before touching
+        # idempotency state; fail closed if it fails — never fall back to any other path.
         access_token, billing_url = await _fetch_spend_token(cfg.http_client)
 
         normalized_input = input if input is not None else {}
@@ -330,7 +333,7 @@ def _wire_idempotency_key(agent_slug: str, key: str) -> str:
 
 
 def _spend_token_and_url(mint: Any) -> tuple[str, str]:
-    """Validate the `/v2/agent/spend-token` response and build the billing spend URL.
+    """Validate a spend-token response (native or keyless mint) and build the billing URL.
 
     Fail closed: the Bearer only ever goes to the ``billing_base_url`` the *authenticated*
     mint returned, and only over https (the mint itself only ever returns https — anything
@@ -352,10 +355,17 @@ def _spend_token_and_url(mint: Any) -> tuple[str, str]:
 async def _fetch_spend_token(http_client: Any) -> tuple[str, str]:
     """Mint a fresh short-lived spend token; return (access_token, billing_spend_url).
 
-    Fail closed: a mint failure raises so the caller never spends. Body `{}` is signed
-    as-is via ``post_bytes`` (``post(path, {})`` would sign ``b""`` and the mint 401s)."""
+    Fail closed: a mint failure raises so the caller never spends. The endpoint is
+    the caller's own: a keyless (bridge) agent has no subkey, so it mints from the
+    unsigned server-attested ``/v2/cloud-agents/spend-token`` (identity resolved from
+    its ``x-sandbox-token``); a native agent signs ``/v2/agent/spend-token``, whose
+    body `{}` is sent as-is via ``post_bytes`` (``post(path, {})`` would sign ``b""``
+    and the mint 401s). Both return the same token shape, validated below."""
     try:
-        mint = await http_client.post_bytes("/v2/agent/spend-token", b"{}")
+        if http_client.keyless:
+            mint = await http_client.post_unsigned("/v2/cloud-agents/spend-token")
+        else:
+            mint = await http_client.post_bytes("/v2/agent/spend-token", b"{}")
     except HttpError as exc:
         raise RuntimeError(
             "monid spend unavailable: could not obtain a spend token "
