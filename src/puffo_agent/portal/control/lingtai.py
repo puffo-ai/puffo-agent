@@ -44,7 +44,9 @@ def parse_lingtai_launch(raw: object) -> LingtaiLaunch | None:
         path = Path(value)
         if not path.is_absolute():
             raise ValueError(f"LingTai {key} must be an absolute path on this machine")
-        paths[key] = path.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        # Keep the selected executable spelling through provision and ACP.
+        paths[key] = path if key == "executable" else resolved
     if not paths["executable"].is_file() or not os.access(paths["executable"], os.X_OK):
         raise ValueError("LingTai executable must be an executable file")
     if not paths["agent_dir"].is_dir() or not (paths["agent_dir"] / "init.json").is_file():

@@ -33,7 +33,7 @@ async def test_discovery_cli_contract_and_hidden_root(tmp_path, monkeypatch):
     # Run the Python CLI fixture explicitly; Windows does not execute shebangs.
     create_process = discovery.asyncio.create_subprocess_exec
     async def launch_fixture(program, *args, **kwargs):
-        assert Path(program) == Path(sys.executable).resolve()
+        assert program == sys.executable
         return await create_process(program, str(executable), *args, **kwargs)
     monkeypatch.setattr(discovery.asyncio, "create_subprocess_exec", launch_fixture)
     monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
@@ -437,3 +437,44 @@ def test_source_name_matches_server_utf8_byte_limit(tmp_path, name, rejected):
             validate_import_profile(payload, tmp_path)
     else:
         validate_import_profile(payload, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_executable_aliases_keep_selected_launch_path(tmp_path, monkeypatch):
+    """One install must not appear twice or lose its selected symlink at launch."""
+    from puffo_agent.portal.control.lingtai import parse_lingtai_launch
+
+    binary = tmp_path / 'venv' / 'lingtai-agent'
+    binary.parent.mkdir()
+    binary.write_text('#!/bin/sh\nexit 0\n')
+    binary.chmod(0o700)
+    other = tmp_path / 'other' / 'lingtai-agent'
+    other.parent.mkdir()
+    other.write_text('#!/bin/sh\nexit 0\n')
+    other.chmod(0o700)
+    alias = tmp_path / 'lingtai-agent'
+    try:
+        alias.symlink_to(binary)
+    except OSError as exc:
+        if os.name == 'nt' and exc.winerror == 1314:
+            pytest.skip('Windows account lacks symlink creation privilege')
+        raise
+    monkeypatch.setattr(discovery.shutil, 'which', lambda name: str(alias))
+    monkeypatch.setattr(discovery.Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(discovery, '_known_paths', lambda operator: ([binary, other], [], []))
+    # Exclude machine-local installations without mocking identity checks.
+    original_access = os.access
+    monkeypatch.setattr(discovery.os, 'access', lambda path, mode:
+                        Path(path).is_relative_to(tmp_path) and original_access(path, mode))
+    automatic = await discovery.discover_lingtai({}, operator='owner')
+    assert automatic['executables'] == [str(alias), str(other)]
+    explicit = await discovery.discover_lingtai({'executable': str(alias)}, operator='owner')
+    assert explicit['executable'] == str(alias)
+    assert explicit['executables'] == [str(alias), str(other)]
+    folder = await discovery.discover_lingtai({'executable_root': str(tmp_path)}, operator='owner')
+    assert len(folder['executables']) == 2
+    assert {Path(path).resolve() for path in folder['executables']} == {binary, other}
+    (tmp_path / 'init.json').write_text('{}')
+    launch = parse_lingtai_launch({'executable': str(alias), 'agent_dir': str(tmp_path),
+                                  'workspace': str(tmp_path)})
+    assert launch.argv()[0] == str(alias)

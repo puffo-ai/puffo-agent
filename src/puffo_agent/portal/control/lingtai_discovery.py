@@ -22,10 +22,11 @@ _MAX_OUTPUT = 1024 * 1024
 _MAX_ROOTS = 16
 
 
-def _absolute(value: object, field: str) -> Path:
+def _absolute(value: object, field: str, *, resolve: bool = True) -> Path:
     if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
         raise ValueError(f"LingTai {field} must be an absolute path on this machine")
-    return Path(value).resolve(strict=True)
+    resolved = Path(value).resolve(strict=True)
+    return resolved if resolve else Path(value)
 
 
 def _known_paths(operator: str) -> tuple[list[Path], list[Path], list[str]]:
@@ -75,6 +76,21 @@ def _registry_entries() -> dict:
         return {}
 
 
+def _unique_executables(paths: list[str]) -> list[str]:
+    # Resolve only for identity; retain the first launch path, including links.
+    targets: set[Path] = set()
+    result: list[str] = []
+    for path in paths:
+        try:
+            target = Path(path).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if target not in targets:
+            targets.add(target)
+            result.append(path)
+    return result
+
+
 def _executable_paths(known: list[Path]) -> list[str]:
     found = shutil.which("lingtai-agent")
     candidates = ([Path(found)] if found else []) + known + [
@@ -93,7 +109,7 @@ def _executable_paths(known: list[Path]) -> list[str]:
                 result.append(path)
         except OSError:
             continue
-    return result
+    return _unique_executables(result)
 
 
 def _search_executable_folder(value: object) -> dict:
@@ -124,6 +140,7 @@ def _search_executable_folder(value: object) -> dict:
                     elif entry.name in {"lingtai-agent", "lingtai-agent.exe"}:
                         if entry.is_file() and os.access(entry.path, os.X_OK):
                             result["executables"].append(entry.path)
+                            result["executables"] = _unique_executables(result["executables"])
                             if len(result["executables"]) >= 8:
                                 result["warnings"].append("results_truncated")
                                 return _bounded_result(result)
@@ -210,11 +227,11 @@ async def _discover(params: dict, operator: str) -> dict:
     known, default_roots, warnings = await asyncio.to_thread(_known_paths, operator)
     executables = await asyncio.to_thread(_executable_paths, known)
     if params.get("executable"):
-        explicit = _absolute(params["executable"], "executable")
+        explicit = _absolute(params["executable"], "executable", resolve=False)
         if not explicit.is_file() or not os.access(explicit, os.X_OK):
             raise ValueError("LingTai executable must be an executable file")
         executable = str(explicit)
-        executables = list(dict.fromkeys([executable, *executables]))
+        executables = _unique_executables([executable, *executables])
     else:
         executable = executables[0] if executables else None
     roots = default_roots
