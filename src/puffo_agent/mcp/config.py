@@ -431,6 +431,16 @@ def puffo_core_mcp_env(
     local_sandbox_token = _os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
     if local_sandbox_token:
         env["PUFFO_LOCAL_SANDBOX_TOKEN"] = local_sandbox_token
+
+    # The monid paid-data tools are gated on an operator env var that is read
+    # INSIDE the subprocess (``monid_tools_enabled`` → ``build_server``). This
+    # dict is built from scratch, so without forwarding it the gate is always
+    # false on the subprocess MCP path: an operator sets the switch on the
+    # daemon and it never reaches the process that reads it, leaving the tools
+    # unregistered with nothing in any log to say why. Forwarded on presence,
+    # like the token above, so an unset deployment still registers nothing.
+    if _os.environ.get(MONID_TOOLS_ENABLED_ENV) == "true":
+        env[MONID_TOOLS_ENABLED_ENV] = "true"
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,
     # so CODEX_HOME must be pinned explicitly or list_mcp_servers
     # would read the operator's host config instead of the agent's.

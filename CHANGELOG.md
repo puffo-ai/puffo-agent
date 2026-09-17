@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The monid tools gate now reaches the process that reads it.**
+  `PUFFO_MONID_TOOLS_ENABLED` is evaluated inside the puffo-core MCP
+  subprocess, whose environment `puffo_core_mcp_env()` builds from scratch — so
+  the variable was never forwarded and the gate read false there no matter what
+  an operator set. The switch the entry below documents therefore could not work
+  on the subprocess MCP path: the daemon had it, its child did not, the tools
+  stayed unregistered, and nothing in any log said why (observed on a staging
+  cloud agent, 2026-09-17). Forwarded on an exact `"true"`, like the sandbox
+  token beside it, so an unset deployment still registers nothing. (PUF-401)
+
 ### Added
 
 - **Monid paid-data tools, re-introduced behind a default-off flag.**

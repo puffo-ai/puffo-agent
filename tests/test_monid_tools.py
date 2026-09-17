@@ -879,3 +879,63 @@ async def test_tools_not_registered_when_disabled():
     tool_names = {t.name for t in await mcp.list_tools()}
     assert "monid_spend" not in tool_names
     assert "monid_prepare" not in tool_names
+
+
+# ── The gate has to reach the process that reads it ──────────────────────
+# ``monid_tools_enabled()`` runs INSIDE the MCP subprocess, whose environment
+# ``puffo_core_mcp_env`` builds from scratch. Before this forward the operator
+# switch was unreachable on that path: set on the daemon, absent on its child,
+# tools silently unregistered. Observed on a staging cloud agent 2026-09-17.
+
+_MCP_ENV_BASE = dict(
+    slug="bot-0001",
+    device_id="dev_1",
+    server_url="http://localhost:3000",
+    keystore_dir="/tmp/keys",
+    workspace="/workspace",
+)
+
+
+def test_subprocess_env_forwards_the_monid_gate(monkeypatch):
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, "true")
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert env[MONID_TOOLS_ENABLED_ENV] == "true"
+
+
+def test_subprocess_env_omits_the_monid_gate_when_unset(monkeypatch):
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert MONID_TOOLS_ENABLED_ENV not in env
+
+
+@pytest.mark.parametrize("value", ["1", "TRUE", "True", "yes", "false", ""])
+def test_subprocess_env_forwards_nothing_but_an_exact_true(monkeypatch, value):
+    """Fail closed, and identically to the gate itself: ``monid_tools_enabled``
+    accepts only the exact string, so forwarding a near-miss would put a value
+    in the child that reads as off — confusing rather than useful."""
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert MONID_TOOLS_ENABLED_ENV not in env
+
+
+def test_the_forwarded_value_is_what_the_gate_accepts(monkeypatch):
+    """Ties the two halves together: whatever this function forwards must make
+    ``monid_tools_enabled()`` true in a process that sees only that env."""
+    from puffo_agent.mcp.config import (
+        MONID_TOOLS_ENABLED_ENV,
+        monid_tools_enabled,
+        puffo_core_mcp_env,
+    )
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, "true")
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert monid_tools_enabled() is True
