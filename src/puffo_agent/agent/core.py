@@ -1,4 +1,3 @@
-
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
@@ -92,6 +91,10 @@ class PuffoAgent:
 
         self.memory = MemoryManager(memory_dir, workspace_dir=workspace_dir)
         self.memory_dir = memory_dir
+        # Set by the router when a turn answered in prose instead of calling
+        # send_message, so the caller can correct the model once (PUF-400).
+        # Cleared at the start of every route; never read across turns.
+        self._dropped_plain_output: str | None = None
 
         # Conversation log shared across all channels.
         self.log: list[dict] = []
@@ -216,13 +219,107 @@ class PuffoAgent:
             *self.log,
             {"role": "user", "content": planned.provider_input},
         ]
-        return await self._run_turn_and_route(
+        reply = await self._run_turn_and_route(
             channel_name="global inbox",
             sender="multiple" if len(planned.targets) > 1 else "",
             on_progress=on_progress,
             allow_plain_fallback=False,
             messages=messages,
         )
+        dropped = self._dropped_plain_output
+        if dropped:
+            self._dropped_plain_output = None
+            return await self._correct_missing_send_message(
+                planned, dropped, on_progress=on_progress
+            )
+        return reply
+
+    async def _correct_missing_send_message(
+        self,
+        planned,
+        dropped: str,
+        on_progress=None,
+    ) -> str | None:
+        """Ask once more, naming the tool, when a global turn answered in prose.
+
+        The model produced an answer and never called ``send_message``, so the
+        router dropped it (``allow_plain_fallback=False`` — a multi-target
+        inbox notice has no single destination for loose text). Discarding it
+        is indistinguishable, from the channel, from an agent that ignored the
+        room; it is also how PUF-400 hid behind PUF-393 for weeks.
+
+        One corrective turn through the same ``run_retry_turn`` seam the
+        rate-limit retry uses. Deliberately *not* a plain-text fallback post:
+        ``send_message`` carries the target, the thread and the
+        human-visibility flag, and posting raw assistant text once leaked the
+        literal ``send_message(...)`` syntax into chat (2026-07-09). Correct
+        the model, do not work around it.
+        """
+
+        def _fmt(target) -> str:
+            if isinstance(target, (tuple, list)):
+                return "/".join(str(part) for part in target)
+            return str(target)
+
+        targets = (
+            ", ".join(_fmt(t) for t in (getattr(planned, "targets", ()) or ()))
+            or "the channel you were notified about"
+        )
+        kick = (
+            "[puffo-agent system message] Your last reply was plain text, so it "
+            "was NOT delivered — nobody saw it. Outbound chat must go through "
+            f"the send_message tool. Call mcp__puffo__send_message now for: {targets}. "
+            "Send the answer you already wrote. If you meant to stay quiet, "
+            "reply with [SILENT] instead."
+        )
+        ctx = TurnContext(
+            system_prompt=self.system_prompt,
+            messages=list(self.log),
+            workspace_dir=self.workspace_dir,
+            claude_dir=self.claude_dir,
+            memory_dir=self.memory_dir,
+            on_progress=on_progress,
+        )
+        result = await self.adapter.run_retry_turn(kick, planned.provider_input, ctx)
+        if bool(result.metadata.get("send_message_targets")):
+            self.logger.info(
+                "[corrected] [global inbox]: send_message called on the "
+                "second ask; the answer was delivered"
+            )
+            if result.reply:
+                self._append_assistant("global inbox", result.reply)
+            return None
+
+        retry_parts: list[str] = result.metadata.get("assistant_text_parts") or []
+        retry_text = "\n".join(retry_parts) if retry_parts else (result.reply or "")
+        if is_silent(retry_text):
+            self.logger.info(
+                "[corrected] [global inbox]: agent chose silence on the second ask"
+            )
+            return None
+
+        # Gave up. Never drop a produced answer without a trace: this is the
+        # only signal anyone gets that the agent answered and could not route it.
+        from ..portal.control.reporter import get_reporter
+
+        self.logger.warning(
+            "[undelivered] [global inbox]: agent produced an answer twice "
+            "without calling send_message; nothing was posted "
+            "(error_category=plain_output_undelivered, chars=%d)",
+            len(dropped),
+        )
+        spawn(
+            get_reporter().emit(
+                self.agent_id,
+                "tool_use",
+                {
+                    "tool": "undelivered",
+                    "content": dropped[:STATUS_PREVIEW_CHARS],
+                },
+            ),
+            name="reporter.emit:undelivered",
+        )
+        return None
 
     async def handle_global_inbox_retry(
         self,
@@ -455,6 +552,7 @@ class PuffoAgent:
         """Apply the shared MCP/silent/error/plain-text reply policy."""
         from ..portal.control.reporter import get_reporter
 
+        self._dropped_plain_output = None
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
         if send_message_called:
@@ -490,6 +588,13 @@ class PuffoAgent:
             return None
 
         if not allow_plain_fallback:
+            # The model answered in prose instead of invoking send_message.
+            # Record it so the caller can correct the model once rather than
+            # silently binning work the human is waiting for (PUF-400): a
+            # channel message reaches the agent through the global-inbox
+            # notice, which sets allow_plain_fallback=False because a
+            # multi-target notice has no single place to post loose text.
+            self._dropped_plain_output = joined
             self.logger.info(
                 f"[no-send] [{channel_name}] @{sender}: ignoring plain "
                 "assistant output; outbound chat requires send_message"
