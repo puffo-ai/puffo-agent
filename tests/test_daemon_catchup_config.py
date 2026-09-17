@@ -242,3 +242,40 @@ def test_reconcile_replaces_post_start_fatal_worker(
     asyncio.run(
         _assert_reconcile_replaces_post_start_fatal_worker(tmp_path, monkeypatch)
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_resume_replaces_failed_worker_with_same_identity(tmp_path, monkeypatch):
+    """A completed failed worker stays held until Resume, then reconciles without import."""
+    from puffo_agent.portal.control.client import execute_command
+    from puffo_agent.portal.state import restart_flag_path
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(profile_sync, "sync_full_profile", AsyncMock())
+    config = _configured_agent("retry-agent")
+    _save_ws_local_identity(config)
+    config.save()
+    daemon = Daemon(DaemonConfig())
+    try:
+        await daemon._reconcile_once()
+        failed = daemon.workers[config.id]
+        failed._task.cancel()
+        await asyncio.gather(failed._task, return_exceptions=True)
+        failed.runtime.status = "error"
+        failed.runtime.error = "Connection closed"
+        failed.runtime.save(config.id)
+        await daemon._reconcile_once()
+        assert daemon.workers[config.id] is failed
+
+        assert (await execute_command("resume", config.id, {}))["ok"]
+        await daemon._reconcile_once()
+
+        replacement = daemon.workers[config.id]
+        assert replacement is not failed
+        assert replacement.runtime.status == "running"
+        assert replacement.agent_cfg.puffo_core == config.puffo_core
+        assert replacement.agent_cfg.workspace_dir == config.workspace_dir
+        assert not restart_flag_path(config.id).exists()
+        assert failed._client is None
+    finally:
+        await daemon._stop_all_workers()

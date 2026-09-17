@@ -346,6 +346,9 @@ async def execute_command(
         cfg.save()
         return {"ok": True, "state": "paused"}
     if op == "resume":
+        from ..state import request_failed_agent_restart
+
+        request_failed_agent_restart(agent_slug)
         cfg = AgentConfig.load(agent_slug)
         cfg.state = "running"
         cfg.save()

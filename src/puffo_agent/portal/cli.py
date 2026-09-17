@@ -52,6 +52,7 @@ from .state import (
     refresh_model_flag_path,
     refresh_runtime_flag_path,
     refresh_session_flag_path,
+    request_failed_agent_restart,
     shared_fs_dir,
     stop_requested_for,
     write_refresh_token_request,
@@ -765,6 +766,11 @@ def _set_agent_state(agent_id: str, new_state: str) -> int:
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     cfg = AgentConfig.load(agent_id)
+    if new_state == "running" and request_failed_agent_restart(agent_id):
+        cfg.state = new_state
+        cfg.save()
+        print(f"agent {agent_id!r} retry requested; daemon will restart the failed runtime")
+        return 0
     if cfg.state == new_state:
         print(f"agent {agent_id!r} already {new_state}")
         return 0

@@ -226,6 +226,17 @@ def restart_flag_path(agent_id: str) -> Path:
     return agent_dir(agent_id) / ".puffo-agent" / "restart.flag"
 
 
+def request_failed_agent_restart(agent_id: str) -> bool:
+    """Turn explicit Resume of a failed runtime into a daemon-owned restart."""
+    runtime = RuntimeState.load(agent_id)
+    if runtime is None or runtime.status != "error":
+        return False
+    flag = restart_flag_path(agent_id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    return True
+
+
 def delete_flag_path(agent_id: str) -> Path:
     """Sentinel for operator-initiated Delete (destructive — no
     archived/ copy retained). Distinct from archive.flag."""

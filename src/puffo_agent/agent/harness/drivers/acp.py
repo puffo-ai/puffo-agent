@@ -73,6 +73,7 @@ from ..driver_authority_server import (
     DRIVER_AUTHORITY_FD_ENV,
     DriverAuthorityServer,
 )
+from ..support.redaction import safe_provider_message
 from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
@@ -284,17 +285,7 @@ class AcpDriver(Driver):
             self._proc.stdout,
             observers=[self._observe_stream],
         )
-        initialized = await self._conn.initialize(
-            protocol_version=PROTOCOL_VERSION,
-            client_capabilities=ClientCapabilities(
-                fs=FileSystemCapabilities(
-                    read_text_file=False,
-                    write_text_file=False,
-                ),
-                terminal=False,
-            ),
-            client_info=Implementation(name="puffo-agent", version="2"),
-        )
+        initialized = await self._initialize()
         if initialized.protocol_version != PROTOCOL_VERSION:
             raise RuntimeError(
                 "ACP agent negotiated unsupported protocol version "
@@ -356,6 +347,38 @@ class AcpDriver(Driver):
                 warnings=self._spawn_warnings,
             ),
         )
+
+    async def _initialize(self):
+        try:
+            return await self._conn.initialize(
+                protocol_version=PROTOCOL_VERSION,
+                client_capabilities=ClientCapabilities(
+                    fs=FileSystemCapabilities(
+                        read_text_file=False,
+                        write_text_file=False,
+                    ),
+                    terminal=False,
+                ),
+                client_info=Implementation(name="puffo-agent", version="2"),
+            )
+        except Exception as exc:
+            # stdout can close just before stderr reaches EOF. Bound this wait:
+            # a broken child or descendant may keep the diagnostic pipe open.
+            tail = b""
+            if self._stderr_reader is not None:
+                try:
+                    tail = await asyncio.wait_for(
+                        asyncio.shield(self._stderr_reader), timeout=0.5
+                    )
+                except (TimeoutError, OSError):
+                    pass
+            if not tail.strip():
+                raise
+            detail = safe_provider_message(tail.decode("utf-8", errors="replace"))
+            hint = ""
+            if "another lingtai agent is already running" in detail.lower():
+                hint = " Close the active LingTai TUI for this source, then resume this Agent."
+            raise RuntimeError(f"ACP initialization failed: {detail}.{hint}") from exc
 
     def _validate_launch_plan(self, spec: RuntimeSpec) -> ValidatedLaunchPlan:
         """Assemble, seal, and optionally validate every launch input."""

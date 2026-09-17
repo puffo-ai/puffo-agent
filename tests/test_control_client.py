@@ -1297,3 +1297,24 @@ async def test_manual_usage_discards_rotation_even_after_loop_clears_event(monke
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["control", "cli"])
+@pytest.mark.parametrize("status", ["error", "running", "starting"])
+async def test_resume_retries_failed_identity_only(home, monkeypatch, entry, status):
+    """Resume must retry a failed worker without re-importing or restarting healthy work."""
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.state import agent_yml_path, restart_flag_path
+
+    write_test_agent(home, "scout")
+    AgentConfig.load("scout").save()
+    before = agent_yml_path("scout").read_bytes()
+    RuntimeState(status=status, error="startup failed" if status == "error" else "").save("scout")
+    if entry == "control":
+        assert (await execute_command("resume", "scout", {}))["ok"]
+    else:
+        monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+        assert cli.cmd_agent_resume(types.SimpleNamespace(id="scout")) == 0
+    assert restart_flag_path("scout").exists() is (status == "error")
+    assert agent_yml_path("scout").read_bytes() == before

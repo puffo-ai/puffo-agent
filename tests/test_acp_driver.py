@@ -964,3 +964,53 @@ def test_both_runtimes_agree_on_which_permission_modes_exist():
         "local_runtime and docker_runtime disagree about permission modes; "
         "they hold separate copies of the same allow-list."
     )
+
+
+@pytest.mark.asyncio
+async def test_initialize_exit_preserves_safe_stderr(tmp_path):
+    """An ACP child refusing an occupied source must not become 'Connection closed'."""
+    script = tmp_path / "refuse.py"
+    script.write_text(
+        "import sys\n"
+        "print('error: another lingtai agent is already running in /workspace; '"
+        "'api_key=private-test-value', file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    driver = AcpDriver()
+    try:
+        with pytest.raises(Exception) as caught:
+            await driver.open(RuntimeSpec(
+                str(tmp_path), executable=sys.executable, launch_args=(str(script),),
+            ))
+        message = str(caught.value)
+        assert "another lingtai agent is already running" in message
+        assert "private-test-value" not in message
+        assert "[REDACTED]" in message
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_does_not_wait_for_stderr_eof():
+    """A child keeping stderr open cannot hang failure reporting or cancel its drainer."""
+    harness = _Harness()
+    harness.proc.stderr = asyncio.StreamReader()
+    original_factory = harness.connection_factory
+
+    async def refuse(**_kwargs):
+        raise ConnectionError("closed before initialize")
+
+    def connection_factory(*args, **kwargs):
+        conn = original_factory(*args, **kwargs)
+        conn.initialize = refuse
+        return conn
+
+    driver = AcpDriver(harness.process_factory, connection_factory=connection_factory)
+    try:
+        async with asyncio.timeout(2):
+            with pytest.raises(ConnectionError, match="closed before initialize"):
+                await driver.open(RuntimeSpec("/workspace", executable="agent"))
+        assert not driver._stderr_reader.done()
+    finally:
+        harness.proc.stderr.feed_eof()
+        await driver.close()
