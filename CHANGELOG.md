@@ -8,6 +8,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A keyless cloud agent can now buy paid data at all.** `monid_prepare` used
+  the *signed* POST, which a bridge-transport agent cannot make — its keystore
+  is a deliberate dead-end that raises `agent holds no local keys`. Because the
+  tool contract is prepare-before-spend, every paid-data request failed at the
+  first step, with the tools registered, the wallet funded and the spend route
+  live. `monid_spend` had been made keyless-aware; `prepare` had not. It now
+  takes the same shape: mint a short-lived token, then go direct to billing with
+  the Bearer — same host and same auth as spend, which is what the module has
+  documented all along. A regression test covers the class, asserting that
+  neither monid tool reaches a signing method when the client is keyless.
+  (PUF-406)
+
+### Fixed
+
 - **The monid tools gate now reaches the process that reads it.**
   `PUFFO_MONID_TOOLS_ENABLED` is evaluated inside the puffo-core MCP
   subprocess, whose environment `puffo_core_mcp_env()` builds from scratch — so

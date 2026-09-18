@@ -131,9 +131,18 @@ def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
         if not 1 <= limit <= 25:
             raise RuntimeError("limit must be between 1 and 25")
 
+        # Same shape as ``monid_spend``: mint a short-lived token and go direct to
+        # billing with the Bearer. Emphatically NOT ``http_client.post`` — that
+        # signs with the local keystore, which a keyless (bridge) cloud agent does
+        # not have, so every prepare failed with "agent holds no local keys" and,
+        # because the contract is prepare-before-spend, no cloud agent could buy
+        # anything at all (PUF-406).
+        access_token, billing_url = await _fetch_spend_token(
+            cfg.http_client, "/v2/monid/prepare"
+        )
         try:
-            data = await cfg.http_client.post(
-                "/v2/monid/prepare", {"query": query, "limit": limit}
+            data = await cfg.http_client.post_bearer(
+                billing_url, access_token, {"query": query, "limit": limit}
             )
         except HttpError as exc:
             # A prepare failure (no capability matched, or a transient upstream
@@ -326,7 +335,7 @@ def _wire_idempotency_key(agent_slug: str, key: str) -> str:
     return f"{agent_slug}:{key}"
 
 
-def _spend_token_and_url(mint: Any) -> tuple[str, str]:
+def _spend_token_and_url(mint: Any, path: str) -> tuple[str, str]:
     """Validate a spend-token response (native or keyless mint) and build the billing URL.
 
     Fail closed: the Bearer only ever goes to the ``billing_base_url`` the *authenticated*
@@ -343,11 +352,18 @@ def _spend_token_and_url(mint: Any) -> tuple[str, str]:
         raise RuntimeError(
             "spend-token response missing a valid https billing_base_url"
         )
-    return token, f"{base.rstrip('/')}/v2/monid/spend"
+    return token, f"{base.rstrip('/')}{path}"
 
 
-async def _fetch_spend_token(http_client: Any) -> tuple[str, str]:
-    """Mint a fresh short-lived spend token; return (access_token, billing_spend_url).
+async def _fetch_spend_token(
+    http_client: Any, path: str = "/v2/monid/spend"
+) -> tuple[str, str]:
+    """Mint a fresh short-lived spend token; return (access_token, billing_url).
+
+    ``path`` is the billing route the Bearer is for — the paid ``/v2/monid/spend``
+    or the free ``/v2/monid/prepare``. Both are billing routes behind the same
+    agent-spend principal, and BOTH must go this way: the signed client cannot be
+    used by a keyless (bridge) agent, which holds no keystore at all.
 
     Fail closed: a mint failure raises so the caller never spends. Keyless agents mint
     from the unsigned ``/v2/cloud-agents/spend-token``; native agents sign
@@ -363,7 +379,7 @@ async def _fetch_spend_token(http_client: Any) -> tuple[str, str]:
             "monid spend unavailable: could not obtain a spend token "
             f"({_monid_error_message(exc)}).\n{_LABEL_NON_MONID}"
         ) from exc
-    return _spend_token_and_url(mint)
+    return _spend_token_and_url(mint, path)
 
 
 def _spend_retry_guidance(wire_key: str) -> str:

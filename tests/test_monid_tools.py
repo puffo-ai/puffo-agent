@@ -125,7 +125,10 @@ async def test_prepare_forwards_query_and_returns_descriptor():
     # The whole descriptor is handed back as JSON so the model can build input.
     assert '"queryParams"' in text
     assert '"/get_company_profile"' in text
-    assert http.calls[-1][1] == "/v2/monid/prepare"
+    # Prepare goes direct to billing with a Bearer, exactly like spend (PUF-406):
+    # the absolute billing URL, and the token on the call rather than a signature.
+    assert http.calls[-1][1] == "https://billing.example/v2/monid/prepare"
+    assert http.calls[-1][3] == "tok_fake"
     body = http.calls[-1][2]
     assert body["query"] == "company profile"
     assert body["limit"] == 3
@@ -968,3 +971,62 @@ def test_the_forwarded_value_drives_the_child_gate(monkeypatch, value, expected)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert monid_tools_enabled() is expected
+
+
+# ── A keyless cloud agent must be able to prepare (PUF-406) ──────────────
+# `monid_prepare` used the SIGNED post, which a bridge agent cannot make: its
+# keystore is a deliberate dead-end that raises "agent holds no local keys".
+# Since the contract is prepare-before-spend, that left a keyless agent unable
+# to buy anything at all, with the tools registered and the wallet funded.
+# Reproduced on staging 2026-09-17 (mercer-7622-c03a4cb7).
+
+
+@pytest.mark.asyncio
+async def test_keyless_agent_can_prepare_without_signing():
+    http = _FakeHttp()
+    http.keyless = True
+    mcp = _tools(http)
+    await _call(mcp, "monid_prepare", {"query": "trash bags", "limit": 2})
+
+    # minted over the unsigned keyless route, never the signed one
+    assert [c[0] for c in http.unsigned_mint_calls] == ["/v2/cloud-agents/spend-token"]
+    assert http.mint_calls == []
+    # and delivered to billing with the Bearer
+    method, url, body, token = http.calls[-1]
+    assert (method, url, token) == ("POST", "https://billing.example/v2/monid/prepare", "tok_fake")
+    assert body == {"query": "trash bags", "limit": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_native_agent_still_mints_the_signed_way_for_prepare():
+    http = _FakeHttp()  # keyless False
+    mcp = _tools(http)
+    await _call(mcp, "monid_prepare", {"query": "trash bags", "limit": 2})
+    assert [c[0] for c in http.mint_calls] == ["/v2/agent/spend-token"]
+    assert http.unsigned_mint_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,args", [
+    ("monid_prepare", {"query": "q", "limit": 1}),
+    ("monid_spend", {
+        "provider": "p", "endpoint": "/e", "input": {}, "max_cost_micro": 1,
+        "idempotency_key": "k",
+    }),
+])
+async def test_no_monid_tool_ever_signs_when_the_client_is_keyless(tool, args):
+    """The class of bug, not just the instance: a keyless agent holds no keys at
+    all, so any signed call on these paths is dead on arrival. `post` is the
+    signed method — neither tool may reach it."""
+    http = _FakeHttp()
+    http.keyless = True
+    signed: list = []
+
+    async def _forbidden(path, body=None):
+        signed.append(path)
+        raise AssertionError(f"signed post on the keyless path: {path}")
+
+    http.post = _forbidden
+    mcp = _tools(http)
+    await _call(mcp, tool, args)
+    assert signed == []
