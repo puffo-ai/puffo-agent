@@ -1373,6 +1373,9 @@ class GlobalInboxRuntime(
             error_category="provider_error",
             error_type=type(exc).__name__,
             error_code=getattr(exc, "error_code", None),
+            # Bounded provider-raw tail; without it the provider-side
+            # cause of a failed turn is unrecoverable post-mortem.
+            error_detail=getattr(exc, "detail", ""),
             outcome="requeued" if terminal else "degraded",
         )
         return terminal, process_outcome, terminal_error

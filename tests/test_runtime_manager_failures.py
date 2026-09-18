@@ -461,6 +461,36 @@ async def test_runtime_exit_preserves_provider_failure_and_allows_next_turn(
 
 
 @pytest.mark.asyncio
+async def test_provider_raw_error_survives_into_the_raised_failure():
+    """2026-09-18 incident: a 3.4s ProviderFailureError left no trace of
+    the provider's actual error and the first cause became unrecoverable
+    post-mortem. The terminal payload's raw provider words must reach the
+    raised failure (bounded) so turn.failed can log them."""
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver, RuntimeSpec("/tmp", task_timeout_seconds=1), driver_name="codex",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    first = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="runtime.exited",
+        driver="codex",
+        session_ref=SessionRef("native-session-1"),
+        data={
+            "error_code": "quota_exhausted",
+            "message": "Internal server error 500: " + "x" * 600,
+        },
+    ))
+    with pytest.raises(ProviderFailureError) as excinfo:
+        await asyncio.wait_for(first, timeout=1)
+    assert "Internal server error 500" in excinfo.value.detail
+    assert "quota_exhausted" not in excinfo.value.detail  # bookkeeping excluded
+    assert len(excinfo.value.detail) <= 500  # bounded: no log bloat
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
 async def test_first_turn_failure_after_resume_forces_a_fresh_session():
     driver = _ControllableDriver()
     durable_session_ids: list[str] = []
