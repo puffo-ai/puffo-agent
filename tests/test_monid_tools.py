@@ -873,19 +873,47 @@ async def test_keyless_spend_mints_from_the_cloud_agents_endpoint():
 
 @pytest.mark.asyncio
 async def test_tools_not_registered_when_disabled():
-    # Default-off gate: a native agent without the feature flag advertises neither
-    # tool, so a stock agent exposes no spend tool until an operator opts in.
+    # Opt-out: a native agent whose gate is off (operator set the flag to "false") advertises
+    # neither tool. The gate now defaults ON, so this is the explicit opt-out, not the default.
     mcp = _tools(_FakeHttp(), monid_tools_enabled=False)
     tool_names = {t.name for t in await mcp.list_tools()}
     assert "monid_spend" not in tool_names
     assert "monid_prepare" not in tool_names
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("false", False),
+        ("False", False),
+        (" FALSE ", False),
+        ("true", True),
+        ("", True),
+        ("1", True),
+        ("yes", True),
+    ],
+)
+def test_monid_tools_enabled_defaults_on_and_opts_out_only_on_false(
+    monkeypatch, value, expected
+):
+    # Default ON: unset → registered. The single opt-out is the exact value "false"
+    # (case-insensitive, trimmed); every other value, including unset, is on.
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, monid_tools_enabled
+
+    if value is None:
+        monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
+    assert monid_tools_enabled() is expected
+
+
 # ── The gate has to reach the process that reads it ──────────────────────
 # ``monid_tools_enabled()`` runs INSIDE the MCP subprocess, whose environment
-# ``puffo_core_mcp_env`` builds from scratch. Before this forward the operator
-# switch was unreachable on that path: set on the daemon, absent on its child,
-# tools silently unregistered. Observed on a staging cloud agent 2026-09-17.
+# ``puffo_core_mcp_env`` builds from scratch, so the daemon's value must be forwarded or the child
+# cannot see it. The gate defaults ON, so the value is forwarded WHENEVER it is set — an explicit
+# opt-out ("false") has to reach the child or the tools stay on there despite the operator
+# disabling them. Unset → not forwarded → the child applies the same default-on.
 
 _MCP_ENV_BASE = dict(
     slug="bot-0001",
@@ -912,30 +940,31 @@ def test_subprocess_env_omits_the_monid_gate_when_unset(monkeypatch):
     assert MONID_TOOLS_ENABLED_ENV not in env
 
 
-@pytest.mark.parametrize("value", ["1", "TRUE", "True", "yes", "false", ""])
-def test_subprocess_env_forwards_nothing_but_an_exact_true(monkeypatch, value):
-    """Fail closed, and identically to the gate itself: ``monid_tools_enabled``
-    accepts only the exact string, so forwarding a near-miss would put a value
-    in the child that reads as off — confusing rather than useful."""
+@pytest.mark.parametrize("value", ["true", "false", "1", "TRUE", "yes", ""])
+def test_subprocess_env_forwards_a_set_value_verbatim(monkeypatch, value):
+    """A value set on the daemon is forwarded verbatim so the child sees the operator's intent —
+    crucially ``false``, the opt-out, which must reach the default-on child to disable it there."""
     from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
 
     monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
     env = puffo_core_mcp_env(**_MCP_ENV_BASE)
-    assert MONID_TOOLS_ENABLED_ENV not in env
+    assert env[MONID_TOOLS_ENABLED_ENV] == value
 
 
-def test_the_forwarded_value_is_what_the_gate_accepts(monkeypatch):
-    """Ties the two halves together: whatever this function forwards must make
-    ``monid_tools_enabled()`` true in a process that sees only that env."""
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_the_forwarded_value_drives_the_child_gate(monkeypatch, value, expected):
+    """Ties the two halves together: the value this function forwards makes ``monid_tools_enabled()``
+    read the operator's intent in a process that sees only that env — on for "true", off for the
+    "false" opt-out."""
     from puffo_agent.mcp.config import (
         MONID_TOOLS_ENABLED_ENV,
         monid_tools_enabled,
         puffo_core_mcp_env,
     )
 
-    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, "true")
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
     env = puffo_core_mcp_env(**_MCP_ENV_BASE)
     monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    assert monid_tools_enabled() is True
+    assert monid_tools_enabled() is expected

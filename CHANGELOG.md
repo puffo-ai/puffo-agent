@@ -15,18 +15,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   an operator set. The switch the entry below documents therefore could not work
   on the subprocess MCP path: the daemon had it, its child did not, the tools
   stayed unregistered, and nothing in any log said why (observed on a staging
-  cloud agent, 2026-09-17). Forwarded on an exact `"true"`, like the sandbox
-  token beside it, so an unset deployment still registers nothing. (PUF-401)
+  cloud agent, 2026-09-17). The daemon's value is forwarded whenever it is set,
+  so an operator's opt-out reaches the child (see the default-on change below).
+  (PUF-401)
+
+### Changed
+
+- **Monid paid-data tools now default ON for native agents.**
+  `PUFFO_MONID_TOOLS_ENABLED` is opt-*out*: unset registers the tools, and an
+  operator disables them for an agent with the exact value `false`. Both launch
+  paths — in-process ws-local and the MCP subprocess — apply the same default,
+  and the daemon→subprocess forward carries any set value so a `false` opt-out
+  reaches the child. Keyless (bridge) agents still never register these tools.
+  This is a fleet-wide default: every native agent may now reach paid monid data
+  on its wallet, bounded server-side by the wallet balance and the per-call
+  ceiling — so the per-agent allowlist that previously enabled cloud agents one
+  at a time is no longer the gate. (PUF-401)
 
 ### Added
 
-- **Monid paid-data tools, re-introduced behind a default-off flag.**
+- **Monid paid-data tools, re-introduced behind a gate.**
   `monid_prepare` (free capability lookup) and `monid_spend` (paid, read-only
   data fetch) let a native agent reach paid external data through the server's
-  monid spend gateway, which holds the key, checks the per-agent budget, pays,
-  and returns the result. Registered only when `PUFFO_MONID_TOOLS_ENABLED=true`;
-  a stock agent advertises neither. Restores the tools reverted by #322, with
-  the new opt-in gate. (#308)
+  monid spend gateway, which holds the key, pays, and returns the result. Gated
+  by `PUFFO_MONID_TOOLS_ENABLED` (see Changed — now default-on). Restores the
+  tools reverted by #322. (#308)
 
 ## [2.0.5a1] - 2026-09-12
 

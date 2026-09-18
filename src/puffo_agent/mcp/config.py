@@ -35,14 +35,26 @@ REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 # Pi --thinking values.
 PI_INFERENCE_LEVELS = (
-    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
 )
 
 # OpenCode ``run --variant`` values that map to Puffo's shared reasoning
 # vocabulary. Individual models publish only the subset advertised by
 # ``opencode models --verbose``.
 OPENCODE_INFERENCE_LEVELS = (
-    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
 )
 
 
@@ -58,18 +70,24 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
         return OPENCODE_INFERENCE_LEVELS
     return ()
 
+
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
-#: Opt-in gate for the monid paid-data tools. Default off, fail closed (exact
-#: "true"): a stock agent registers no spend tool; an operator enables it per
-#: deployment. The money gates (server billing flag + per-agent budget) apply
-#: regardless — this only controls whether the tools are advertised at all.
+#: Gate for the monid paid-data tools. Default ON: a native agent registers the tools unless an
+#: operator opts out with the exact value "false". Every agent may spend its wallet; the money
+#: gates stay server-side (billing's wallet-balance check + the per-call ceiling) and apply
+#: regardless — this only controls whether the tools are advertised. Keyless (bridge) agents never
+#: register these tools, independent of this switch (see ``core_monid_tools.register_monid_tools``).
 MONID_TOOLS_ENABLED_ENV = "PUFFO_MONID_TOOLS_ENABLED"
 
 
 def monid_tools_enabled() -> bool:
-    """Whether the monid paid-data MCP tools should be registered (see the env above)."""
-    return os.environ.get(MONID_TOOLS_ENABLED_ENV, "") == "true"
+    """Whether the monid paid-data MCP tools should be registered (see the env above).
+
+    Default ON; disabled only by the exact opt-out value ``false`` (case-insensitive), so an unset
+    deployment registers the tools.
+    """
+    return os.environ.get(MONID_TOOLS_ENABLED_ENV, "true").strip().lower() != "false"
 
 
 PUFFO_CORE_TOOL_NAMES = (
@@ -201,7 +219,8 @@ def write_codex_mcp_config(
             logger.warning(
                 "dropping inference_level %r for codex (no matching "
                 "model_reasoning_effort; expected one of %s)",
-                inference_level, ", ".join(REASONING_EFFORTS),
+                inference_level,
+                ", ".join(REASONING_EFFORTS),
             )
     # LiteLLM (or any OpenAI-compatible gateway) custom provider. When present,
     # codex talks to ``base_url`` via the Responses API using the bearer key in
@@ -223,7 +242,9 @@ def write_codex_mcp_config(
         lines.append(
             f'env_key = "{_toml_escape(provider.get("env_key") or "OPENAI_API_KEY")}"'
         )
-        lines.append(f'wire_api = "{_toml_escape(provider.get("wire_api") or "responses")}"')
+        lines.append(
+            f'wire_api = "{_toml_escape(provider.get("wire_api") or "responses")}"'
+        )
     # Host extras first so the puffo entry below shadows any duplicate.
     for name, spec in sorted((extra_servers or {}).items()):
         if name == MCP_SERVER_NAME:
@@ -257,15 +278,13 @@ def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
                 f'"{_toml_escape(str(k))}" = "{_toml_escape(str(v))}"'
                 for k, v in sorted(headers.items())
             )
-            out.append(f'http_headers = {{ {inline} }}')
+            out.append(f"http_headers = {{ {inline} }}")
     else:
         cmd = str(spec.get("command", ""))
         out.append(f'command = "{_toml_escape(cmd)}"')
         args = spec.get("args") or []
         out.append(
-            "args = ["
-            + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
-            + "]"
+            "args = [" + ", ".join(f'"{_toml_escape(str(a))}"' for a in args) + "]"
         )
     env = spec.get("env") or {}
     if env:
@@ -428,23 +447,25 @@ def puffo_core_mcp_env(
     # daemon environment — production leaves it unset, so nothing is
     # written to any config file.
     import os as _os
+
     local_sandbox_token = _os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
     if local_sandbox_token:
         env["PUFFO_LOCAL_SANDBOX_TOKEN"] = local_sandbox_token
 
-    # The monid paid-data tools are gated on an operator env var that is read
-    # INSIDE the subprocess (``monid_tools_enabled`` → ``build_server``). This
-    # dict is built from scratch, so without forwarding it the gate is always
-    # false on the subprocess MCP path: an operator sets the switch on the
-    # daemon and it never reaches the process that reads it, leaving the tools
-    # unregistered with nothing in any log to say why. Forwarded on presence,
-    # like the token above, so an unset deployment still registers nothing.
-    if _os.environ.get(MONID_TOOLS_ENABLED_ENV) == "true":
-        env[MONID_TOOLS_ENABLED_ENV] = "true"
+    # The monid paid-data tools are gated on an env var read INSIDE the subprocess
+    # (``monid_tools_enabled`` → ``build_server``). This dict is built from scratch, so the daemon's
+    # value must be forwarded or the child cannot see it. The gate now defaults ON, so forward the
+    # value WHENEVER it is set — an explicit opt-out (``false``) has to reach the child, or the
+    # tools would stay registered there despite the operator disabling them. Unset → not forwarded
+    # → the child applies the same default-on.
+    monid_switch = _os.environ.get(MONID_TOOLS_ENABLED_ENV)
+    if monid_switch is not None:
+        env[MONID_TOOLS_ENABLED_ENV] = monid_switch
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,
     # so CODEX_HOME must be pinned explicitly or list_mcp_servers
     # would read the operator's host config instead of the agent's.
     if harness == "codex" and workspace:
         from pathlib import Path as _Path
+
         env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")
     return env

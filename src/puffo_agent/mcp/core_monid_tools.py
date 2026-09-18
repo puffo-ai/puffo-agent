@@ -80,10 +80,10 @@ def _monid_error_message(exc: HttpError) -> str:
 
 
 def register_monid_tools(mcp: FastMCP, cfg: Any) -> None:
-    # Default-off: unregistered unless PUFFO_MONID_TOOLS_ENABLED is set (cfg.
-    # monid_tools_enabled), so a stock agent advertises no spend tool. Enabling
-    # it only surfaces the tools; the money gates are server-side (the billing
-    # flag + the per-agent budget).
+    # Default-on: registered unless an operator opts out with PUFFO_MONID_TOOLS_ENABLED=false (cfg.
+    # monid_tools_enabled), so a stock native agent advertises the spend tools. This only surfaces
+    # the tools; the money gates are server-side (billing's wallet-balance check + the per-call
+    # ceiling).
     #
     # Registered for native and keyless agents alike; each mints from its own
     # endpoint (see `_fetch_spend_token`). A keyless agent's identity is still
