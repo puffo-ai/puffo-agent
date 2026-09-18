@@ -21,14 +21,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Monid paid-data tools now default ON for native agents.**
+- **Monid paid-data tools now default ON.**
   `PUFFO_MONID_TOOLS_ENABLED` is opt-*out*: unset registers the tools, and an
   operator disables them for an agent with the exact value `false`. Both launch
   paths — in-process ws-local and the MCP subprocess — apply the same default,
   and the daemon→subprocess forward carries any set value so a `false` opt-out
-  reaches the child. Keyless (bridge) agents still never register these tools.
-  This is a fleet-wide default: every native agent may now reach paid monid data
-  on its wallet, bounded server-side by the wallet balance and the per-call
+  reaches the child. This registers the tools for native AND keyless (bridge)
+  agents alike (a keyless agent's identity is still server-attested, so it adds
+  no trust). This is a fleet-wide default: every agent may now reach paid monid
+  data on its wallet, bounded server-side by the wallet balance and the per-call
   ceiling — so the per-agent allowlist that previously enabled cloud agents one
   at a time is no longer the gate. (PUF-401)
 

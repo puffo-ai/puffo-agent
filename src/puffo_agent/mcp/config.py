@@ -73,11 +73,12 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
-#: Gate for the monid paid-data tools. Default ON: a native agent registers the tools unless an
-#: operator opts out with the exact value "false". Every agent may spend its wallet; the money
+#: Gate for the monid paid-data tools. Default ON: an agent registers the tools unless an operator
+#: opts out with the exact value "false". Native AND keyless (bridge) agents alike register them —
+#: a keyless agent's identity is still server-attested, so opening registration to it adds no trust
+#: (see ``core_monid_tools.register_monid_tools``). Every agent may spend its wallet; the money
 #: gates stay server-side (billing's wallet-balance check + the per-call ceiling) and apply
-#: regardless — this only controls whether the tools are advertised. Keyless (bridge) agents never
-#: register these tools, independent of this switch (see ``core_monid_tools.register_monid_tools``).
+#: regardless — this only controls whether the tools are advertised.
 MONID_TOOLS_ENABLED_ENV = "PUFFO_MONID_TOOLS_ENABLED"
 
 
