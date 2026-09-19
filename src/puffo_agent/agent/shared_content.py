@@ -1464,6 +1464,19 @@ def write_agents_md(codex_dir: Path, content: str) -> Path:
     return path
 
 
+# Codex-only: its condensed tool surface can hide the (still-callable) monid
+# tools, so codex agents need the nudge; Claude already surfaces them.
+_CODEX_MONID_GUIDANCE = """\
+## Paid data (monid)
+
+When a task needs paid or external data, use the monid tools rather than \
+guessing or giving up: call `monid_prepare` to price the request, and once it \
+is within budget call `monid_spend` to execute, honoring the returned price \
+ceiling. These tools remain available even if a condensed tool list does not \
+surface them.
+"""
+
+
 def rebuild_agent_codex_md(
     *,
     shared_dir: Path,
@@ -1490,6 +1503,7 @@ def rebuild_agent_codex_md(
     ensure_shared_primer(shared_dir)
     sync_shared_skills_codex(shared_dir, workspace_dir)
     primer = _strip_puffo_mcp_prefix_for_codex(read_shared_primer(shared_dir))
+    primer = f"{primer.rstrip()}\n\n{_CODEX_MONID_GUIDANCE.strip()}"
     try:
         profile_text = profile_path.read_text(encoding="utf-8")
     except OSError:

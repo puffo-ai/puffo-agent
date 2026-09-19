@@ -57,6 +57,14 @@ def test_standing_prompt_contains_runtime_identity_profile_and_flat_memory():
         assert "# Your memory" in text
 
 
+def test_codex_primer_nudges_monid_but_claude_stays_clean():
+    # Codex can hide monid from its tool surface; Claude surfaces it already.
+    claude, codex = _rebuild(_tmp())
+    assert "monid_prepare" in codex
+    assert "monid_spend" in codex
+    assert "monid_prepare" not in claude
+
+
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
     primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     for phrase in (
