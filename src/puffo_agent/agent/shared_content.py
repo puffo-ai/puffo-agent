@@ -1464,10 +1464,8 @@ def write_agents_md(codex_dir: Path, content: str) -> Path:
     return path
 
 
-# Codex-only primer addendum. Codex's condensed tool surface can omit the monid
-# tools even though they stay callable, so codex agents will otherwise not know
-# to reach for them; Claude agents already surface and use them, so this is not
-# added to the shared primer.
+# Codex-only: its condensed tool surface can hide the (still-callable) monid
+# tools, so codex agents need the nudge; Claude already surfaces them.
 _CODEX_MONID_GUIDANCE = """\
 ## Paid data (monid)
 
