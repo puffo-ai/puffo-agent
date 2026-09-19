@@ -125,7 +125,10 @@ async def test_prepare_forwards_query_and_returns_descriptor():
     # The whole descriptor is handed back as JSON so the model can build input.
     assert '"queryParams"' in text
     assert '"/get_company_profile"' in text
-    assert http.calls[-1][1] == "/v2/monid/prepare"
+    # Prepare goes direct to billing with a Bearer, exactly like spend (PUF-406):
+    # the absolute billing URL, and the token on the call rather than a signature.
+    assert http.calls[-1][1] == "https://billing.example/v2/monid/prepare"
+    assert http.calls[-1][3] == "tok_fake"
     body = http.calls[-1][2]
     assert body["query"] == "company profile"
     assert body["limit"] == 3
@@ -873,9 +876,157 @@ async def test_keyless_spend_mints_from_the_cloud_agents_endpoint():
 
 @pytest.mark.asyncio
 async def test_tools_not_registered_when_disabled():
-    # Default-off gate: a native agent without the feature flag advertises neither
-    # tool, so a stock agent exposes no spend tool until an operator opts in.
+    # Opt-out: a native agent whose gate is off (operator set the flag to "false") advertises
+    # neither tool. The gate now defaults ON, so this is the explicit opt-out, not the default.
     mcp = _tools(_FakeHttp(), monid_tools_enabled=False)
     tool_names = {t.name for t in await mcp.list_tools()}
     assert "monid_spend" not in tool_names
     assert "monid_prepare" not in tool_names
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("false", False),
+        ("False", False),
+        (" FALSE ", False),
+        ("true", True),
+        ("", True),
+        ("1", True),
+        ("yes", True),
+    ],
+)
+def test_monid_tools_enabled_defaults_on_and_opts_out_only_on_false(
+    monkeypatch, value, expected
+):
+    # Default ON: unset → registered. The single opt-out is the exact value "false"
+    # (case-insensitive, trimmed); every other value, including unset, is on.
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, monid_tools_enabled
+
+    if value is None:
+        monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
+    assert monid_tools_enabled() is expected
+
+
+# ── The gate has to reach the process that reads it ──────────────────────
+# ``monid_tools_enabled()`` runs INSIDE the MCP subprocess, whose environment
+# ``puffo_core_mcp_env`` builds from scratch, so the daemon's value must be forwarded or the child
+# cannot see it. The gate defaults ON, so the value is forwarded WHENEVER it is set — an explicit
+# opt-out ("false") has to reach the child or the tools stay on there despite the operator
+# disabling them. Unset → not forwarded → the child applies the same default-on.
+
+_MCP_ENV_BASE = dict(
+    slug="bot-0001",
+    device_id="dev_1",
+    server_url="http://localhost:3000",
+    keystore_dir="/tmp/keys",
+    workspace="/workspace",
+)
+
+
+def test_subprocess_env_forwards_the_monid_gate(monkeypatch):
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, "true")
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert env[MONID_TOOLS_ENABLED_ENV] == "true"
+
+
+def test_subprocess_env_omits_the_monid_gate_when_unset(monkeypatch):
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert MONID_TOOLS_ENABLED_ENV not in env
+
+
+@pytest.mark.parametrize("value", ["true", "false", "1", "TRUE", "yes", ""])
+def test_subprocess_env_forwards_a_set_value_verbatim(monkeypatch, value):
+    """A value set on the daemon is forwarded verbatim so the child sees the operator's intent —
+    crucially ``false``, the opt-out, which must reach the default-on child to disable it there."""
+    from puffo_agent.mcp.config import MONID_TOOLS_ENABLED_ENV, puffo_core_mcp_env
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    assert env[MONID_TOOLS_ENABLED_ENV] == value
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_the_forwarded_value_drives_the_child_gate(monkeypatch, value, expected):
+    """Ties the two halves together: the value this function forwards makes ``monid_tools_enabled()``
+    read the operator's intent in a process that sees only that env — on for "true", off for the
+    "false" opt-out."""
+    from puffo_agent.mcp.config import (
+        MONID_TOOLS_ENABLED_ENV,
+        monid_tools_enabled,
+        puffo_core_mcp_env,
+    )
+
+    monkeypatch.setenv(MONID_TOOLS_ENABLED_ENV, value)
+    env = puffo_core_mcp_env(**_MCP_ENV_BASE)
+    monkeypatch.delenv(MONID_TOOLS_ENABLED_ENV, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert monid_tools_enabled() is expected
+
+
+# ── A keyless cloud agent must be able to prepare (PUF-406) ──────────────
+# `monid_prepare` used the SIGNED post, which a bridge agent cannot make: its
+# keystore is a deliberate dead-end that raises "agent holds no local keys".
+# Since the contract is prepare-before-spend, that left a keyless agent unable
+# to buy anything at all, with the tools registered and the wallet funded.
+# Reproduced on staging 2026-09-17 (mercer-7622-c03a4cb7).
+
+
+@pytest.mark.asyncio
+async def test_keyless_agent_can_prepare_without_signing():
+    http = _FakeHttp()
+    http.keyless = True
+    mcp = _tools(http)
+    await _call(mcp, "monid_prepare", {"query": "trash bags", "limit": 2})
+
+    # minted over the unsigned keyless route, never the signed one
+    assert [c[0] for c in http.unsigned_mint_calls] == ["/v2/cloud-agents/spend-token"]
+    assert http.mint_calls == []
+    # and delivered to billing with the Bearer
+    method, url, body, token = http.calls[-1]
+    assert (method, url, token) == ("POST", "https://billing.example/v2/monid/prepare", "tok_fake")
+    assert body == {"query": "trash bags", "limit": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_native_agent_still_mints_the_signed_way_for_prepare():
+    http = _FakeHttp()  # keyless False
+    mcp = _tools(http)
+    await _call(mcp, "monid_prepare", {"query": "trash bags", "limit": 2})
+    assert [c[0] for c in http.mint_calls] == ["/v2/agent/spend-token"]
+    assert http.unsigned_mint_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,args", [
+    ("monid_prepare", {"query": "q", "limit": 1}),
+    ("monid_spend", {
+        "provider": "p", "endpoint": "/e", "input": {}, "max_cost_micro": 1,
+        "idempotency_key": "k",
+    }),
+])
+async def test_no_monid_tool_ever_signs_when_the_client_is_keyless(tool, args):
+    """The class of bug, not just the instance: a keyless agent holds no keys at
+    all, so any signed call on these paths is dead on arrival. `post` is the
+    signed method — neither tool may reach it."""
+    http = _FakeHttp()
+    http.keyless = True
+    signed: list = []
+
+    async def _forbidden(path, body=None):
+        signed.append(path)
+        raise AssertionError(f"signed post on the keyless path: {path}")
+
+    http.post = _forbidden
+    mcp = _tools(http)
+    await _call(mcp, tool, args)
+    assert signed == []

@@ -95,7 +95,9 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
 def _ts_to_iso(ms: int) -> str:
     if not ms:
         return ""
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(
+        timespec="seconds"
+    )
 
 
 def _enc_tag(m: Any) -> str:
@@ -162,9 +164,7 @@ async def _stage_model_visible_messages(
         space_id=watermark.space_id if watermark is not None else None,
         channel_id=watermark.channel_id if watermark is not None else None,
         through_seq=watermark.server_seq if watermark is not None else None,
-        through_envelope_id=(
-            watermark.envelope_id if watermark is not None else None
-        ),
+        through_envelope_id=(watermark.envelope_id if watermark is not None else None),
         tool_name=tool_name,
         tool_arguments=tool_arguments,
         visible_message_ids=visible,
@@ -202,7 +202,9 @@ async def _read_space_channels(cfg: Any, space_id: str) -> Any:
 
 
 async def _read_channel_members(
-    cfg: Any, space_id: str, channel_id: str,
+    cfg: Any,
+    space_id: str,
+    channel_id: str,
 ) -> Any:
     """Read the exact channel roster on both transports."""
     quoted_space_id = urllib.parse.quote(space_id, safe="")
@@ -223,13 +225,12 @@ async def _read_profiles(cfg: Any, slugs_csv: str) -> Any:
         return await cfg.http_client.get_unsigned(
             f"/v2/cloud-agents/identities/profiles?slugs={quoted}"
         )
-    return await cfg.http_client.get(
-        f"/identities/profiles?slugs={quoted}"
-    )
+    return await cfg.http_client.get(f"/identities/profiles?slugs={quoted}")
 
 
 async def _read_profile_map(
-    cfg: Any, slugs: list[str],
+    cfg: Any,
+    slugs: list[str],
 ) -> dict[str, dict[str, Any]]:
     """Best-effort profile enrichment without making roster reads fragile."""
     normalized = list(dict.fromkeys(slug.lstrip("@") for slug in slugs if slug))
@@ -252,15 +253,23 @@ async def _read_profile_map(
 
 
 async def _send_keyless(cfg: Any, body: dict) -> dict:
-    return await cfg.http_client.post_unsigned(
-        "/v2/cloud-agents/messages", body,
-    ) or {}
+    return (
+        await cfg.http_client.post_unsigned(
+            "/v2/cloud-agents/messages",
+            body,
+        )
+        or {}
+    )
 
 
 async def _upload_blob_keyless(cfg: Any, data: bytes) -> dict:
-    return await cfg.http_client.post_bytes_unsigned(
-        "/v2/cloud-agents/blobs/upload", data,
-    ) or {}
+    return (
+        await cfg.http_client.post_bytes_unsigned(
+            "/v2/cloud-agents/blobs/upload",
+            data,
+        )
+        or {}
+    )
 
 
 @dataclass
@@ -294,9 +303,11 @@ class PuffoCoreToolsConfig:
     bridge_client: Any = None
     # Live Inbox runtime for in-process tools. Subprocess tools use rpc_client.
     inbox_runtime: Any = None
-    # Default-off gate for the monid paid-data tools (PUFFO_MONID_TOOLS_ENABLED).
-    # Off leaves them unregistered so a stock agent advertises no spend tool; the
-    # server-side billing flag + per-agent budget are the money gates when it is on.
+    # Whether the monid paid-data tools are registered. Both call sites set this from
+    # ``config.monid_tools_enabled()`` (env gate, now default-ON: opt out with
+    # PUFFO_MONID_TOOLS_ENABLED=false); the money gates stay server-side (billing's wallet-balance
+    # check + the per-call ceiling). The field itself defaults False as a fail-closed fallback for a
+    # config built without the flag.
     monid_tools_enabled: bool = False
 
     @property
@@ -306,8 +317,10 @@ class PuffoCoreToolsConfig:
 
 
 async def _dispatch_semantic_send(
-    cfg: PuffoCoreToolsConfig, request: SemanticSendRequest,
-    *, tool_name: str = "send_message",
+    cfg: PuffoCoreToolsConfig,
+    request: SemanticSendRequest,
+    *,
+    tool_name: str = "send_message",
 ) -> dict[str, Any]:
     coordinator = getattr(cfg, "send_coordinator", None)
     if coordinator is None:
@@ -341,7 +354,6 @@ async def _dispatch_semantic_send(
             kind="protocol",
         )
 
-
     rpc = getattr(cfg, "rpc_client", None)
     if rpc is not None:
         try:
@@ -367,9 +379,13 @@ async def _dispatch_semantic_send(
         kind="coordinator_unavailable",
     )
 
+
 def _note_contact(
-    cfg: PuffoCoreToolsConfig, slug: str, *,
-    allowed: bool = False, blocked: Optional[bool] = None,
+    cfg: PuffoCoreToolsConfig,
+    slug: str,
+    *,
+    allowed: bool = False,
+    blocked: Optional[bool] = None,
 ) -> None:
     """Reflect an allowlist/blocklist write into the in-process contact
     cache when the tool runs inside the daemon (ws-local). Out-of-process
@@ -398,9 +414,7 @@ async def _fetch_device_keys(
     seen_ids: set[str] = set()
     since = 0
     while True:
-        data = await http_client.get(
-            f"/certs/sync?slugs={slugs_param}&since={since}"
-        )
+        data = await http_client.get(f"/certs/sync?slugs={slugs_param}&since={since}")
         for entry in data.get("entries", []):
             if entry.get("kind") == "device_cert":
                 cert = entry.get("cert", {})
@@ -412,10 +426,12 @@ async def _fetch_device_keys(
                 kem_b64 = enc_block.get("public_key") or cert.get("kem_public_key", "")
                 if dev_id and kem_b64 and dev_id not in seen_ids:
                     try:
-                        devices.append(RecipientDevice(
-                            device_id=dev_id,
-                            kem_public_key=base64url_decode(kem_b64),
-                        ))
+                        devices.append(
+                            RecipientDevice(
+                                device_id=dev_id,
+                                kem_public_key=base64url_decode(kem_b64),
+                            )
+                        )
                         seen_ids.add(dev_id)
                     except Exception:
                         # Skip malformed entry; don't abort the fetch.
@@ -446,23 +462,27 @@ async def _supplement_missing_devices(
                 "supplementation: server reported %d missing device(s) "
                 "for %s but fresh /certs/sync returned none of them; "
                 "those devices won't receive this message",
-                len(missing_device_ids), envelope_id,
+                len(missing_device_ids),
+                envelope_id,
             )
             return
         supp_env = build_supplementation_envelope(
-            envelope, content_key, supp_devices,
+            envelope,
+            content_key,
+            supp_devices,
         )
         await http_client.post("/messages", supp_env)
         logger.debug(
             "supplementation: re-posted %s to %d device(s)",
-            envelope_id, len(supp_devices),
+            envelope_id,
+            len(supp_devices),
         )
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning(
-            "supplementation: failed for %s: %s", envelope_id, exc,
+            "supplementation: failed for %s: %s",
+            envelope_id,
+            exc,
         )
-
-
 
 
 _RESOLVE_ROOT_MAX_DEPTH = 8
@@ -715,6 +735,7 @@ def register_core_tools(
     from .core_message_tools import register_message_tools
     from .core_monid_tools import register_monid_tools
     from .core_note_tools import register_note_tools
+
     register_inbox_tools(mcp, cfg, result_surface=result_surface)
     register_identity_tools(mcp, cfg)
     register_message_tools(mcp, cfg, result_surface=result_surface)
