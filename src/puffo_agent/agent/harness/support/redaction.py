@@ -24,7 +24,7 @@ _TOKENISH = re.compile(
 )
 
 
-def safe_provider_message(message: Any) -> str:
+def safe_provider_message(message: Any, *, max_length: int = 300) -> str:
     """Keep a bounded diagnostic without copying credential-shaped text."""
     if not isinstance(message, str):
         return "(missing or invalid provider message)"
@@ -37,4 +37,4 @@ def safe_provider_message(message: Any) -> str:
     )
     redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", redacted)
     redacted = _TOKENISH.sub("[REDACTED]", redacted)
-    return redacted[:300] or "(empty provider message)"
+    return redacted[:max_length] or "(empty provider message)"

@@ -378,6 +378,7 @@ def _make_daemon_stub(tmp_path):
     daemon.refresher = CredentialRefresher(host_home=tmp_path)
     daemon.codex_refresher = CredentialRefresher(host_home=tmp_path)
     daemon.workers = {}
+    daemon._failed_start_reported = {}
     return daemon
 
 
