@@ -169,6 +169,18 @@ Standing memory is loaded from the Agent's flat `memory/*.md` files. Existing
 tool-managed briefing topics are included through a compatibility view; notes,
 recollections, and imports are recalled on demand. Use the memory tools for
 structured updates and recall; their schemas define limits and update behavior.
+
+## Paid data (monid)
+
+Use the monid tools FIRST for these specific kinds of data — social posts and
+timelines, live prices, company or people records, or anything behind a login
+or paywall — before falling back to free web search. Free or built-in search
+of these sources is often stale, partial, or blocked (rate limits, 403s);
+never present a free-scraped result as authoritative when monid can retrieve
+the real one. Flow: call `monid_prepare` to price the request, then if within
+budget call `monid_spend`, honoring the returned price ceiling. For other,
+low-stakes facts that free search covers reliably, free search is fine — monid
+is for data that free access cannot reliably get.
 """
 
 
@@ -1464,22 +1476,13 @@ def write_agents_md(codex_dir: Path, content: str) -> Path:
     return path
 
 
-# Codex-only: codex free-searches first, so it needs a push to PREFER monid for
-# gated data; naming concrete categories (not vague adjectives) curbs overspend.
-_CODEX_MONID_GUIDANCE = """\
-## Paid data (monid)
-
-Use the monid tools FIRST for these specific kinds of data — social posts and \
-timelines, live prices, company or people records, or anything behind a login \
-or paywall — before falling back to free web search. Free or built-in search \
-of these sources is often stale, partial, or blocked (rate limits, 403s); \
-never present a free-scraped result as authoritative when monid can retrieve \
-the real one. Flow: call `monid_prepare` to price the request, then if within \
-budget call `monid_spend`, honoring the returned price ceiling. For other, \
-low-stakes facts that free search covers reliably, free search is fine — monid \
-is for data that free access cannot reliably get. These tools remain available \
-even if a condensed tool list does not surface them.
-"""
+# The shared primer carries the monid guidance for every harness. Codex alone
+# condenses its tool list, so it gets this one extra line reassuring the tools
+# stay callable when they are not surfaced.
+_CODEX_MONID_GUIDANCE = (
+    "These tools remain available even if a condensed tool list does not "
+    "surface them."
+)
 
 
 def rebuild_agent_codex_md(

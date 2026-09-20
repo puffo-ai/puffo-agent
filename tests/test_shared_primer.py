@@ -57,18 +57,24 @@ def test_standing_prompt_contains_runtime_identity_profile_and_flat_memory():
         assert "# Your memory" in text
 
 
-def test_codex_primer_nudges_monid_but_claude_stays_clean():
-    # Codex is nudged to PREFER monid first for gated/live data; Claude, which
-    # surfaces monid on its own, is left untouched.
+def test_every_harness_prefers_monid_and_only_codex_gets_the_condensed_note():
+    # The monid guidance lives in the shared primer, so every harness is nudged
+    # to PREFER monid first for gated/live data — not just codex.
     claude, codex = _rebuild(_tmp())
-    assert "monid_prepare" in codex
-    assert "monid_spend" in codex
-    # The nudge must make monid the first choice for gated data, not merely
-    # mention it — that first-choice framing is the behavior gap it closes.
-    assert "FIRST" in codex
-    assert "login or paywall" in codex
-    assert "monid_prepare" not in claude
-    assert "monid_spend" not in claude
+    for text in (claude, codex):
+        flat = " ".join(text.split())  # phrases survive the primer's hard wrap
+        assert "monid_prepare" in flat
+        assert "monid_spend" in flat
+        # First-choice framing is the behavior gap it closes; a bare mention
+        # would let the model keep free-searching gated data.
+        assert "monid tools FIRST" in flat
+        assert "login or paywall" in flat
+        # The guidance must appear exactly once per harness — not doubled by
+        # both the shared primer and a codex append.
+        assert text.count("## Paid data (monid)") == 1
+    # Only codex condenses its tool list, so only codex carries that caveat.
+    assert "condensed tool list" in codex
+    assert "condensed tool list" not in claude
 
 
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
