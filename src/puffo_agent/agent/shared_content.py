@@ -1464,10 +1464,8 @@ def write_agents_md(codex_dir: Path, content: str) -> Path:
     return path
 
 
-# Codex-only: unlike Claude, codex reaches for its own free web search first, so
-# it needs an explicit nudge to PREFER monid for data free access can't reliably
-# get. Naming concrete categories (not vague adjectives) is deliberate — it keeps
-# the nudge from degrading into "pay for everything".
+# Codex-only: codex free-searches first, so it needs a push to PREFER monid for
+# gated data; naming concrete categories (not vague adjectives) curbs overspend.
 _CODEX_MONID_GUIDANCE = """\
 ## Paid data (monid)
 
