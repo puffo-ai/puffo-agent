@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import ssl
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
@@ -24,6 +25,29 @@ def _env_proxy_for_url(url: str) -> str | None:
 
 def _is_socks_proxy(proxy_url: str) -> bool:
     return urlsplit(proxy_url).scheme.lower() in _SOCKS_SCHEMES
+
+
+def trust_store_fingerprint() -> tuple[tuple[str, int, int], ...]:
+    """Identity of the trust store a fresh context would load, cheaply.
+
+    ``(path, mtime_ns, size)`` for the system CA bundle
+    (``ssl.get_default_verify_paths()``) and certifi's. A sandbox that is
+    resumed on a different E2B node gets that node's proxy CA written into
+    the system bundle (PUF-377); the file's mtime moves, and that is the
+    signal a cached session must not outlive. Missing files fingerprint as
+    absent rather than raising — the store is read on every request.
+    """
+    paths = ssl.get_default_verify_paths()
+    out = []
+    for path in dict.fromkeys(
+        p for p in (paths.cafile, paths.openssl_cafile, certifi.where()) if p
+    ):
+        try:
+            st = os.stat(path)
+            out.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((path, -1, -1))
+    return tuple(out)
 
 
 def create_remote_ssl_context() -> ssl.SSLContext:

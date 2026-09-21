@@ -12,7 +12,7 @@ import aiohttp
 from .certs import create_subkey_cert, needs_rotation
 from .encoding import base64url_encode
 from .http_auth import sign_request
-from .http_session import create_remote_http_session
+from .http_session import create_remote_http_session, trust_store_fingerprint
 from .keystore import KeyStore, Session, decode_secret
 from .primitives import Ed25519KeyPair
 
@@ -121,6 +121,15 @@ class _HealedRequest:
             if heal_if_dead_executor(exc):
                 await self._client.close()
             raise
+        except aiohttp.ClientConnectorCertificateError:
+            # The peer's certificate did not verify against the context this
+            # session was built with. In a sandbox that means the trust store
+            # changed under us (E2B rewrites the proxy CA on a node move,
+            # PUF-377): drop the session so the next attempt builds a context
+            # from the current store. Surfaced, never replayed, for the same
+            # redirect-hop reason as the executor case above.
+            await self._client.close()
+            raise
 
     async def __aexit__(self, *exc_info):
         return await self._ctx.__aexit__(*exc_info)
@@ -144,10 +153,27 @@ class PuffoCoreHttpClient:
         # it False and are byte-for-byte unchanged.
         self.keyless = keyless
         self._session: aiohttp.ClientSession | None = None
+        self._session_trust: tuple | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        """The session, rebuilt when the trust store it was built from moved.
+
+        A session pins the SSL context it was created with (PUF-192 gives it
+        a fresh one). The daemon, though, outlives every E2B pause→resume,
+        and a resume that lands on another node rewrites the system CA bundle
+        with that node's proxy CA — so a session from before the move can no
+        longer verify the relay and every send fails until the process
+        restarts (PUF-377; staging 2026-09-21: four silent sends). Comparing
+        the store's fingerprint on each request costs a few stats and makes
+        the rebuild happen *before* a request is attempted, so nothing is
+        ever replayed.
+        """
+        trust = trust_store_fingerprint()
+        if self._session is not None and not self._session.closed and trust != self._session_trust:
+            await self.close()
         if self._session is None or self._session.closed:
             self._session = create_remote_http_session(self.server_url)
+            self._session_trust = trust
         return self._session
 
     def _healed_request(self, method: str, url: str, **kwargs):

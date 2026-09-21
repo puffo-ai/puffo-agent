@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A cloud agent no longer goes silent after a resume onto another E2B
+  node (PUF-377).** The daemon's HTTP session pinned the trust store it was
+  built with; a resume that lands on a different node rewrites the system CA
+  bundle with that node's proxy CA, so every send to the relay failed at the
+  TLS handshake until the process restarted. The client now fingerprints
+  the trust store (system bundle + certifi, mtime/size) on each request and
+  rebuilds the session when it moved — before anything is sent, so nothing
+  replays — and drops the session on a certificate verification error so
+  the next attempt gets a fresh context.
+
 - **A keyless cloud agent can now buy paid data at all.** `monid_prepare` used
   the *signed* POST, which a bridge-transport agent cannot make — its keystore
   is a deliberate dead-end that raises `agent holds no local keys`. Because the
