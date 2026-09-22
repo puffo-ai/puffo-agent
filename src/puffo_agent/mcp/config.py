@@ -91,6 +91,31 @@ def monid_tools_enabled() -> bool:
     return os.environ.get(MONID_TOOLS_ENABLED_ENV, "true").strip().lower() != "false"
 
 
+#: Opt-in telemetry gate for the weak-model paid-data probe. Default OFF so production stays silent;
+#: an operator sets it to the exact value "true" to log model turns that ran tools but chose none of
+#: the monid tools (see the probe in ``harness.runtime.local_runtime``). Logging only — no behavior
+#: change, no bearing on whether the tools are registered or spendable.
+MONID_UNUSED_TELEMETRY_ENV = "PUFFO_MONID_UNUSED_TELEMETRY"
+
+
+def monid_unused_telemetry_enabled() -> bool:
+    """Whether to log a model turn that used tools yet skipped the monid paid-data tools.
+
+    Opt-in: off unless the env above is exactly ``true`` (case-insensitive).
+    """
+    return (
+        os.environ.get(MONID_UNUSED_TELEMETRY_ENV, "false").strip().lower() == "true"
+    )
+
+
+#: The monid paid-data MCP tool names (bare, unscoped). Single source of truth: spliced into
+#: ``PUFFO_CORE_TOOL_NAMES`` below and reused by the telemetry probe so the two never drift.
+MONID_TOOL_NAMES = (
+    "monid_prepare",
+    "monid_spend",
+)
+
+
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
     "send_message_with_attachments",
@@ -123,9 +148,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "add_dm_allowlist",
     "update_dm_blocklist",
     "refresh",
-    # Monid paid-data tools (registered by mcp.core_monid_tools, default-off gate).
-    "monid_prepare",
-    "monid_spend",
+    # Monid paid-data tools (registered by mcp.core_monid_tools; see monid_tools_enabled).
+    *MONID_TOOL_NAMES,
     # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",

@@ -21,8 +21,11 @@ from typing import Any, Protocol
 from ....macos.keychain import is_macos
 from ....mcp.config import (
     INFERENCE_LEVELS,
+    MONID_TOOL_NAMES,
     OPENCODE_INFERENCE_LEVELS,
     default_python_executable,
+    monid_tools_enabled,
+    monid_unused_telemetry_enabled,
     puffo_core_mcp_env,
     write_cli_mcp_config,
     write_codex_mcp_config,
@@ -1091,6 +1094,98 @@ class _LegacyStatusProjector:
         self._emitted_tools.clear()
 
 
+class _MonidUnusedProbe:
+    """Turn-scoped, opt-in telemetry for weak models that under-use paid data.
+
+    Logs one line per model turn that invoked at least one tool but none of the
+    monid paid-data tools — the signal that the model is using tools, just not
+    the paid ones. A turn that calls no tool at all is skipped on purpose: "no
+    paid data because it answered from memory" is indistinguishable from normal
+    chit-chat at this layer and would drown the signal. Armed only when the
+    monid tools are actually offered and the operator opted in, so it is inert
+    (never constructed) otherwise; observation only, failures never reach the
+    runtime. Reads the real tool label off the raw event — the durable outbox
+    replaces it with a constant, so identity is gone downstream.
+    """
+
+    def __init__(self, agent_id: str) -> None:
+        self._agent_id = agent_id
+        self._turn: str | None = None
+        self._tool_refs: set[str] = set()
+        self._monid_called = False
+
+    def observe(self, event: HarnessEvent) -> None:
+        kind = _event_kind(event)
+        turn = str(event.turn_ref.value) if event.turn_ref is not None else ""
+        if kind == "turn.started":
+            self._turn = turn
+            self._reset()
+            return
+        if kind in {"turn.completed", "turn.abandoned"}:
+            if self._turn == turn and self._tool_refs and not self._monid_called:
+                logger.info(
+                    "agent %s: turn %s invoked %d tool call(s), none monid "
+                    "(paid-data tools offered but uninvoked)",
+                    self._agent_id,
+                    turn or "?",
+                    len(self._tool_refs),
+                )
+            self._turn = None
+            self._reset()
+            return
+        if kind == "runtime.exited":
+            self._turn = None
+            self._reset()
+            return
+        if not turn or self._turn != turn:
+            return
+        if kind == "turn.tool_started":
+            ref = str(event.data.get("tool_call_ref") or "")
+            if ref:
+                self._tool_refs.add(ref)
+            label = _normalized_tool_label(str(event.data.get("label") or ""))
+            if label in MONID_TOOL_NAMES:
+                self._monid_called = True
+
+    def _reset(self) -> None:
+        self._tool_refs.clear()
+        self._monid_called = False
+
+
+def _arm_monid_probe(agent_id: str) -> _MonidUnusedProbe | None:
+    """Construct the opt-in weak-model paid-data probe, or None when it is not
+    armed (monid tools not offered, or the operator did not opt in), so the
+    per-event hot path carries zero overhead in the default case."""
+    if monid_tools_enabled() and monid_unused_telemetry_enabled():
+        return _MonidUnusedProbe(agent_id)
+    return None
+
+
+def _run_local_projections(
+    legacy_projector: _LegacyStatusProjector,
+    monid_probe: _MonidUnusedProbe | None,
+    event: HarnessEvent,
+    agent_id: str,
+) -> None:
+    """Feed a driver event to the local, observation-only projections (legacy
+    status + optional monid telemetry). Failures never reach the runtime."""
+    try:
+        legacy_projector.project(event)
+    except Exception:
+        logger.exception(
+            "agent %s: Profile Log projection failed; runtime continues",
+            agent_id,
+        )
+    if monid_probe is not None:
+        try:
+            monid_probe.observe(event)
+        except Exception:
+            logger.exception(
+                "agent %s: monid telemetry probe failed; runtime continues",
+                agent_id,
+            )
+
+
 async def _observe_compaction_activity(
     activity_sink, event_type: str, agent_id: str,
 ) -> None:
@@ -1144,16 +1239,13 @@ def build_local_runtime_adapter(
     )
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
     legacy_projector = _LegacyStatusProjector(prepared.preparer.agent_id)
+    monid_probe = _arm_monid_probe(prepared.preparer.agent_id)
     manager: RuntimeManager
 
     async def persist_event(event: HarnessEvent) -> None:
-        try:
-            legacy_projector.project(event)
-        except Exception:
-            logger.exception(
-                "agent %s: Profile Log projection failed; runtime continues",
-                prepared.preparer.agent_id,
-            )
+        _run_local_projections(
+            legacy_projector, monid_probe, event, prepared.preparer.agent_id,
+        )
         logical_session = str(event.session_ref or manager.session_ref)
         projector.session_ref = logical_session
         try:
