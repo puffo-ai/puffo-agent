@@ -7,6 +7,7 @@ read an unreadable store as "nothing here".
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -203,3 +204,68 @@ async def test_other_server_refusals_are_not_rechecked_into_success(tmp_path):
 
     assert result["ok"] is False
     assert result["stage"] == STAGE_FETCH
+
+
+@pytest.mark.asyncio
+async def test_two_different_requests_at_once_do_not_overwrite_each_other(tmp_path):
+    """`connector.claim` is a background op, so two commands really do overlap.
+
+    Read-then-save is not atomic, so without serialisation both claims see an
+    empty store, both fetch, and the second save silently replaces the first —
+    while the first caller is told "connected" with a reference that is no
+    longer on disk (Boris 219713).
+    """
+    store = store_at(tmp_path)
+
+    async def slow(request_ref):
+        await asyncio.sleep(0.05)
+        return "fake", {"token": request_ref}
+
+    first, second = await asyncio.gather(
+        claim_connection("req_A", fetch=slow, store=store),
+        claim_connection("req_B", fetch=slow, store=store),
+    )
+
+    saved = store.load()
+    winners = [r for r in (first, second) if r["ok"]]
+    losers = [r for r in (first, second) if not r["ok"]]
+    assert len(winners) == 1, "exactly one claim may take the single connection"
+    assert len(losers) == 1
+    assert losers[0]["stage"] == STAGE_ALREADY_CONNECTED
+    # The one told "connected" must be the one actually on disk — the original
+    # symptom was a reference handed out for a credential already replaced.
+    assert winners[0]["connection_ref"] == saved.reference
+    assert saved.credential == {"token": saved.request_ref}
+
+
+@pytest.mark.asyncio
+async def test_the_machine_level_command_reaches_the_connector(tmp_path, monkeypatch):
+    """`connector.claim` carries no agent_slug; prove the dispatcher still
+    routes it instead of falling through to "unsupported op"."""
+    from puffo_agent.portal.connector import command as connector_command
+    from puffo_agent.portal.control.client import execute_command
+
+    seen = {}
+
+    async def fake_run(params, server_url):
+        seen["params"] = params
+        seen["server_url"] = server_url
+        return {"ok": True, "connected": True, "connection_ref": "deadbeef"}
+
+    monkeypatch.setattr(connector_command, "run_claim_command", fake_run)
+
+    result = await execute_command(
+        "connector.claim", None, {"request_ref": "req-1"}, server_url="https://example.test/"
+    )
+
+    assert result == {"ok": True, "connected": True, "connection_ref": "deadbeef"}
+    assert seen["params"] == {"request_ref": "req-1"}
+
+
+@pytest.mark.asyncio
+async def test_the_claim_command_without_a_server_url_does_not_reach_the_connector(tmp_path):
+    from puffo_agent.portal.control.client import execute_command
+
+    result = await execute_command("connector.claim", None, {"request_ref": "req-1"})
+
+    assert result["ok"] is False

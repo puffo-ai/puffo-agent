@@ -13,7 +13,9 @@ only that reference means connected.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -54,9 +56,35 @@ CODE_ALREADY_CLAIMED = "already_claimed"
 
 Fetch = Callable[[str], Awaitable[tuple[str, Any]]]
 
+# One claim at a time in this process. `connector.claim` is a background op, so
+# two commands really do run concurrently, and read-then-save is not atomic:
+# without this, two different requests both read "nothing here", both fetch,
+# and the second save overwrites the first — defeating the refusal below and
+# handing the first caller a connection reference that no longer exists
+# (Boris 219713, reproduced before fixing).
+#
+# Keyed by running loop rather than a single module-level Lock: an asyncio.Lock
+# binds to the loop that first awaits it and refuses any other, which would
+# break every test after the first. A daemon has one loop, so this is one lock
+# there; the weak keys let finished test loops go.
+_CLAIM_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _claim_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _CLAIM_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CLAIM_LOCKS[loop] = lock
+    return lock
+
 
 async def claim_connection(request_ref: str, *, fetch: Fetch, store: Any) -> dict:
     """Fetch, save, and report. What this returns is the command result.
+
+    Serialised against other claims on this computer. Not a caller's choice:
+    the guarantee below — that an existing connection is never silently
+    replaced — is only true if the read and the save cannot interleave.
 
     ``fetch`` is the whole of the server contract, kept to one call so the real
     HTTP shape can land without touching anything else here.
@@ -65,6 +93,11 @@ async def claim_connection(request_ref: str, *, fetch: Fetch, store: Any) -> dic
     page has to be able to stop waiting (v0.4 §7), so raising out of here would
     move the problem rather than report it.
     """
+    async with _claim_lock():
+        return await _claim_while_locked(request_ref, fetch=fetch, store=store)
+
+
+async def _claim_while_locked(request_ref: str, *, fetch: Fetch, store: Any) -> dict:
     try:
         existing = store.load()
     except _READ_ERRORS as exc:
