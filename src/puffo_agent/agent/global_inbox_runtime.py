@@ -1334,9 +1334,11 @@ class GlobalInboxRuntime(
         self, planned: PlannedTurn, process_started: float, exc: Exception
     ) -> tuple[bool, str, str]:
         process_outcome = failure_outcome(exc)
+        # auth needs its own category: re-login, not retry
+        error_category = "auth" if process_outcome == "auth_failed" else "provider_error"
         async with self._turn_state_lock:
             terminal = await self._requeue_active_turn(
-                planned, process_started, "provider_error"
+                planned, process_started, error_category
             )
         terminal_error = operator_failure_text(exc)
         if process_outcome in {"drained", "extra_usage_required"}:
@@ -1370,7 +1372,7 @@ class GlobalInboxRuntime(
             provider_turn_id=self.active.provider_turn_id,
             notice_generation=planned.notice_generation,
             target_count=len(planned.targets),
-            error_category="provider_error",
+            error_category=error_category,
             error_type=type(exc).__name__,
             error_code=getattr(exc, "error_code", None),
             outcome="requeued" if terminal else "degraded",

@@ -885,6 +885,41 @@ async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (AgentAPIError("pi rejected the credential", is_auth=True), "auth"),
+        (AgentAPIError("provider 500"), "provider_error"),
+        (RuntimeError("provider failed before admission"), "provider_error"),
+    ],
+)
+async def test_failed_turn_categorises_auth_apart_from_provider_errors(
+    tmp_path, caplog, exc, expected,
+):
+    caplog.set_level(logging.INFO)
+    store = await make_store(tmp_path)
+    await receipt(store, "m1", 1)
+
+    async def fail(_planned):
+        raise exc
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=fail, workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+
+    events = {
+        event["event"]: event
+        for event in runtime_events(caplog)
+        if event["event"] in {"turn.failed", "turn.requeued"}
+    }
+    assert events["turn.failed"]["error_category"] == expected
+    assert events["turn.requeued"]["error_category"] == expected
+    assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_admission_failure_requeues_exact_union_and_provider_session_clears(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "m1", 1)

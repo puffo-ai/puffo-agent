@@ -20,6 +20,7 @@ from typing import Any
 
 from .cli_parser import build_parser as build_cli_parser
 from .desktop_dependencies import desktop_error_message, prepare_desktop
+from .host_assets import pi_auth_expiry_ms, pi_auth_projection_state
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -692,6 +693,12 @@ def cmd_agent_show(args: argparse.Namespace) -> int:
     print(f"  provider:      {ac.runtime.provider or '(default)'}")
     print(f"  model:         {ac.runtime.model or '(default)'}")
     print(f"  api_key:       {'(set)' if ac.runtime.api_key else '(inherit)'}")
+    if ac.runtime.harness == "pi":
+        pi_home = agent_dir(agent_id) / ".pi" / "agent"
+        print("  pi_auth:")
+        print(f"    projection:  {pi_auth_projection_state(pi_home)}")
+        print(f"    credential:  {_summarise_credentials(pi_home / 'auth.json')}")
+        print(f"    expires:     {_format_pi_expiry(pi_auth_expiry_ms(pi_home))}")
     print(
         f"triggers:        on_mention={ac.triggers.on_mention} on_dm={ac.triggers.on_dm}"
     )
@@ -713,6 +720,14 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
 
 def cmd_agent_resume(args: argparse.Namespace) -> int:
     return _set_agent_state(args.id, "running")
+
+
+def _format_pi_expiry(expires_ms: int | None) -> str:
+    """Projected Codex access-token expiry, flagged once elapsed."""
+    if expires_ms is None:
+        return "unknown"
+    stamp = _format_ts(expires_ms // 1000)
+    return stamp if expires_ms / 1000 > time.time() else f"{stamp} (expired)"
 
 
 def _summarise_credentials(path: Path) -> str:
