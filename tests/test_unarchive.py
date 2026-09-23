@@ -866,6 +866,40 @@ async def test_worker_stop_reports_a_wedged_adapter_as_unconfirmed(monkeypatch):
     failing = bare(Failing())
     await failing.stop()
     assert failing.stop_confirmed is False and failing.runtime.status == "stopped"
+
+    class TimingOut:
+        async def aclose(self):
+            raise asyncio.TimeoutError()  # what wait_for raises at its bound
+
+    timing_out = bare(TimingOut())
+    await timing_out.stop()
+    assert timing_out.stop_confirmed is False
     clean = bare(Clean())
     await clean.stop()
     assert clean.stop_confirmed is True
+
+
+async def test_both_revoke_obligations_survive_an_interruption_between_them(stub, monkeypatch):
+    # The earlier device is settled; the process dies revoking the replaced
+    # one. Each obligation is on disk on its own and is retried on its own.
+    archive, old, _ = make_archive()
+    (archive / ".puffo-agent" / "pending_revoke.json").write_text(
+        json.dumps({"old_device_id": "dev_older", "last_error": "x"}))
+
+    async def revoke(identity, staged, device_id):
+        stub.revokes.append(device_id)
+        if device_id == old.device_id and len(stub.revokes) == 2:
+            raise Crash()
+        return ""
+
+    monkeypatch.setattr(unarchive, "_revoke_old_device", revoke)
+    with pytest.raises(Crash):
+        await unarchive.unarchive_agent(AGENT, archive.name)
+    state = json.loads((archive / ".puffo-agent" / unarchive.STATE_FILE).read_text())
+    assert state["earlier_device_id"] == "dev_older" and state["earlier_settled"]
+    assert state["old_device_id"] == old.device_id
+    assert _marker(archive)["old_device_id"] == old.device_id, "ours on disk before its revoke"
+
+    result = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert result["ok"] and not result["old_device_revoke_pending"]
+    assert stub.revokes == ["dev_older", old.device_id, old.device_id], "earlier not repeated"
