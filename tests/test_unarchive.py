@@ -210,7 +210,15 @@ async def test_several_archives_need_a_choice(stub):
     make_archive("20260902-120000")
     result = await unarchive.unarchive_agent(AGENT)
     assert result["error_code"] == "archive_ambiguous"
-    assert result["archive_ids"] == [f"{AGENT}-ws-20260901-120000", f"{AGENT}-ws-20260902-120000"]
+    # The portal lists these for the user to pick from: ids and times only,
+    # never a local path.
+    archives = result["archives"]
+    assert [a["archive_id"] for a in archives] == [
+        f"{AGENT}-ws-20260901-120000", f"{AGENT}-ws-20260902-120000",
+    ]
+    assert all(set(a) == {"archive_id", "archived_at"} for a in archives)
+    assert all(a["archived_at"].endswith("Z") and "/" not in a["archived_at"] for a in archives)
+    assert archives[0]["archived_at"] < archives[1]["archived_at"]
     result = await unarchive.unarchive_agent(AGENT, f"{AGENT}-ws-20260902-120000")
     assert result["ok"] and result["restored_from"] == f"{AGENT}-ws-20260902-120000"
 
@@ -225,21 +233,81 @@ async def test_nothing_to_restore(stub):
     assert (await unarchive.unarchive_agent(AGENT))["error_code"] == "archive_not_found"
 
 
-async def test_a_live_agent_archived_only_on_the_server_is_just_paused(stub):
+def make_live(state: str = "running") -> tuple[Path, StoredIdentity]:
     home = agent_dir(AGENT)
     (home / "keys").mkdir(parents=True)
+    (home / ".puffo-agent").mkdir()
     ident, _ = _identity()
+    KeyStore(home / "keys").save_identity(ident)
     (home / "agent.yml").write_text(yaml.safe_dump({
-        "id": AGENT, "state": "running",
+        "id": AGENT, "state": state,
         "puffo_core": {"server_url": SERVER, "slug": SLUG, "device_id": ident.device_id},
     }))
+    return home, ident
+
+
+async def test_a_live_agent_archived_only_on_the_server_still_gets_a_new_device(stub):
+    # Its directory never moved, but its device may have been revoked
+    # meanwhile: it is replaced, never trusted.
+    home, old = make_live()
     result = await unarchive.unarchive_agent(AGENT)
-    assert result["ok"] and result["mode"] == "server_only"
-    assert yaml.safe_load((home / "agent.yml").read_text())["state"] == "paused"
-    assert stub.restores == [] and stub.reports == [AGENT]
+    assert result["ok"] and result["mode"] == "in_place" and result["state"] == "paused"
+    new_id = result["device_id"]
+    assert new_id != old.device_id and len(stub.restores) == 1
+    assert KeyStore(home / "keys").load_identity(SLUG).device_id == new_id
+    assert (home / "keys" / "retired" / f"{old.device_id}.json").exists()
+    raw = yaml.safe_load((home / "agent.yml").read_text())
+    assert raw["state"] == "paused" and raw["puffo_core"]["device_id"] == new_id
+    assert stub.revokes == [old.device_id] and stub.reports == [AGENT]
+    assert not (home / ".puffo-agent" / unarchive.STATE_FILE).exists()
 
     refused = await unarchive.unarchive_agent(AGENT, f"{AGENT}-ws-20260901-120000")
     assert refused["error_code"] == "agent_exists"
+
+
+async def test_a_live_agent_the_server_does_not_consider_archived_is_left_alone(stub):
+    home, old = make_live()
+    stub.restore_error = unarchive.UnarchiveError("not_archived_on_server", "not archived")
+    result = await unarchive.unarchive_agent(AGENT)
+    assert result["error_code"] == "not_archived_on_server"
+    raw = yaml.safe_load((home / "agent.yml").read_text())
+    assert raw["state"] == "running" and raw["puffo_core"]["device_id"] == old.device_id
+    assert KeyStore(home / "keys").load_identity(SLUG).device_id == old.device_id
+    assert stub.revokes == [] and stub.reports == []
+
+
+async def test_a_retry_after_a_lost_ack_gets_the_same_answer(stub):
+    archive, _, _ = make_archive()
+    first = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert first["ok"]
+    for archive_id in (archive.name, None):
+        again = await unarchive.unarchive_agent(AGENT, archive_id)
+        assert again["ok"] and again["mode"] == "already_restored"
+        assert again["state"] == "paused" and again["device_id"] == first["device_id"]
+        assert again["restored_from"] == archive.name
+    assert len(stub.restores) == 1, "a retry must not mint or install another device"
+
+
+async def test_a_stale_retry_does_not_pause_a_resumed_agent(stub):
+    archive, _, _ = make_archive()
+    assert (await unarchive.unarchive_agent(AGENT))["ok"]
+    yml = agent_dir(AGENT) / "agent.yml"
+    raw = yaml.safe_load(yml.read_text())
+    raw["state"] = "running"  # the user resumed it
+    yml.write_text(yaml.safe_dump(raw))
+    late = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert late["error_code"] == "agent_exists"
+    assert yaml.safe_load(yml.read_text())["state"] == "running"
+
+
+async def test_concurrent_restores_of_one_agent_install_one_device(stub):
+    import asyncio
+
+    make_archive()
+    a, b = await asyncio.gather(unarchive.unarchive_agent(AGENT), unarchive.unarchive_agent(AGENT))
+    assert a["ok"] and b["ok"] and a["device_id"] == b["device_id"]
+    assert {a["mode"], b["mode"]} == {"restored", "already_restored"}
+    assert len(stub.restores) == 1
 
 
 @pytest.mark.parametrize("bad", ["../escape", "a/b", ".hidden", "", "x" * 65])

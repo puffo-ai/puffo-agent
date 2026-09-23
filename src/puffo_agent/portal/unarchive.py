@@ -25,8 +25,13 @@ The archive stays untouched until step 3, so any earlier failure leaves it
 exactly as it was, plus the reason in ``.puffo-agent/unarchive.json``.
 
 An agent that is still on disk while the server says "archived" (an owner
-force-archived it while this machine was offline) was never moved or
-revoked; unarchive then only reports it paused (``mode: server_only``).
+force-archived it while this machine was offline) goes through the same
+steps in place (``mode: in_place``): its device may or may not have been
+revoked meanwhile, so it is replaced rather than trusted.
+
+A finished restore leaves ``.puffo-agent/unarchive-done.json``; a retry
+whose acknowledgement was lost finds it and answers the same result
+instead of ``agent_exists``.
 
 LingTai agents need nothing extra: archive never revokes the LingTai
 runtime binding, so the ``--runtime-id`` in ``agent.yml`` still resolves.
@@ -39,6 +44,8 @@ import json
 import logging
 import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -55,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 _STAMP = r"\d{8}-\d{6}"
 STATE_FILE = "unarchive.json"
+DONE_FILE = "unarchive-done.json"
 
 
 class UnarchiveError(Exception):
@@ -112,6 +120,20 @@ def _record_failure(archive: Path | None, exc: UnarchiveError) -> None:
         logger.warning("unarchive: could not record failure in %s: %s", archive, err)
 
 
+def _describe(archive: Path) -> dict:
+    """What the portal may show for a candidate: no local paths."""
+    entry = {"archive_id": archive.name}
+    try:
+        # The daemon names archives with a local-time stamp.
+        local = datetime.strptime(archive.name[-15:], "%Y%m%d-%H%M%S")
+        entry["archived_at"] = (
+            local.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+    except ValueError:
+        pass
+    return entry
+
+
 def _select_archive(agent_id: str, archive_id: str | None) -> Path:
     candidates = _archives(agent_id, "ws")
     if archive_id is not None:
@@ -130,12 +152,12 @@ def _select_archive(agent_id: str, archive_id: str | None) -> Path:
         raise UnarchiveError(
             "archive_ambiguous",
             f"{len(candidates)} archives of {agent_id!r}; choose one",
-            archive_ids=[p.name for p in candidates],
+            archives=[_describe(p) for p in candidates],
         )
     return candidates[0]
 
 
-def _load_archived_identity(archive: Path) -> tuple[dict, StoredIdentity]:
+def _load_identity(archive: Path) -> tuple[dict, StoredIdentity]:
     import yaml
 
     try:
@@ -297,17 +319,43 @@ async def _report_paused(agent_id: str) -> bool:
         return False
 
 
-async def _server_only(agent_id: str) -> dict:
-    """Owner archived it server-side while we were offline: nothing moved."""
+def _write_done(directory: Path, restored_from: str | None, device_id: str) -> None:
+    try:
+        _atomic_write_private(directory / ".puffo-agent" / DONE_FILE, json.dumps({
+            "restored_from": restored_from,
+            "device_id": device_id,
+            "restored_at": int(time.time() * 1000),
+        }, indent=2))
+    except OSError as err:  # the restore stands; only a lost-ack retry is affected
+        logger.warning("unarchive: could not record completion in %s: %s", directory, err)
+
+
+async def _already_restored(agent_id: str, archive_id: str | None) -> dict | None:
+    """The answer to a retry whose first acknowledgement was lost, if this is one.
+
+    It is one only while nothing has moved on since: the marker names the
+    device the agent still has, the agent is still paused, and a named
+    archive is the one that was restored.
+    """
     from .state import AgentConfig
 
-    cfg = AgentConfig.load(agent_id)
-    cfg.state = "paused"
-    cfg.save()
+    try:
+        done = json.loads((agent_dir(agent_id) / ".puffo-agent" / DONE_FILE).read_text(encoding="utf-8"))
+        cfg = AgentConfig.load(agent_id)
+    except Exception:  # noqa: BLE001 — no readable marker: not a retry
+        return None
+    if not (
+        isinstance(done, dict)
+        and done.get("device_id") == cfg.puffo_core.device_id
+        and cfg.state == "paused"
+        and (archive_id is None or done.get("restored_from") == archive_id)
+    ):
+        return None
     reported = await _report_paused(agent_id)
     return {
-        "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "server_only",
-        "device_id": cfg.puffo_core.device_id, "status_reported": reported,
+        "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "already_restored",
+        "device_id": cfg.puffo_core.device_id, "restored_from": done.get("restored_from"),
+        "status_reported": reported,
     }
 
 
@@ -360,6 +408,7 @@ async def _restore_unrevoked(
     _prepare_yml(archive, identity.device_id)
     target = _move_back(agent_id, archive)
     _discard_state(target)
+    _write_done(target, archive.name, identity.device_id)
     reported = await _report_paused(agent_id)
     logger.info("unarchive %s: archive had not completed; restored in place", agent_id)
     return {
@@ -369,8 +418,13 @@ async def _restore_unrevoked(
     }
 
 
-async def _restore(agent_id: str, archive: Path) -> dict:
-    raw, identity = _load_archived_identity(archive)
+async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> dict:
+    """Replace the agent's device and bring it back paused.
+
+    ``archive`` is an archived directory, or — ``in_place`` — the agent's
+    live directory when only the server considers it archived.
+    """
+    raw, identity = _load_identity(archive)
     server_url = identity.server_url or (raw.get("puffo_core") or {}).get("server_url")
     if not server_url:
         raise UnarchiveError("archive_unreadable", "archived agent has no server_url")
@@ -379,11 +433,14 @@ async def _restore(agent_id: str, archive: Path) -> dict:
     try:
         await _post_restore(server_url, identity.slug, staged)
     except UnarchiveError as exc:
-        if exc.code != "not_archived_on_server":
+        if exc.code != "not_archived_on_server" or in_place:
             raise
         return await _restore_unrevoked(agent_id, archive, identity, exc)
 
-    # Server accepted the new device — from here the archive is rewritten.
+    # Server accepted the new device — from here the directory is rewritten.
+    if in_place:
+        # Stop a running worker before its keys change under it.
+        _prepare_yml(archive, identity.device_id)
     old_device_id = state.get("old_device_id") or identity.device_id
     if "old_device_id" not in state:
         state["old_device_id"] = old_device_id
@@ -393,18 +450,21 @@ async def _restore(agent_id: str, archive: Path) -> dict:
     if old_device_id != new_device_id:
         revoke_error = await _revoke_old_device(identity, staged, old_device_id)
 
-    dot = archive / ".puffo-agent"
-    for leftover in ("archive.flag", "pending_revoke.json"):
-        try:
-            (dot / leftover).unlink()
-        except FileNotFoundError:
-            pass
+    if not in_place:
+        dot = archive / ".puffo-agent"
+        for leftover in ("archive.flag", "pending_revoke.json"):
+            try:
+                (dot / leftover).unlink()
+            except FileNotFoundError:
+                pass
     _prepare_yml(archive, new_device_id)
 
-    target = _move_back(agent_id, archive)
+    target = archive if in_place else _move_back(agent_id, archive)
     # Only now: until the move, a retry must find the same staged certs and
     # the recorded old device, or it would mint yet another device.
     _discard_state(target)
+    restored_from = None if in_place else archive.name
+    _write_done(target, restored_from, new_device_id)
     if revoke_error:
         from .import_agents import _write_pending_revoke
 
@@ -416,8 +476,9 @@ async def _restore(agent_id: str, archive: Path) -> dict:
     reported = await _report_paused(agent_id)
     logger.info("unarchive %s: restored from %s as device %s", agent_id, archive.name, new_device_id)
     return {
-        "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "restored",
-        "device_id": new_device_id, "restored_from": archive.name,
+        "ok": True, "agent_slug": agent_id, "state": "paused",
+        "mode": "in_place" if in_place else "restored",
+        "device_id": new_device_id, "restored_from": restored_from,
         "old_device_revoke_pending": bool(revoke_error), "status_reported": reported,
     }
 
@@ -441,11 +502,15 @@ async def _unarchive_locked(agent_id: str, archive_id: str | None) -> dict:
     archive: Path | None = None
     try:
         if agent_yml_path(agent_id).exists():
+            retried = await _already_restored(agent_id, archive_id)
+            if retried is not None:
+                return retried
             if archive_id is not None:
                 raise UnarchiveError(
                     "agent_exists", f"agent {agent_id!r} is on this machine; not restoring an archive over it",
                 )
-            return await _server_only(agent_id)
+            archive = agent_dir(agent_id)
+            return await _restore(agent_id, archive, in_place=True)
         archive = _select_archive(agent_id, archive_id)
         return await _restore(agent_id, archive)
     except UnarchiveError as exc:
