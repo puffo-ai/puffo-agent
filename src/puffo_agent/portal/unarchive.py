@@ -13,11 +13,14 @@ cannot tell us either way. The path is therefore the same in every case:
 1. mint a new device + subkey signed by the agent's root key, staged in the
    archive so a retry replays the *same* signed certs;
 2. ask the server to install them (``restore-device``, machine-authed);
-3. write the new identity, keeping the old one under ``keys/retired/`` so
-   nothing that could decrypt past traffic is destroyed;
+3. record that the old device is owed a revoke (``pending_revoke.json`` in
+   the schema ``revoke-pending`` reads), then write the new identity,
+   keeping the old one under ``keys/retired/`` so nothing that could decrypt
+   past traffic is destroyed;
 4. revoke the old device with a root-signed revocation sent through the new
-   device (idempotent from our side: already-revoked is fine), or leave an
-   import-style pending marker for ``revoke-pending``;
+   device (idempotent from our side: already-revoked is fine) and clear the
+   record — or leave it, so the obligation travels with the agent whatever
+   happens next;
 5. drop ``archive.flag``, set the agent paused, move the directory back and
    report ``paused``.
 
@@ -46,6 +49,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import aiohttp
@@ -319,11 +323,16 @@ async def _report_paused(agent_id: str) -> bool:
         return False
 
 
-def _write_done(directory: Path, restored_from: str | None, device_id: str) -> None:
+def _write_done(
+    directory: Path, restored_from: str | None, device_id: str, *,
+    old_device_id: str | None = None, old_device_revoke_pending: bool = False,
+) -> None:
     try:
         _atomic_write_private(directory / ".puffo-agent" / DONE_FILE, json.dumps({
             "restored_from": restored_from,
             "device_id": device_id,
+            "old_device_id": old_device_id,
+            "old_device_revoke_pending": old_device_revoke_pending,
             "restored_at": int(time.time() * 1000),
         }, indent=2))
     except OSError as err:  # the restore stands; only a lost-ack retry is affected
@@ -355,6 +364,11 @@ async def _already_restored(agent_id: str, archive_id: str | None) -> dict | Non
     return {
         "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "already_restored",
         "device_id": cfg.puffo_core.device_id, "restored_from": done.get("restored_from"),
+        # The pending marker, not this record, is the obligation: report it
+        # as it stands now.
+        "old_device_revoke_pending": (
+            agent_dir(agent_id) / ".puffo-agent" / "pending_revoke.json"
+        ).exists(),
         "status_reported": reported,
     }
 
@@ -375,30 +389,59 @@ def _move_back(agent_id: str, archive: Path) -> Path:
     return target
 
 
+async def _device_status(server_url: str, slug: str, device_id: str) -> dict:
+    """The server's record of one of this agent's devices: known / revoked."""
+    from .control import machine_auth
+    from .control.store import load_or_create_machine
+
+    machine = load_or_create_machine()
+    path = f"/v2/machines/me/agents/{slug}/devices/{device_id}"
+    headers = machine_auth.signed_headers(machine, "GET", path, b"")
+    base = server_url.rstrip("/")
+    try:
+        async with create_remote_http_session(base) as session:
+            async with session.get(f"{base}{path}", headers=headers) as resp:
+                text = await resp.text()
+                status = resp.status
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        raise UnarchiveError("restore_pending", f"server unreachable: {exc}") from exc
+    if status == 200:
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise UnarchiveError("restore_pending", "unreadable device status") from exc
+        if isinstance(data, dict) and isinstance(data.get("known"), bool) \
+                and isinstance(data.get("revoked"), bool):
+            return data
+        raise UnarchiveError("restore_pending", "unreadable device status")
+    if status in (408, 429) or status >= 500:
+        raise UnarchiveError("restore_pending", f"server busy (HTTP {status}); retry")
+    raise UnarchiveError(
+        "restore_rejected", f"server refused the device status (HTTP {status}): {text[:300]}",
+    )
+
+
 async def _restore_unrevoked(
     agent_id: str, archive: Path, identity: StoredIdentity, refusal: UnarchiveError,
 ) -> dict:
-    """The archive never finished: its device was never revoked.
+    """The server does not consider the agent archived, yet it sits in the archive.
 
-    ``_archive_on_flag`` reports ``archived`` *before* revoking and gives up
-    on the revoke when that report fails, leaving a marker with
-    ``lifecycle_status: archived``. If the server still does not consider the
-    agent archived, that report never landed, so the revoke was never sent
-    and the old device is still valid — restore in place, no new device.
-    Without such a marker the archive did complete (the device is revoked),
-    and the server's view genuinely disagrees: refuse rather than guess.
+    Either the archive never finished (its ``archived`` report failed, so the
+    revoke was never sent) or it did and the server's status moved on since.
+    Nothing local can tell them apart — a revoke whose response was lost
+    leaves the same marker as one never sent — so ask the server whether the
+    archived device is revoked. Still valid: bring it back as it is, no new
+    device. Revoked (or unknown): refuse; it can only come back through a
+    new device, which needs the server to consider it archived.
     """
-    marker = archive / ".puffo-agent" / "pending_revoke.json"
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        payload = None
-    if not (
-        isinstance(payload, dict)
-        and payload.get("lifecycle_status") == "archived"
-        and payload.get("device_id") == identity.device_id
-    ):
-        raise UnarchiveError("restore_rejected", str(refusal))
+    device = await _device_status(identity.server_url, identity.slug, identity.device_id)
+    if not device["known"] or device["revoked"]:
+        raise UnarchiveError(
+            "restore_rejected",
+            f"{refusal}; its device is "
+            f"{'revoked' if device['revoked'] else 'unknown to the server'}, "
+            "so it can only return on a new device once the server shows it archived",
+        )
     dot = archive / ".puffo-agent"
     for leftover in ("archive.flag", "pending_revoke.json"):
         try:
@@ -410,12 +453,53 @@ async def _restore_unrevoked(
     _discard_state(target)
     _write_done(target, archive.name, identity.device_id)
     reported = await _report_paused(agent_id)
-    logger.info("unarchive %s: archive had not completed; restored in place", agent_id)
+    logger.info("unarchive %s: archived device still valid; restored as is", agent_id)
     return {
         "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "restored",
         "device_id": identity.device_id, "restored_from": archive.name,
         "old_device_revoke_pending": False, "status_reported": reported,
     }
+
+
+def _write_revoke_obligation(directory: Path, old_device_id: str, last_error: str) -> None:
+    """Record, in the schema ``revoke-pending`` reads, that the old device is owed a revoke.
+
+    Written into the directory *before* the identity changes and before it
+    moves, so a crash at any later point still carries the obligation with
+    the agent. The archive sweep leaves this schema alone
+    (``import_agents._retry_archived_pending_revoke``).
+    """
+    marker = directory / ".puffo-agent" / "pending_revoke.json"
+    _ensure_private_directory(marker.parent)
+    _atomic_write_private(marker, json.dumps({
+        "old_device_id": old_device_id,
+        "last_error": last_error,
+        "attempted_at": int(time.time() * 1000),
+    }, indent=2))
+
+
+def _check_no_foreign_obligation(directory: Path, old_device_id: str) -> None:
+    """An earlier import may still owe a revoke for an older device.
+
+    Its marker (import schema, ``old_device_id``) sits where ours goes;
+    overwriting it would drop that obligation. The archive's own marker
+    (archive schema, ``kind``) is about ``old_device_id`` itself and is
+    replaced on purpose.
+    """
+    marker = directory / ".puffo-agent" / "pending_revoke.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("kind") == "archive_self_revoke":
+        return
+    if not (isinstance(payload, dict) and payload.get("old_device_id") == old_device_id):
+        raise UnarchiveError(
+            "revoke_pending_exists",
+            "this agent still owes a revoke for an earlier device; run revoke-pending first",
+        )
 
 
 async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> dict:
@@ -429,6 +513,8 @@ async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> d
     if not server_url:
         raise UnarchiveError("archive_unreadable", "archived agent has no server_url")
     state = _load_state(archive)
+    old_device_id = state.get("old_device_id") or identity.device_id
+    _check_no_foreign_obligation(archive, old_device_id)
     staged = _staged_request(archive, state, identity)
     try:
         await _post_restore(server_url, identity.slug, staged)
@@ -439,24 +525,32 @@ async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> d
 
     # Server accepted the new device — from here the directory is rewritten.
     if in_place:
-        # Stop a running worker before its keys change under it.
+        # Paused, and the worker actually gone, before its keys change.
         _prepare_yml(archive, identity.device_id)
-    old_device_id = state.get("old_device_id") or identity.device_id
+        await _stop_worker(agent_id)
     if "old_device_id" not in state:
         state["old_device_id"] = old_device_id
         _save_state(archive, state)
-    new_device_id = _install_identity(archive, identity, staged)
+    new_device_id = staged["device_cert"]["device_id"]
+    if old_device_id != new_device_id:
+        # Replaces the archive's own marker too: that one describes the old
+        # identity and must not outlive it.
+        _write_revoke_obligation(archive, old_device_id, "unarchive: revoke not yet attempted")
+    _install_identity(archive, identity, staged)
     revoke_error = ""
     if old_device_id != new_device_id:
         revoke_error = await _revoke_old_device(identity, staged, old_device_id)
+        if revoke_error:
+            _write_revoke_obligation(archive, old_device_id, revoke_error)
+            logger.warning(
+                "unarchive %s: old device %s not yet revoked (%s); left for revoke-pending",
+                agent_id, old_device_id, revoke_error,
+            )
+        else:
+            (archive / ".puffo-agent" / "pending_revoke.json").unlink(missing_ok=True)
 
     if not in_place:
-        dot = archive / ".puffo-agent"
-        for leftover in ("archive.flag", "pending_revoke.json"):
-            try:
-                (dot / leftover).unlink()
-            except FileNotFoundError:
-                pass
+        (archive / ".puffo-agent" / "archive.flag").unlink(missing_ok=True)
     _prepare_yml(archive, new_device_id)
 
     target = archive if in_place else _move_back(agent_id, archive)
@@ -464,15 +558,10 @@ async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> d
     # the recorded old device, or it would mint yet another device.
     _discard_state(target)
     restored_from = None if in_place else archive.name
-    _write_done(target, restored_from, new_device_id)
-    if revoke_error:
-        from .import_agents import _write_pending_revoke
-
-        _write_pending_revoke(agent_id, old_device_id, revoke_error)
-        logger.warning(
-            "unarchive %s: old device %s not yet revoked (%s); left for revoke-pending",
-            agent_id, old_device_id, revoke_error,
-        )
+    _write_done(
+        target, restored_from, new_device_id,
+        old_device_id=old_device_id, old_device_revoke_pending=bool(revoke_error),
+    )
     reported = await _report_paused(agent_id)
     logger.info("unarchive %s: restored from %s as device %s", agent_id, archive.name, new_device_id)
     return {
@@ -481,6 +570,31 @@ async def _restore(agent_id: str, archive: Path, *, in_place: bool = False) -> d
         "device_id": new_device_id, "restored_from": restored_from,
         "old_device_revoke_pending": bool(revoke_error), "status_reported": reported,
     }
+
+
+# Set by the daemon: stops an agent's worker and returns once it has exited.
+_worker_stopper: Callable[[str], Awaitable[None]] | None = None
+# Agents mid-unarchive; the daemon starts no worker for them.
+_held: set[str] = set()
+STOP_TIMEOUT_S = 90.0
+
+
+def set_worker_stopper(stopper: Callable[[str], Awaitable[None]] | None) -> None:
+    global _worker_stopper
+    _worker_stopper = stopper
+
+
+def is_held(agent_id: str) -> bool:
+    return agent_id in _held
+
+
+async def _stop_worker(agent_id: str) -> None:
+    if _worker_stopper is None:
+        return  # no daemon in this process, so no worker to stop
+    try:
+        await asyncio.wait_for(_worker_stopper(agent_id), timeout=STOP_TIMEOUT_S)
+    except TimeoutError as exc:
+        raise UnarchiveError("restore_pending", "the agent's worker did not stop; retry") from exc
 
 
 _locks: dict[str, asyncio.Lock] = {}
@@ -495,7 +609,11 @@ async def unarchive_agent(agent_id: str, archive_id: str | None = None) -> dict:
     # the second must see the first's outcome, not race it on the same dir.
     lock = _locks.setdefault(agent_id, asyncio.Lock())
     async with lock:
-        return await _unarchive_locked(agent_id, archive_id)
+        _held.add(agent_id)
+        try:
+            return await _unarchive_locked(agent_id, archive_id)
+        finally:
+            _held.discard(agent_id)
 
 
 async def _unarchive_locked(agent_id: str, archive_id: str | None) -> dict:

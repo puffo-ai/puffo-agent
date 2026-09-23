@@ -144,6 +144,11 @@ class Daemon:
         self.workers: dict[str, Worker] = {}
         # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
+        # Workers popped from ``workers`` whose stop() has not returned yet.
+        self._stopping: set[str] = set()
+        from .unarchive import set_worker_stopper
+
+        set_worker_stopper(self._stop_worker_and_wait)
         from .control.client import UsageRefresh
 
         self._usage_refresh = UsageRefresh()
@@ -557,6 +562,12 @@ class Daemon:
             self._starting_agents.discard(agent_id)
 
     async def _start_and_observe_worker(self, agent_cfg: AgentConfig) -> None:
+        from .unarchive import is_held
+
+        if is_held(agent_cfg.id):
+            # Unarchive is replacing this agent's keys; it leaves it paused.
+            logger.info("agent %s: unarchive in progress, not starting", agent_cfg.id)
+            return
         worker = Worker(
             self.daemon_cfg,
             agent_cfg,
@@ -811,7 +822,18 @@ class Daemon:
             if cb is not None:
                 self.refresher.unregister_on_refresh_success(cb)
                 self.codex_refresher.unregister_on_refresh_success(cb)
-            await worker.stop()
+            self._stopping.add(agent_id)
+            try:
+                await worker.stop()
+            finally:
+                self._stopping.discard(agent_id)
+
+    async def _stop_worker_and_wait(self, agent_id: str) -> None:
+        """Stop the agent's worker and return only once it has exited —
+        including a stop the reconciler began first."""
+        await self._stop_worker(agent_id)
+        while agent_id in self._stopping:
+            await asyncio.sleep(0.05)
 
     async def _stop_all_workers(self) -> None:
         ids = list(self.workers.keys())

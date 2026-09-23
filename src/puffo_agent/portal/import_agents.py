@@ -706,12 +706,30 @@ class _RetryOutcome(enum.Enum):
     UNRETRYABLE = "unretryable"      # bad schema / missing keys; renamed to .broken
 
 
+def _owned_by_unarchive(archived_path: Path, payload: object) -> bool:
+    from .unarchive import STATE_FILE
+
+    if not isinstance(payload, dict) or "old_device_id" not in payload:
+        return False
+    try:
+        state = json.loads((archived_path / ".puffo-agent" / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and state.get("old_device_id") == payload["old_device_id"]
+
+
 async def _retry_archived_pending_revoke(
     archived_path: Path,
 ) -> _RetryOutcome:
     marker = archived_pending_revoke_path(archived_path)
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
+        if _owned_by_unarchive(archived_path, payload):
+            # An unarchive in progress wrote this for the agent's *new*
+            # identity: revoking needs that identity, not this archive's
+            # self-revoke, and the unarchive retry (or revoke-pending once
+            # the agent is back) owns it. Renaming it .broken would drop it.
+            return _RetryOutcome.TRANSIENT
         server_url = payload["server_url"]
         slug = payload["slug"]
         device_id = payload["device_id"]
