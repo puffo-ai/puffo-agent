@@ -566,7 +566,7 @@ async def test_a_crash_before_the_move_keeps_a_failed_revoke_owed(stub, monkeypa
     assert again["mode"] == "already_restored" and again["old_device_revoke_pending"]
 
 
-async def test_a_crash_after_the_move_resumes_on_retry(stub, monkeypatch):
+async def test_a_crash_after_the_move_answers_the_retry(stub, monkeypatch):
     archive, old, _ = make_archive()
     stub.revoke_error = "network down"
     real_discard = unarchive._discard_state
@@ -579,24 +579,26 @@ async def test_a_crash_after_the_move_resumes_on_retry(stub, monkeypatch):
         await unarchive.unarchive_agent(AGENT)
     home = agent_dir(AGENT)
     assert not archive.exists() and _marker(home)["old_device_id"] == old.device_id
+    # The completion record landed before the staging was due to go.
+    assert (home / ".puffo-agent" / unarchive.DONE_FILE).exists()
 
     monkeypatch.setattr(unarchive, "_discard_state", real_discard)
-    stub.revoke_error = ""
     result = await unarchive.unarchive_agent(AGENT)
-    assert result["ok"] and result["device_id"] == stub.restores[0]["device_cert"]["device_id"]
-    assert stub.restores[0]["device_cert"] == stub.restores[1]["device_cert"]
-    assert stub.revokes == [old.device_id, old.device_id]
-    assert not (home / ".puffo-agent" / "pending_revoke.json").exists()
+    assert result["ok"] and result["mode"] == "already_restored"
+    assert result["device_id"] == stub.restores[0]["device_cert"]["device_id"]
+    assert len(stub.restores) == 1
+    # Still owed, and now where revoke-pending reads it.
+    assert result["old_device_revoke_pending"]
+    assert _marker(home)["old_device_id"] == old.device_id
 
 
-async def test_in_place_refuses_over_an_older_unsettled_revoke(stub):
-    home, _ = make_live()
+async def test_in_place_settles_an_older_unsettled_revoke_first(stub):
+    home, old = make_live()
     (home / ".puffo-agent" / "pending_revoke.json").write_text(
         json.dumps({"old_device_id": "dev_older", "last_error": "x"}))
     result = await unarchive.unarchive_agent(AGENT)
-    assert result["error_code"] == "revoke_pending_exists"
-    assert stub.restores == []
-    assert _marker(home)["old_device_id"] == "dev_older"
+    assert result["ok"] and stub.revokes == ["dev_older", old.device_id]
+    assert not (home / ".puffo-agent" / "pending_revoke.json").exists()
 
 
 # ── in place: the worker is gone before the keys change ──
@@ -689,12 +691,181 @@ async def test_the_daemon_waits_for_a_stop_already_under_way_and_starts_nothing_
     assert started == [AGENT] and AGENT not in daemon.workers
 
 
-async def test_an_archive_owing_an_older_revoke_is_not_overwritten(stub):
+async def test_an_archive_owing_an_older_revoke_settles_it_before_coming_back(stub, monkeypatch):
     # Imported with its previous device still unrevoked, then archived: the
-    # import marker travelled into the archive. Ours would overwrite it.
-    archive, _, _ = make_archive()
+    # import marker travelled into the archive, where revoke-pending cannot
+    # reach it. The restore settles it through the new device, first.
+    from puffo_agent.portal import import_agents
+
+    archive, old, _ = make_archive()
     (archive / ".puffo-agent" / "pending_revoke.json").write_text(
         json.dumps({"old_device_id": "dev_older", "last_error": "x"}))
-    result = await unarchive.unarchive_agent(AGENT)
-    assert result["error_code"] == "revoke_pending_exists"
-    assert stub.restores == [] and _marker(archive)["old_device_id"] == "dev_older"
+    failing = {"dev_older"}
+
+    async def revoke(identity, staged, device_id):
+        stub.revokes.append(device_id)
+        return "network down" if device_id in failing else ""
+
+    monkeypatch.setattr(unarchive, "_revoke_old_device", revoke)
+    result = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert result["error_code"] == "restore_pending" and "dev_older" in result["error"]
+    # Not moved, the earlier obligation intact and not discarded by the sweep.
+    assert archive.is_dir() and not agent_dir(AGENT).exists()
+    assert _marker(archive)["old_device_id"] == "dev_older"
+    assert await import_agents._retry_archived_pending_revoke(archive) is \
+        import_agents._RetryOutcome.TRANSIENT
+    assert _marker(archive)["old_device_id"] == "dev_older"
+
+    failing.clear()
+    result = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert result["ok"] and not result["old_device_revoke_pending"]
+    assert stub.revokes == ["dev_older", "dev_older", old.device_id]
+    assert len({json.dumps(r["device_cert"], sort_keys=True) for r in stub.restores}) == 1
+    assert not (agent_dir(AGENT) / ".puffo-agent" / "pending_revoke.json").exists()
+
+
+# ── review round 3: a selected archive interrupted after the move ──
+
+@pytest.mark.parametrize("after_discard", [False, True])
+async def test_a_selected_archive_interrupted_after_the_move_finishes_on_retry(
+    stub, monkeypatch, after_discard,
+):
+    # The web always names the archive it restores. A crash after the move
+    # (before or after the staging file goes) must not turn the retry into
+    # agent_exists.
+    archive, old, _ = make_archive()
+    selected = archive.name
+    real_discard = unarchive._discard_state
+
+    def crash(directory):
+        if after_discard:
+            real_discard(directory)
+        raise Crash()
+
+    monkeypatch.setattr(unarchive, "_discard_state", crash)
+    with pytest.raises(Crash):
+        await unarchive.unarchive_agent(AGENT, selected)
+    monkeypatch.setattr(unarchive, "_discard_state", real_discard)
+
+    result = await unarchive.unarchive_agent(AGENT, selected)
+    assert result["ok"] and result["state"] == "paused"
+    assert result["restored_from"] == selected
+    assert result["device_id"] == stub.restores[0]["device_cert"]["device_id"]
+    assert all(r["device_cert"] == stub.restores[0]["device_cert"] for r in stub.restores)
+
+
+async def test_a_selected_archive_interrupted_before_the_completion_record_resumes(
+    stub, monkeypatch,
+):
+    archive, old, _ = make_archive()
+    selected = archive.name
+    real_done = unarchive._write_done
+
+    def crash(*args, **kwargs):
+        raise Crash()
+
+    monkeypatch.setattr(unarchive, "_write_done", crash)
+    with pytest.raises(Crash):
+        await unarchive.unarchive_agent(AGENT, selected)
+    home = agent_dir(AGENT)
+    state = json.loads((home / ".puffo-agent" / unarchive.STATE_FILE).read_text())
+    assert state["restored_from"] == selected, "persisted before the move"
+    monkeypatch.setattr(unarchive, "_write_done", real_done)
+
+    result = await unarchive.unarchive_agent(AGENT, selected)
+    assert result["ok"] and result["mode"] == "restored"
+    assert result["restored_from"] == selected
+    assert len({json.dumps(r["device_cert"], sort_keys=True) for r in stub.restores}) == 1
+    assert stub.revokes == [old.device_id, old.device_id]
+    assert not (home / ".puffo-agent" / unarchive.STATE_FILE).exists()
+    # A different archive id is still not this operation.
+    other = await unarchive.unarchive_agent(AGENT, f"{AGENT}-ws-20990101-000000")
+    assert other["error_code"] == "agent_exists"
+
+
+# ── review round 3: a stop that gave up is not an exit ──
+
+def _daemon_module():
+    import importlib
+
+    return importlib.import_module("puffo_agent.portal.daemon")
+
+
+async def test_a_timed_out_stop_is_still_awaited_on_retry(stub, monkeypatch):
+    import asyncio
+
+    from puffo_agent.portal.state import DaemonConfig
+
+    daemon = _daemon_module().Daemon(DaemonConfig())
+    release = asyncio.Event()
+
+    class StillRunning:
+        async def stop(self):
+            await release.wait()
+            self.stop_confirmed = True
+
+    daemon.workers[AGENT] = StillRunning()
+    monkeypatch.setattr(unarchive, "_worker_stopper", daemon._stop_worker_and_wait)
+    monkeypatch.setattr(unarchive, "STOP_TIMEOUT_S", 0.01)
+    for _ in range(2):
+        with pytest.raises(unarchive.UnarchiveError, match="did not stop"):
+            await unarchive._stop_worker(AGENT)
+    release.set()
+    monkeypatch.setattr(unarchive, "STOP_TIMEOUT_S", 2)
+    await unarchive._stop_worker(AGENT)
+    assert AGENT not in daemon._stop_tasks and AGENT not in daemon._unconfirmed_stops
+
+
+async def test_an_unconfirmed_exit_is_stopped_again_before_it_counts(stub, monkeypatch):
+    from puffo_agent.portal.state import DaemonConfig
+
+    daemon = _daemon_module().Daemon(DaemonConfig())
+    outcomes = [False, False, True]
+    calls = []
+
+    class Wedged:
+        stop_confirmed = False
+
+        async def stop(self):
+            calls.append(1)
+            self.stop_confirmed = outcomes.pop(0)
+
+    daemon.workers[AGENT] = Wedged()
+    monkeypatch.setattr(unarchive, "_worker_stopper", daemon._stop_worker_and_wait)
+    with pytest.raises(unarchive.UnarchiveError, match="exit not confirmed"):
+        await unarchive._stop_worker(AGENT)
+    assert len(calls) == 2
+    await unarchive._stop_worker(AGENT)
+    assert len(calls) == 3 and AGENT not in daemon._unconfirmed_stops
+
+
+async def test_worker_stop_reports_a_wedged_adapter_as_unconfirmed(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.worker import Worker
+
+    def bare(adapter):
+        w = Worker.__new__(Worker)
+        w._stop = asyncio.Event()
+        w._task = None
+        w._client = None
+        w._adapter = adapter
+        w.agent_cfg = SimpleNamespace(id=AGENT)
+        w.runtime = SimpleNamespace(status="running", save=lambda _id: None)
+        return w
+
+    class Failing:
+        async def aclose(self):
+            raise OSError("docker stop failed")
+
+    class Clean:
+        async def aclose(self):
+            return None
+
+    failing = bare(Failing())
+    await failing.stop()
+    assert failing.stop_confirmed is False and failing.runtime.status == "stopped"
+    clean = bare(Clean())
+    await clean.stop()
+    assert clean.stop_confirmed is True

@@ -144,8 +144,12 @@ class Daemon:
         self.workers: dict[str, Worker] = {}
         # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
-        # Workers popped from ``workers`` whose stop() has not returned yet.
-        self._stopping: set[str] = set()
+        # In-flight worker stops, awaitable by anyone who must know the
+        # worker is gone; a waiter giving up never cancels them.
+        self._stop_tasks: dict[str, asyncio.Future] = {}
+        # Stopped workers whose exit was not confirmed (Worker.stop gave up
+        # on a wedged task, adapter or client). Stopped again on demand.
+        self._unconfirmed_stops: dict[str, Worker] = {}
         from .unarchive import set_worker_stopper
 
         set_worker_stopper(self._stop_worker_and_wait)
@@ -822,23 +826,47 @@ class Daemon:
             if cb is not None:
                 self.refresher.unregister_on_refresh_success(cb)
                 self.codex_refresher.unregister_on_refresh_success(cb)
-            self._stopping.add(agent_id)
-            try:
-                await worker.stop()
-            finally:
-                self._stopping.discard(agent_id)
+            await asyncio.shield(self._track_stop(agent_id, worker))
+
+    def _track_stop(self, agent_id: str, worker: Worker) -> asyncio.Future:
+        task = spawn(self._run_stop(agent_id, worker), name=f"agent-stop:{agent_id}")
+        self._stop_tasks[agent_id] = task
+        return task
+
+    async def _run_stop(self, agent_id: str, worker: Worker) -> None:
+        try:
+            await worker.stop()
+        finally:
+            if getattr(worker, "stop_confirmed", True):
+                self._unconfirmed_stops.pop(agent_id, None)
+            else:
+                self._unconfirmed_stops[agent_id] = worker
+            if self._stop_tasks.get(agent_id) is asyncio.current_task():
+                del self._stop_tasks[agent_id]
 
     async def _stop_worker_and_wait(self, agent_id: str) -> None:
-        """Stop the agent's worker and return only once it has exited —
-        including a stop the reconciler began first."""
+        """Stop the agent's worker; return only once its exit is confirmed.
+
+        Waits for a stop already under way (the reconciler's, or one a
+        previous caller gave up waiting for) and stops again a worker whose
+        earlier stop could not confirm its exit. Raises if it still cannot.
+        """
         await self._stop_worker(agent_id)
-        while agent_id in self._stopping:
-            await asyncio.sleep(0.05)
+        task = self._stop_tasks.get(agent_id)
+        if task is not None:
+            await asyncio.shield(task)
+        stale = self._unconfirmed_stops.get(agent_id)
+        if stale is not None:
+            await asyncio.shield(self._track_stop(agent_id, stale))
+            if agent_id in self._unconfirmed_stops:
+                raise RuntimeError(f"agent {agent_id}: worker exit not confirmed")
 
     async def _stop_all_workers(self) -> None:
         ids = list(self.workers.keys())
         await asyncio.gather(
-            *(self._stop_worker(i) for i in ids), return_exceptions=True
+            *(self._stop_worker(i) for i in ids),
+            *list(self._stop_tasks.values()),
+            return_exceptions=True,
         )
 
     async def _archive_on_flag(self, agent_id: str) -> None:

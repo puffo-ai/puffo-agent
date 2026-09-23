@@ -715,7 +715,9 @@ def _owned_by_unarchive(archived_path: Path, payload: object) -> bool:
         state = json.loads((archived_path / ".puffo-agent" / STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(state, dict) and state.get("old_device_id") == payload["old_device_id"]
+    return isinstance(state, dict) and payload["old_device_id"] in (
+        state.get("old_device_id"), state.get("earlier_device_id"),
+    )
 
 
 async def _retry_archived_pending_revoke(

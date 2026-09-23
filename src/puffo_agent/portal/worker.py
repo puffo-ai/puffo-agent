@@ -1443,8 +1443,15 @@ class Worker:
             send_coordinator=getattr(client, "send_delegate", None),
         )
 
+    # Set by stop(): True only when the task ended and the adapter and
+    # client closed within their bounds. stop() still gives up on a wedged
+    # part so shutdown cannot hang; callers that must know the worker is
+    # gone (unarchive swapping its keys) read this.
+    stop_confirmed: bool = False
+
     async def stop(self) -> None:
         self._stop.set()
+        confirmed = True
         if self._task is not None:
             self._task.cancel()
             try:
@@ -1453,6 +1460,7 @@ class Worker:
                 # in milliseconds.
                 await asyncio.wait_for(self._task, timeout=10.0)
             except asyncio.TimeoutError:
+                confirmed = False
                 logger.warning(
                     "agent %s: worker task didn't exit within 10s of cancel — "
                     "moving on to adapter cleanup anyway",
@@ -1467,41 +1475,51 @@ class Worker:
                 # grace plus our own ``docker stop -t 5`` and drains.
                 await asyncio.wait_for(self._adapter.aclose(), timeout=30.0)
             except asyncio.TimeoutError:
+                confirmed = False
                 logger.warning(
                     "agent %s: adapter aclose timed out after 30s — "
                     "container may still be running, run `docker ps` to check",
                     self.agent_cfg.id,
                 )
             except Exception as exc:
+                confirmed = False
                 logger.warning(
                     "agent %s: adapter aclose failed: %s",
                     self.agent_cfg.id,
                     exc,
                 )
-        await self._close_client()
+        if not await self._close_client():
+            confirmed = False
+        self.stop_confirmed = confirmed
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
-    async def _close_client(self) -> None:
-        """Release a partially or fully started message client."""
+    async def _close_client(self) -> bool:
+        """Release a partially or fully started message client.
+
+        False when it did not close cleanly."""
         if self._client is None:
-            return
+            return True
+        closed = True
         # Release WS + SQLite handles. Required on Windows so
         # ``messages.db*`` is renamable by ``agent archive``.
         try:
             await asyncio.wait_for(self._client.stop(), timeout=10.0)
         except asyncio.TimeoutError:
+            closed = False
             logger.warning(
                 "agent %s: client.stop timed out after 10s",
                 self.agent_cfg.id,
             )
         except Exception as exc:
+            closed = False
             logger.warning(
                 "agent %s: client.stop failed: %s",
                 self.agent_cfg.id,
                 exc,
             )
         self._client = None
+        return closed
 
     def _runtime_info(self) -> dict[str, object]:
         rt = self.agent_cfg.runtime
