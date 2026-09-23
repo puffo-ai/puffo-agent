@@ -133,3 +133,73 @@ def test_the_stored_credential_is_never_parsed(tmp_path):
 
     assert store.load().credential == alien
     assert json.loads(store.path.read_bytes())["credential"] == alien
+
+
+class SavedByAnotherCommand(SkeletonConnectionStore):
+    """A store that is empty when first read and holds a connection after.
+
+    Models the race Boris 219654 describes: two pages click, both commands see
+    nothing yet, one claims and saves while the other is still on the network.
+    """
+
+    def __init__(self, path, appears):
+        super().__init__(path)
+        self.appears = appears
+        self.reads = 0
+
+    def load(self):
+        self.reads += 1
+        return None if self.reads == 1 else self.appears
+
+
+@pytest.mark.asyncio
+async def test_already_claimed_reports_connected_when_the_credential_did_land(tmp_path):
+    """The other command won the race and saved. Reporting a failure here would
+    show an error for a connection that is actually up."""
+    landed = SkeletonConnectionStore(tmp_path / "other.json").save(
+        request_ref="req-1", provider="fake", credential={"token": "won"}
+    )
+    store = SavedByAnotherCommand(tmp_path / "connection.json", landed)
+
+    async def already_claimed(_request_ref):
+        raise ClaimFailed("that credential was already claimed", code="already_claimed")
+
+    result = await claim_connection("req-1", fetch=already_claimed, store=store)
+
+    assert result["ok"] is True
+    assert result["connected"] is True
+    assert result["connection_ref"] == landed.reference
+
+
+@pytest.mark.asyncio
+async def test_already_claimed_with_nothing_here_is_still_a_failure(tmp_path):
+    """No connection landed, so the credential went somewhere this computer
+    cannot see. Claiming success would be a lie the page would display."""
+    store = store_at(tmp_path)
+
+    async def already_claimed(_request_ref):
+        raise ClaimFailed("that credential was already claimed", code="already_claimed")
+
+    result = await claim_connection("req-1", fetch=already_claimed, store=store)
+
+    assert result["ok"] is False
+    assert result["connected"] is False
+    assert result["stage"] == STAGE_FETCH
+
+
+@pytest.mark.asyncio
+async def test_other_server_refusals_are_not_rechecked_into_success(tmp_path):
+    """Only already_claimed can mean "it already worked"; a not_ready must not
+    be rescued by a connection that happens to be sitting there."""
+    landed = SkeletonConnectionStore(tmp_path / "other.json").save(
+        request_ref="req-1", provider="fake", credential={"token": "stale"}
+    )
+    store = SavedByAnotherCommand(tmp_path / "connection.json", landed)
+
+    async def not_ready(_request_ref):
+        raise ClaimFailed("the credential is not ready yet", code="not_ready")
+
+    result = await claim_connection("req-1", fetch=not_ready, store=store)
+
+    assert result["ok"] is False
+    assert result["stage"] == STAGE_FETCH

@@ -36,7 +36,13 @@ from ...tasks import spawn
 log = logging.getLogger("puffo_agent.control")
 
 # Ops that wait on the network or a slow build run off the receive loop.
-BACKGROUND_OPS = frozenset({"create", "discover_lingtai", "unarchive"})
+BACKGROUND_OPS = frozenset(
+    # connector.claim makes an HTTP round trip (HTTP_TIMEOUT below is 30s total),
+    # and there is one machine-control receive loop — waiting on it here would
+    # stall pause/resume and every other operator. The final result still acks
+    # through the same path, so the page waits for the save, not the dispatch.
+    {"create", "discover_lingtai", "unarchive", "connector.claim"}
+)
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 # Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 from ...crypto.http_session import create_remote_http_session
@@ -24,10 +25,14 @@ from .store import SkeletonConnectionStore
 
 logger = logging.getLogger(__name__)
 
-# PROVISIONAL: path and response field names are awaiting Bob's server
-# contract. Everything above this line is contract-independent; only
-# ``_CLAIM_PATH`` and ``_read_claimed`` change when it lands.
-_CLAIM_PATH = "/v2/machines/connector/claims"
+# Server contract: claim interface v1 (Bob 219652) §2.
+#
+# The request carries NO body. `signed_headers` signs
+# ``POST\n{path}\n{timestamp}\n{nonce}\n`` with zero body bytes appended, and
+# the POST is sent without one — an empty body and a literal ``{}`` are
+# different bytes and would verify differently, so this matches the eight
+# existing machine-signed calls rather than inventing a third convention.
+_CLAIM_ROOT = "/v2/machines/me/oauth-requests"
 
 
 def connection_path() -> Path:
@@ -60,19 +65,13 @@ async def _fetch_from_server(
     base: str, machine: MachineControlIdentity, request_ref: str
 ) -> tuple[str, Any]:
     """Ask the server to hand over the credential prepared for this request."""
-    path = f"{_CLAIM_PATH}/{request_ref}"
+    path = f"{_CLAIM_ROOT}/{quote(request_ref, safe='')}/claim"
     headers = machine_auth.signed_headers(machine, "POST", path)
     try:
         async with create_remote_http_session(base) as session:
             async with session.post(f"{base}{path}", headers=headers) as response:
-                if response.status == 404:
-                    raise ClaimFailed("server has no such claim")
-                if response.status == 410:
-                    raise ClaimFailed("the prepared credential is gone; start again")
                 if response.status != 200:
-                    raise ClaimFailed(
-                        f"server refused the claim ({response.status})"
-                    )
+                    raise _refusal(response.status, await _reason_of(response))
                 return _read_claimed(await response.json())
     except ClaimFailed:
         raise
@@ -80,6 +79,32 @@ async def _fetch_from_server(
         # Reported, not raised: the page has to stop waiting either way, and
         # whether the server already handed the credential out is unknown here.
         raise ClaimFailed(f"claim call did not complete: {type(exc).__name__}") from exc
+
+
+async def _reason_of(response: Any) -> str | None:
+    """The server's structured ``reason``, when the body carries one."""
+    try:
+        body = await response.json()
+    except Exception:  # noqa: BLE001 - an unparseable error body is just no reason
+        return None
+    return body.get("reason") if isinstance(body, dict) else None
+
+
+# Interface v1 §2. 403 is deliberately the same answer for "no such request" and
+# "not this machine" — the server refuses to say which, so neither does this.
+_REFUSALS = {
+    "not_claimable": "this computer cannot claim that request",
+    "not_ready": "the credential is not ready yet",
+    "already_claimed": "that credential was already claimed",
+    "expired": "the prepared credential expired; start again",
+}
+
+
+def _refusal(status: int, reason: str | None) -> ClaimFailed:
+    described = _REFUSALS.get(reason or "")
+    if described is None:
+        return ClaimFailed(f"server refused the claim ({status})", code=reason)
+    return ClaimFailed(described, code=reason)
 
 
 def _read_claimed(payload: Any) -> tuple[str, Any]:

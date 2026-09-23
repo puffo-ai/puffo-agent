@@ -33,11 +33,23 @@ _READ_ERRORS = (OSError, ValueError, KeyError)
 
 
 class ClaimFailed(Exception):
-    """The server could not hand over a credential for this request."""
+    """The server could not hand over a credential for this request.
 
-    def __init__(self, reason: str) -> None:
+    ``code`` is the server's structured reason where it gave one. Only
+    ``already_claimed`` is acted on differently; the rest are reported as-is.
+    """
+
+    def __init__(self, reason: str, code: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.code = code
+
+
+# The one server reason that can mean "this already worked". Two pages clicking
+# at once produce two commands: the first claims and saves, the second is told
+# the credential is gone. Reporting that as a failure would show the user an
+# error for a connection that is in fact up (Boris 219654).
+CODE_ALREADY_CLAIMED = "already_claimed"
 
 
 Fetch = Callable[[str], Awaitable[tuple[str, Any]]]
@@ -85,6 +97,15 @@ async def claim_connection(request_ref: str, *, fetch: Fetch, store: Any) -> dic
     try:
         provider, credential = await fetch(request_ref)
     except ClaimFailed as exc:
+        if exc.code == CODE_ALREADY_CLAIMED:
+            landed = _connection_for(store, request_ref)
+            if landed is not None:
+                logger.info(
+                    "connector: claim %s was claimed by a concurrent command; "
+                    "connection %s is here, reporting connected",
+                    request_ref, landed.reference,
+                )
+                return {"ok": True, "connected": True, "connection_ref": landed.reference}
         return _failure(request_ref, STAGE_FETCH, exc.reason)
 
     try:
@@ -100,6 +121,22 @@ async def claim_connection(request_ref: str, *, fetch: Fetch, store: Any) -> dic
         "connector: claim %s saved as connection %s", request_ref, connection.reference
     )
     return {"ok": True, "connected": True, "connection_ref": connection.reference}
+
+
+def _connection_for(store: Any, request_ref: str) -> Any:
+    """The connection for this request if it is on disk now, else None.
+
+    Re-read rather than reuse the earlier one: the point is that another
+    command may have saved it in the meantime. An unreadable store answers
+    None — this is a second chance, not a place to start diagnosing.
+    """
+    try:
+        existing = store.load()
+    except _READ_ERRORS:
+        return None
+    if existing is not None and existing.request_ref == request_ref:
+        return existing
+    return None
 
 
 def _failure(request_ref: str, stage: str, reason: str) -> dict:
