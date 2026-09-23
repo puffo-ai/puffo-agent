@@ -376,6 +376,16 @@ async def execute_command(
             load_or_create_machine(), server_url.rstrip("/"), usage_refresh=usage_refresh
         )
         return {"ok": True, "posted": posted}
+    if op == "connector.claim":
+        # Machine-level like refresh_usage: a claim concerns this computer's
+        # connection, not one agent. The credential travels server -> daemon
+        # over the claim call and never rides in this command (design v0.4 §3);
+        # the command carries only the request reference.
+        if not server_url:
+            return {"ok": False, "error": "connector.claim: no server_url"}
+        from ..connector.command import run_claim_command
+
+        return await run_claim_command(params, server_url)
     if op == "create":
         return await _create_agent_command(
             params, server_url, paired_root_pubkey, resolve_model=resolve_model,
