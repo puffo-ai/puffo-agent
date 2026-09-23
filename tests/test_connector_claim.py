@@ -199,3 +199,17 @@ async def test_the_claim_command_without_a_server_url_does_not_reach_the_connect
     result = await execute_command("connector.claim", None, {"request_ref": "req-1"})
 
     assert result["ok"] is False
+
+
+def test_an_unrecognised_server_code_is_not_swallowed():
+    """A code the table does not know must still reach the log verbatim.
+
+    Otherwise a newly added or misspelled server code degrades to a bare
+    status — the very reason-loss this contract exists to prevent, and with
+    nothing left to diagnose it by (Boris 219775).
+    """
+    from puffo_agent.portal.connector.command import _refusal
+
+    assert "brand_new_code" in _refusal(409, "brand_new_code").reason
+    # A code the table does know still reads as its own sentence.
+    assert _refusal(409, "not_ready").reason == "the credential is not ready yet"

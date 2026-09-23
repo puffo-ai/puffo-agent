@@ -103,9 +103,19 @@ _REFUSALS = {
 
 
 def _refusal(status: int, reason: str | None) -> ClaimFailed:
+    """Turn the server's refusal into the text the caller and the log will see.
+
+    An unrecognised code keeps its raw value. Dropping it would reproduce
+    exactly the failure this whole contract exists to prevent: a code the table
+    does not know — newly added server-side, or simply spelled differently —
+    would surface as a bare status and leave no way to tell which one it was
+    (Boris 219775). This assumes the contract holds and ``reason`` stays a short
+    stable code; if free text ever arrives there, this is the line that puts it
+    in the log.
+    """
     described = _REFUSALS.get(reason or "")
     if described is None:
-        return ClaimFailed(f"server refused the claim ({status})")
+        return ClaimFailed(f"server refused the claim ({status}, reason={reason!r})")
     return ClaimFailed(described)
 
 
