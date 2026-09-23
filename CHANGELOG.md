@@ -6,6 +6,59 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.8] - 2026-09-22
+
+### Added
+
+- **Unarchive: an archived agent can be brought back, paused.** A new
+  control command, `unarchive {agent_slug, archive_id?}`, advertised with the
+  capability flag `agent_unarchive: true`, moves the agent back from
+  `archived/` on a **new device**. The new device is signed by the agent's root
+  key and installed by the server's machine-authenticated `restore-device`
+  route (puffo-server). The old device stays revoked, or is revoked now. Its
+  keys are kept under `keys/retired/`, so past messages can still be
+  decrypted. Normal and LingTai agents take the same path, and the LingTai
+  runtime binding is kept.
+  - **Retries are safe.** A retry replays the same signed request. A retry
+    whose acknowledgement was lost gets the same answer
+    (`mode: "already_restored"`). A crash at any step, including after the
+    move, finishes on retry without minting another device.
+  - **The old device's revoke is never lost.** It is recorded before the keys
+    change, and an earlier import's unsettled revoke is settled first.
+  - **When the server does not consider the agent archived,** the daemon asks
+    the server whether the archived device is revoked instead of guessing
+    from local files.
+  - **An agent still on disk that the server shows archived** (force-archived
+    while this machine was offline) gets a new device in place. Its worker is
+    stopped, and that stop confirmed, before any key changes.
+  - **Several archives of one agent** return `archive_ambiguous` with
+    `archives: [{archive_id, archived_at}]`. (#406)
+  - **Needs a puffo-server with `restore-device`** (puffo-server #405). An
+    older server has no such route, so the command fails and the archive is
+    left untouched.
+
+- `runtime.auth_mode: subscription` for the **codex** harness: the plan's
+  `auth.json` document (delivered by the provisioner as
+  `CODEX_SUBSCRIPTION_AUTH_JSON`) is written under the agent's `CODEX_HOME`
+  and supersedes any configured gateway. Previously the codex spec refused the
+  mode outright; only claude-code implemented it (PUF-396 §4c).
+
+### Changed
+
+- **Every harness is told to prefer monid for data free access cannot get
+  reliably:** social posts and timelines, live prices, company and people
+  records, and pages behind a login or paywall. Low-stakes facts still use free
+  search. The guidance lives in the shared primer, and codex additionally
+  learns that the tools stay callable under its condensed tool list. Prose only;
+  no spend, quota or wallet logic changed. (#397, #399, #400)
+
+- **A worker stop now says whether the worker really exited.** `Worker.stop`
+  records `stop_confirmed`, which is false when it gave up on the worker task,
+  the adapter or the message client. A client or adapter that failed to close
+  is kept and closed again on the next stop. `docker stop` failures now raise
+  instead of being remembered as a stopped container; a container that no
+  longer exists counts as stopped. (#406)
+
 ### Fixed
 
 - **A cloud agent no longer goes silent after a resume onto another E2B
@@ -17,6 +70,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   rebuilds the session when it moved — before anything is sent, so nothing
   replays — and drops the session on a certificate verification error so
   the next attempt gets a fresh context.
+
+- **A codex model that needs a newer Codex CLI now says so.** The failure is
+  classified as `codex_upgrade_required` with an upgrade-and-restart message,
+  instead of falling through to a generic provider error. (#385)
+
+## [2.0.7] - 2026-09-19
+
+### Fixed
 
 - **A keyless cloud agent can now buy paid data at all.** `monid_prepare` used
   the *signed* POST, which a bridge-transport agent cannot make — its keystore
@@ -58,12 +119,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   at a time is no longer the gate. (PUF-401)
 
 ### Added
-
-- `runtime.auth_mode: subscription` for the **codex** harness: the plan's
-  `auth.json` document (delivered by the provisioner as
-  `CODEX_SUBSCRIPTION_AUTH_JSON`) is written under the agent's `CODEX_HOME`
-  and supersedes any configured gateway. Previously the codex spec refused the
-  mode outright; only claude-code implemented it (PUF-396 §4c).
 
 - **Monid paid-data tools, re-introduced behind a gate.**
   `monid_prepare` (free capability lookup) and `monid_spend` (paid, read-only
