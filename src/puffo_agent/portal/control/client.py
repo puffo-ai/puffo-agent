@@ -35,7 +35,8 @@ from ...tasks import spawn
 
 log = logging.getLogger("puffo_agent.control")
 
-BACKGROUND_OPS = frozenset({"create", "discover_lingtai"})
+# Ops that wait on the network or a slow build run off the receive loop.
+BACKGROUND_OPS = frozenset({"create", "discover_lingtai", "unarchive"})
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 # Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
@@ -325,6 +326,12 @@ async def execute_command(
         "runtime.inspect_recovery", "runtime.stop_recovery", "runtime.retry_recovery",
     }:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
+    if op == "unarchive":
+        # The agent is not under agents/ (that is the point), so it skips the
+        # known-agent gate below; unarchive_agent validates the id itself.
+        from ..unarchive import unarchive_agent
+
+        return await unarchive_agent(agent_slug, params.get("archive_id"))
     if op == "discover_lingtai":
         from .lingtai_discovery import discover_lingtai
 
@@ -665,6 +672,8 @@ def build_capabilities() -> dict:
         },
         "providers": providers,
         "daemon_version": daemon_version,
+        # The portal offers Unarchive only to daemons that implement it.
+        "agent_unarchive": True,
     }
 
 

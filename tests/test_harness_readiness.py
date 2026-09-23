@@ -166,3 +166,9 @@ def test_capabilities_publish_an_explicit_empty_opencode_variant_list(monkeypatc
             "supported_inference_levels": [],
         }],
     }]
+
+
+def test_capabilities_advertise_unarchive(monkeypatch):
+    # The portal offers Unarchive only when the daemon says it can do it.
+    _patch_hosts(monkeypatch, opencode_path="/bin/opencode")
+    assert build_capabilities()["agent_unarchive"] is True
