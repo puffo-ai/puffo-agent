@@ -90,8 +90,10 @@ async def _reason_of(response: Any) -> str | None:
     return body.get("reason") if isinstance(body, dict) else None
 
 
-# Interface v1 §2. 403 is deliberately the same answer for "no such request" and
-# "not this machine" — the server refuses to say which, so neither does this.
+# Interface v1 §2. The server's stable reason code becomes readable text here;
+# nothing branches on it. 403 is deliberately the same answer for "no such
+# request" and "not this machine" — the server refuses to say which, so neither
+# does this.
 _REFUSALS = {
     "not_claimable": "this computer cannot claim that request",
     "not_ready": "the credential is not ready yet",
@@ -103,8 +105,8 @@ _REFUSALS = {
 def _refusal(status: int, reason: str | None) -> ClaimFailed:
     described = _REFUSALS.get(reason or "")
     if described is None:
-        return ClaimFailed(f"server refused the claim ({status})", code=reason)
-    return ClaimFailed(described, code=reason)
+        return ClaimFailed(f"server refused the claim ({status})")
+    return ClaimFailed(described)
 
 
 def _read_claimed(payload: Any) -> tuple[str, Any]:
