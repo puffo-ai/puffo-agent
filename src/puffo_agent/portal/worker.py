@@ -1494,17 +1494,23 @@ class Worker:
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
+    # A client whose stop() failed: out of ``_client`` (nothing may use it)
+    # but kept, so the next stop() tries again instead of calling it closed.
+    _unclosed_client = None
+
     async def _close_client(self) -> bool:
         """Release a partially or fully started message client.
 
-        False when it did not close cleanly."""
-        if self._client is None:
+        False when it did not close cleanly; it is then retried next time."""
+        client = self._client if self._client is not None else self._unclosed_client
+        if client is None:
             return True
+        self._client = None
         closed = True
         # Release WS + SQLite handles. Required on Windows so
         # ``messages.db*`` is renamable by ``agent archive``.
         try:
-            await asyncio.wait_for(self._client.stop(), timeout=10.0)
+            await asyncio.wait_for(client.stop(), timeout=10.0)
         except asyncio.TimeoutError:
             closed = False
             logger.warning(
@@ -1518,7 +1524,7 @@ class Worker:
                 self.agent_cfg.id,
                 exc,
             )
-        self._client = None
+        self._unclosed_client = None if closed else client
         return closed
 
     def _runtime_info(self) -> dict[str, object]:

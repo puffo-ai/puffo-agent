@@ -819,14 +819,22 @@ class DockerRuntimePreparer:
         """Stop the container once the Driver transport has terminated."""
         if self._container_stopped:
             return
-        self._container_stopped = True
         # ``docker stop`` (not ``rm -f``) preserves the container's fs —
         # codex home, sessions, config — so the next start resumes cleanly.
         # ``-t 5`` bounds the SIGTERM grace inside Worker.stop's 30s budget.
-        await run_cmd(
+        returncode, _stdout, stderr = await run_cmd(
             [self._docker_bin, "stop", "-t", "5", self.container_name],
             check=False,
         )
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        # A container that no longer exists is stopped; anything else that
+        # failed is not, and must stay retryable rather than be remembered
+        # as done (unarchive swaps keys only after a confirmed stop).
+        if returncode != 0 and "No such container" not in detail:
+            raise RuntimeError(
+                f"docker stop {self.container_name} failed ({returncode}): {detail[:300]}"
+            )
+        self._container_stopped = True
 
 
 __all__ = [

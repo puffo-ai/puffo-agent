@@ -903,3 +903,108 @@ async def test_both_revoke_obligations_survive_an_interruption_between_them(stub
     result = await unarchive.unarchive_agent(AGENT, archive.name)
     assert result["ok"] and not result["old_device_revoke_pending"]
     assert stub.revokes == ["dev_older", old.device_id, old.device_id], "earlier not repeated"
+
+
+# ── review round 4 ──
+
+async def test_a_client_that_failed_to_close_is_retried_not_forgotten():
+    import asyncio
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.worker import Worker
+
+    attempts = []
+
+    class Client:
+        async def stop(self):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise OSError("client still open")
+
+    w = Worker.__new__(Worker)
+    w._stop = asyncio.Event()
+    w._task = None
+    w._adapter = None
+    w._client = Client()
+    w.agent_cfg = SimpleNamespace(id=AGENT)
+    w.runtime = SimpleNamespace(status="running", save=lambda _id: None)
+    for _ in range(2):
+        await w.stop()
+        assert w.stop_confirmed is False
+        assert w._client is None, "a failed client must not stay usable"
+    await w.stop()
+    assert w.stop_confirmed is True and len(attempts) == 3
+    await w.stop()
+    assert w.stop_confirmed is True and len(attempts) == 3, "closed once, not again"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "stopped"),
+    [
+        (0, b"", True),
+        (1, b"Error response from daemon: No such container: x", True),
+        (1, b"Cannot connect to the Docker daemon", False),
+    ],
+)
+async def test_docker_stop_counts_only_when_the_container_is_stopped(
+    monkeypatch, returncode, stderr, stopped,
+):
+    from puffo_agent.agent.harness.runtime import docker_runtime
+
+    calls = []
+
+    async def run_cmd(cmd, check=True, **kwargs):
+        calls.append(cmd)
+        return returncode, b"", stderr
+
+    monkeypatch.setattr(docker_runtime, "run_cmd", run_cmd)
+    prep = docker_runtime.DockerRuntimePreparer.__new__(docker_runtime.DockerRuntimePreparer)
+    prep._container_stopped = False
+    prep._docker_bin = "docker"
+    prep.container_name = "puffo-x"
+    if stopped:
+        await prep.aclose()
+        await prep.aclose()
+        assert prep._container_stopped and len(calls) == 1
+    else:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="docker stop puffo-x failed"):
+                await prep.aclose()
+        assert not prep._container_stopped and len(calls) == 2, "retried, not remembered as done"
+
+
+async def test_the_as_is_path_keeps_an_earlier_imports_revoke(stub):
+    archive, old, _ = make_archive()
+    (archive / ".puffo-agent" / "pending_revoke.json").write_text(
+        json.dumps({"old_device_id": "dev_earlier", "last_error": "x"}))
+    stub.restore_error = unarchive.UnarchiveError("not_archived_on_server", "not archived")
+    stub.device = {"known": True, "revoked": False}
+    result = await unarchive.unarchive_agent(AGENT, archive.name)
+    assert result["ok"] and result["device_id"] == old.device_id
+    assert result["old_device_revoke_pending"]
+    # Back under agents/, where revoke-pending settles it with the live device.
+    assert _marker(agent_dir(AGENT))["old_device_id"] == "dev_earlier"
+
+
+async def test_the_as_is_path_interrupted_before_the_record_finishes_as_is(stub, monkeypatch):
+    archive, old, _ = make_archive()
+    selected = archive.name
+    stub.restore_error = unarchive.UnarchiveError("not_archived_on_server", "not archived")
+    stub.device = {"known": True, "revoked": False}
+    real_done = unarchive._write_done
+
+    def crash(*args, **kwargs):
+        raise Crash()
+
+    monkeypatch.setattr(unarchive, "_write_done", crash)
+    with pytest.raises(Crash):
+        await unarchive.unarchive_agent(AGENT, selected)
+    monkeypatch.setattr(unarchive, "_write_done", real_done)
+    result = await unarchive.unarchive_agent(AGENT, selected)
+    assert result["ok"] and result["device_id"] == old.device_id
+    assert result["restored_from"] == selected
+    assert len(stub.restores) == 1, "the retry must not go to restore-device"
+    assert stub.revokes == []
+    home = agent_dir(AGENT)
+    assert KeyStore(home / "keys").load_identity(SLUG).device_id == old.device_id
+    assert not (home / ".puffo-agent" / unarchive.STATE_FILE).exists()

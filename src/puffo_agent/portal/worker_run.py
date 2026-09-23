@@ -585,10 +585,13 @@ class StandardWorkerRun:
             try:
                 await worker._adapter.aclose()
             except Exception:
+                # Kept: Worker.stop() retries the close, and reports the stop
+                # unconfirmed until it succeeds.
                 logger.exception(
                     "agent %s: failed to close adapter after init error", agent_id
                 )
-            worker._adapter = None
+            else:
+                worker._adapter = None
         await worker._close_client()
         if outbox is not None:
             outbox.close()
@@ -695,10 +698,13 @@ class StandardWorkerRun:
         try:
             await worker._adapter.aclose()
         except Exception:
+            # Kept: Worker.stop() retries the close, and reports the stop
+            # unconfirmed until it succeeds.
             logger.exception(
                 "agent %s: failed to close Driver after warm error", agent_id
             )
-        worker._adapter = None
+        else:
+            worker._adapter = None
         await worker._close_client()
         context.runtime_event_outbox.close()
 
@@ -1177,7 +1183,9 @@ class StandardWorkerRun:
             )
             return
         except Exception:
+            # Left for stop() to retry, like the timeout above.
             logger.exception(
                 "agent %s: failed to close local Driver during cleanup", agent_id
             )
+            return
         worker._adapter = None

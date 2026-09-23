@@ -433,8 +433,9 @@ async def _restore_unrevoked(
     Nothing local can tell them apart — a revoke whose response was lost
     leaves the same marker as one never sent — so ask the server whether the
     archived device is revoked. Still valid: bring it back as it is, no new
-    device. Revoked (or unknown): refuse; it can only come back through a
-    new device, which needs the server to consider it archived.
+    device (``restore-device`` would refuse anyway). Revoked (or unknown):
+    refuse; it can only come back through a new device, which needs the
+    server to consider it archived.
     """
     device = await _device_status(identity.server_url, identity.slug, identity.device_id)
     if not device["known"] or device["revoked"]:
@@ -444,22 +445,41 @@ async def _restore_unrevoked(
             f"{'revoked' if device['revoked'] else 'unknown to the server'}, "
             "so it can only return on a new device once the server shows it archived",
         )
+    # Recorded before the move, and it travels with the directory: a retry
+    # naming this archive after the move finishes *this* path, never
+    # restore-device.
+    state = _load_state(archive)
+    state.update(as_is=True, restored_from=archive.name)
+    _save_state(archive, state)
     dot = archive / ".puffo-agent"
-    for leftover in ("archive.flag", "pending_revoke.json"):
-        try:
-            (dot / leftover).unlink()
-        except FileNotFoundError:
-            pass
+    dot.joinpath("archive.flag").unlink(missing_ok=True)
+    # The archive's own marker is about this very device, which stays valid.
+    # An earlier import's obligation (import schema) is kept: back under
+    # agents/, revoke-pending settles it with this live device.
+    marker = dot / "pending_revoke.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = None
+    except (OSError, ValueError) as exc:
+        raise UnarchiveError("archive_unreadable", f"pending_revoke.json unreadable: {exc}") from exc
+    if isinstance(payload, dict) and payload.get("kind") == "archive_self_revoke":
+        marker.unlink()
     _prepare_yml(archive, identity.device_id)
     target = _move_back(agent_id, archive)
-    _write_done(target, archive.name, identity.device_id)
+    return await _finish_as_is(agent_id, target, identity.device_id, archive.name)
+
+
+async def _finish_as_is(agent_id: str, target: Path, device_id: str, restored_from: str) -> dict:
+    owed = (target / ".puffo-agent" / "pending_revoke.json").exists()
+    _write_done(target, restored_from, device_id, old_device_revoke_pending=owed)
     _discard_state(target)
     reported = await _report_paused(agent_id)
     logger.info("unarchive %s: archived device still valid; restored as is", agent_id)
     return {
         "ok": True, "agent_slug": agent_id, "state": "paused", "mode": "restored",
-        "device_id": identity.device_id, "restored_from": archive.name,
-        "old_device_revoke_pending": False, "status_reported": reported,
+        "device_id": device_id, "restored_from": restored_from,
+        "old_device_revoke_pending": owed, "status_reported": reported,
     }
 
 
@@ -658,10 +678,18 @@ async def _unarchive_locked(agent_id: str, archive_id: str | None) -> dict:
             if retried is not None:
                 return retried
             archive = agent_dir(agent_id)
-            if archive_id is not None and _load_state(archive).get("restored_from") != archive_id:
+            state = _load_state(archive)
+            if archive_id is not None and state.get("restored_from") != archive_id:
                 raise UnarchiveError(
                     "agent_exists", f"agent {agent_id!r} is on this machine; not restoring an archive over it",
                 )
+            if state.get("as_is"):
+                # Brought back on its still-valid device and interrupted
+                # before the completion record: finish that, nothing else.
+                from .state import AgentConfig
+
+                device_id = AgentConfig.load(agent_id).puffo_core.device_id
+                return await _finish_as_is(agent_id, archive, device_id, state["restored_from"])
             # Either only the server considers it archived, or this is the
             # restore of that archive, interrupted after the move: its staging
             # moved with it and the same steps finish it.
