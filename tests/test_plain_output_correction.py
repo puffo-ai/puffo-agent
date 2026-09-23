@@ -174,3 +174,115 @@ async def test_a_turn_that_calls_send_message_is_never_corrected(tmp_path):
 
     assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
     assert adapter.retries == 0
+
+
+# ── ben-frankl 2026-09-23: a send the daemon committed must count as a send ──
+#
+# The harness drivers behind the cli-local runtime never report
+# ``send_message_targets``, so every cloud turn that ended in a closing
+# sentence looked undelivered and earned the corrective ask. gpt-5.6-luna took
+# "send the answer you already wrote" literally and posted the same DM reply
+# twice (msg_2d97169f then msg_3d397bed, 20:57:52 and 20:57:57 UTC). The
+# daemon's own send ledger is the second witness.
+
+
+@pytest.mark.asyncio
+async def test_a_send_committed_through_the_daemon_ledger_is_never_corrected(
+    tmp_path, caplog
+):
+    """Closing prose after a real send is discarded, not re-asked."""
+
+    class ProseAfterSendAdapter:
+        def __init__(self):
+            self.retries = 0
+
+        async def run_turn(self, _ctx):
+            # The driver saw the model's send_message tool call go through
+            # the daemon RPC, but reports nothing about it — only the prose.
+            return TurnResult(
+                reply="Sent the comparison to Shan.",
+                metadata={"assistant_text_parts": ["Sent the comparison to Shan."]},
+            )
+
+        async def run_retry_turn(self, _kick, _fallback, _ctx):
+            self.retries += 1
+            return TurnResult(reply="", metadata={})
+
+    adapter = ProseAfterSendAdapter()
+    agent = PuffoAgent(
+        adapter=adapter,
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+    )
+    agent.send_ledger = lambda: 1  # the daemon committed one send this turn
+
+    with caplog.at_level(logging.INFO):
+        assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
+    assert adapter.retries == 0, "no corrective ask after a committed send"
+    assert "[no-send]" not in caplog.text
+    assert "[undelivered]" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_empty_ledger_still_corrects_plain_output(tmp_path):
+    """The ledger only adds a witness; zero sends keeps PUF-400 behaviour."""
+
+    class ProseAdapter:
+        def __init__(self):
+            self.retries = 0
+
+        async def run_turn(self, _ctx):
+            return TurnResult(
+                reply="Tokyo.", metadata={"assistant_text_parts": ["Tokyo."]}
+            )
+
+        async def run_retry_turn(self, _kick, _fallback, _ctx):
+            self.retries += 1
+            return TurnResult(
+                reply="sent", metadata={"send_message_targets": ["ch_general"]}
+            )
+
+    adapter = ProseAdapter()
+    agent = PuffoAgent(
+        adapter=adapter,
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+    )
+    agent.send_ledger = lambda: 0
+
+    assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
+    assert adapter.retries == 1
+
+
+@pytest.mark.asyncio
+async def test_a_broken_ledger_probe_never_blocks_routing(tmp_path):
+    """A probe that raises is treated as 'no witness', not as a crash."""
+
+    class ProseAdapter:
+        def __init__(self):
+            self.retries = 0
+
+        async def run_turn(self, _ctx):
+            return TurnResult(
+                reply="Tokyo.", metadata={"assistant_text_parts": ["Tokyo."]}
+            )
+
+        async def run_retry_turn(self, _kick, _fallback, _ctx):
+            self.retries += 1
+            return TurnResult(
+                reply="sent", metadata={"send_message_targets": ["ch_general"]}
+            )
+
+    adapter = ProseAdapter()
+    agent = PuffoAgent(
+        adapter=adapter,
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+    )
+
+    def _boom() -> int:
+        raise RuntimeError("ledger gone")
+
+    agent.send_ledger = _boom
+    assert await agent.handle_global_inbox_turn(_planned_one_channel()) is None
+    assert adapter.retries == 1

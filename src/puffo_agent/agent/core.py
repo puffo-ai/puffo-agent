@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
@@ -95,6 +97,15 @@ class PuffoAgent:
         # send_message, so the caller can correct the model once (PUF-400).
         # Cleared at the start of every route; never read across turns.
         self._dropped_plain_output: str | None = None
+        # Committed sends of the current turn, as counted by the daemon that
+        # actually posted them. The harness drivers behind the cli-local
+        # runtime never report ``send_message_targets`` in a turn result,
+        # so without this hook every turn that ends in a closing sentence
+        # looked undelivered and earned the corrective ask — which a literal
+        # model answers by posting the same reply twice (ben-frankl, 2026-09-23).
+        # The worker wires it to the inbox runtime's send ledger; ``None``
+        # (tests, legacy adapters) falls back to the metadata alone.
+        self.send_ledger: Callable[[], int] | None = None
 
         # Conversation log shared across all channels.
         self.log: list[dict] = []
@@ -234,6 +245,26 @@ class PuffoAgent:
             )
         return reply
 
+    def _send_message_called(self, result) -> bool:
+        """Did this turn post through ``send_message``?
+
+        Two witnesses, either suffices: the adapter's own report
+        (``send_message_targets``, populated by the legacy CLI session
+        adapter) or the daemon's send ledger, which counts the RPC commits
+        it made on the model's behalf during the current turn. The cloud
+        drivers only ever satisfy the second.
+        """
+        if bool(result.metadata.get("send_message_targets")):
+            return True
+        probe = self.send_ledger
+        if probe is None:
+            return False
+        try:
+            return int(probe()) > 0
+        except Exception:  # noqa: BLE001 — a broken probe must not block routing
+            self.logger.debug("send ledger probe failed", exc_info=True)
+            return False
+
     async def _correct_missing_send_message(
         self,
         planned,
@@ -281,7 +312,7 @@ class PuffoAgent:
             on_progress=on_progress,
         )
         result = await self.adapter.run_retry_turn(kick, planned.provider_input, ctx)
-        if bool(result.metadata.get("send_message_targets")):
+        if self._send_message_called(result):
             self.logger.info(
                 "[corrected] [global inbox]: send_message called on the "
                 "second ask; the answer was delivered"
@@ -344,7 +375,7 @@ class PuffoAgent:
             planned.provider_input,
             ctx,
         )
-        send_message_called = bool(result.metadata.get("send_message_targets"))
+        send_message_called = self._send_message_called(result)
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
         if send_message_called:
             if result.reply:
@@ -438,7 +469,7 @@ class PuffoAgent:
         # Route reply the same way as a normal turn so the consumer
         # picks up AgentAPIError again on consecutive rate-limit
         # failures.
-        send_message_called = bool(result.metadata.get("send_message_targets"))
+        send_message_called = self._send_message_called(result)
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
         if send_message_called:
             if result.reply:
@@ -553,7 +584,7 @@ class PuffoAgent:
         from ..portal.control.reporter import get_reporter
 
         self._dropped_plain_output = None
-        send_message_called = bool(result.metadata.get("send_message_targets"))
+        send_message_called = self._send_message_called(result)
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
         if send_message_called:
             self.logger.debug(

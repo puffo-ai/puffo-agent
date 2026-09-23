@@ -895,6 +895,11 @@ class StandardWorkerRun:
         global_runtime.send_delegate = TrackingSendDelegate(
             coordinator, global_runtime.attempts, global_runtime
         )
+        # Let the routing shell see the sends this daemon committed during
+        # the turn, so a closing sentence after a real send is not mistaken
+        # for an undelivered answer (the drivers do not report tool calls).
+        attempts = global_runtime.attempts
+        context.puffo.send_ledger = lambda: attempts.states.count("sent")
         client.global_runtime = global_runtime
         client.send_coordinator = coordinator
         client.send_delegate = global_runtime.send_delegate
