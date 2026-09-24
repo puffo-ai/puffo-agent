@@ -144,3 +144,26 @@ def _failure(request_ref: str, stage: str, reason: str) -> dict:
     """Log where and why, keyed by the reference tying the two ends together."""
     logger.error("connector: claim %s failed at %s: %s", request_ref, stage, reason)
     return {"ok": False, "connected": False, "stage": stage, "reason": reason}
+
+
+async def replace_credential(reference: str, credential: Any, *, store: Any) -> Any:
+    """Write a refreshed credential onto the connection already on this computer.
+
+    Shares the claim lock rather than taking one of its own. ``store.update``
+    reads, compares and writes, which is no more atomic than the claim's
+    read-then-save above; two separate locks would serialise each entry point
+    against itself and leave the pair free to interleave — the same hole
+    Boris 219713 found between two claims, one door further along.
+
+    Raises ``StaleConnection`` (from the store) when the named connection is
+    not the one here. Nothing is written in that case and the caller's only
+    sound move is to drop the credential it holds: it belongs to a connection
+    this computer no longer has.
+
+    Unlike ``claim_connection`` this raises rather than returning a result
+    dict. There is no page waiting on it — a refresh is the daemon's own
+    errand, not an answer to a notification — so the caller is code that can
+    handle a failure, not a UI that must stop spinning.
+    """
+    async with _claim_lock():
+        return store.update(reference=reference, credential=credential)
