@@ -902,8 +902,11 @@ def test_a_move_never_overwrites_something_that_arrived_first(monkeypatch, tmp_p
     # The newer credential survived and is what the caller got.
     assert loaded.credential == {"refresh_token": "NEWER"}
     assert fake.items[key] == newer
-    # And the superseded file is gone rather than left in the clear.
-    assert files_holding(tmp_path, SENTINEL) == []
+    # The file is NOT swept: same connection, different credential, and
+    # nothing here can establish that the file holds nothing newer. It cost
+    # the plaintext staying on disk, which is the trade 測試姬 221378 argued
+    # for and this cell records rather than hides.
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
 
 
 def test_a_refused_move_is_not_retried_on_every_read(monkeypatch, tmp_path):
@@ -982,12 +985,11 @@ def test_a_read_that_converges_does_not_need_the_keychain_twice(monkeypatch, tmp
     the once-per-process guard exists to prevent.
     """
     legacy = tmp_path / "connection.json"
-    # One connection, two copies — which is the only shape that gets swept.
-    legacy.write_bytes(b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":1}}')
+    # Byte-identical copies — the only shape that gets swept on a read.
+    one_record = b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":1}}'
+    legacy.write_bytes(one_record)
     fake = FakeSecurity()
-    fake.items[("Puffo Agent-connector", "mac_testmachine")] = (
-        b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":2}}'
-    )
+    fake.items[("Puffo Agent-connector", "mac_testmachine")] = one_record
     store = keychain_over(monkeypatch, fake, legacy)
 
     store.load()
@@ -1300,18 +1302,17 @@ def test_a_disconnect_still_clears_both_copies_while_a_conflict_is_present(
     assert fake.items == {}
 
 
-def test_the_same_reference_does_not_decide_which_credential_is_usable(
-    monkeypatch, tmp_path
+def test_one_connection_with_two_credentials_is_answered_but_not_swept(
+    monkeypatch, tmp_path, caplog
 ):
-    """The residual, recorded as behaviour rather than asserted away.
+    """The two legs need different propositions, and only one is available.
 
-    Jeff 221374 built this to falsify a sentence in the docstring that said
-    the cost of guessing wrong here is "a refresh, not a connection". The
-    Keychain holds an older credential, the file a newer one under the same
-    reference: ``load`` answers with the older and deletes the newer, and
-    nothing here knows whether the survivor still works. This cell exists so
-    that reading the code and reading the doc give the same answer, and so a
-    later change of resolution cannot happen quietly.
+    Jeff 221374 measured the version that deleted here: the Keychain holding
+    an older credential and the file a newer one under one reference, and the
+    newer one gone. Answering from the Keychain is sound — the connection's
+    identity is not in doubt — but deleting needs "the file holds nothing the
+    Keychain does not", which matching references do not give and this daemon
+    cannot establish (測試姬 221378). So it answers and keeps.
     """
     legacy = tmp_path / "connection.json"
     legacy.write_bytes(
@@ -1326,8 +1327,47 @@ def test_the_same_reference_does_not_decide_which_credential_is_usable(
     )
     store = keychain_over(monkeypatch, fake, legacy)
 
-    loaded = store.load()
+    with caplog.at_level(logging.ERROR, logger=keychain_store.__name__):
+        loaded = store.load()
 
+    # Answered from the Keychain: one connection, and that is the copy in use.
     assert loaded.credential == {"refresh_token": "OLDER-IN-THE-KEYCHAIN"}
-    assert not legacy.exists()
-    assert files_holding(tmp_path, "NEWER-IN-THE-FILE") == []
+    # Not deleted: it may be the only credential the provider still honours.
+    assert files_holding(tmp_path, "NEWER-IN-THE-FILE") == [legacy]
+    # And not silent, because it is a credential left readable on disk.
+    assert "different credentials for connection r" in caplog.text
+
+
+def test_a_conflict_is_loud_enough_to_tell_apart_from_a_flaky_read(
+    monkeypatch, tmp_path, caplog
+):
+    """A wedged computer must not look like "try again".
+
+    The claim maps a conflict to the same ``read_local`` stage as any other
+    unreadable store, so from the page it is indistinguishable from a
+    transient failure — and a disconnect, which is the way out, only happens
+    if someone knows to do it (測試姬 221378). The references are minted here
+    and are not credentials, so naming them is what makes the state
+    diagnosable at all.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake,
+        b'{"reference":"someone-else","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"STALE"}}',
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    with caplog.at_level(logging.ERROR, logger=keychain_store.__name__):
+        with pytest.raises(ConflictingConnections):
+            store.load()
+
+    said = caplog.text
+    assert "two records naming different connections" in said
+    assert "someone-else" in said
+    assert SkeletonConnectionStore(legacy).load().reference in said
+    # The way out is named, since nothing else on this path will name it.
+    assert "disconnect" in said
+    # And the credential itself never reaches the log.
+    assert SENTINEL not in said
