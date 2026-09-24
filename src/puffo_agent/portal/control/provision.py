@@ -393,9 +393,11 @@ async def provision_agent_from_bundle(
     if launch is not None:
         try:
             validate_import_profile(payload, launch.agent_dir)
+            # Reject unsupported or ambiguous resident runtimes before a
+            # provision/revoke pair can leave this source marked revoked.
+            context["runtime"].lingtai_attach = await resident_lingtai_available(launch)
             try:
                 await provision_lingtai(launch)
-                context["runtime"].lingtai_attach = await resident_lingtai_available(launch)
             except BaseException:
                 # Registration may be committed before the CLI exits. A lost
                 # result must revoke this attempt's binding before a retry.

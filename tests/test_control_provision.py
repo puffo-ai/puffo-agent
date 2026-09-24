@@ -636,20 +636,41 @@ async def test_lingtai_probe_distinguishes_listening_and_absent_socket(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_lingtai_probe_failure_revokes_binding_before_materialization(
+async def test_old_lingtai_kernel_can_retry_same_source_after_upgrade(
     lingtai_creation, monkeypatch,
 ):
-    """An ambiguous resident must not leave a bound Agent saved in spawn mode."""
+    """An unsupported kernel must not leave a revoked binding that blocks retry."""
     payload, operator, associations = lingtai_creation
+    calls = []
+
+    async def register(launch):
+        calls.append("provision")
+        associations.add((launch.runtime_id, launch.registry))
+
+    async def revoke(launch):
+        calls.append("revoke")
+        associations.remove((launch.runtime_id, launch.registry))
+
+    monkeypatch.setattr(provision, "provision_lingtai", register)
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
 
     async def failed_probe(_launch):
-        raise ValueError("LingTai resident ACP socket is unavailable")
+        raise ValueError("LingTai kernel 1.0.9 or newer is required for Load Agent attach")
 
     monkeypatch.setattr(provision, "resident_lingtai_available", failed_probe)
-    with pytest.raises(ProvisionError, match="resident ACP socket is unavailable"):
+    with pytest.raises(ProvisionError, match="kernel 1.0.9 or newer is required"):
         await provision_agent_from_bundle(payload, operator)
+    assert calls == [], "an unsupported kernel must not write or revoke a registry binding"
     assert not associations
     assert not (Path(os.environ["PUFFO_AGENT_HOME"]) / "agents/helper-1234/agent.yml").exists()
+
+    async def upgraded_probe(_launch):
+        return False
+
+    monkeypatch.setattr(provision, "resident_lingtai_available", upgraded_probe)
+    result = await provision_agent_from_bundle(payload, operator)
+    assert calls == ["provision"]
+    assert AgentConfig.load(result["agent_id"]).runtime.lingtai_attach is False
 
 
 @pytest.mark.asyncio
