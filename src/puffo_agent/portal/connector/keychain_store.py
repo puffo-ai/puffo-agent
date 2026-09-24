@@ -369,6 +369,14 @@ class KeychainConnectionStore(ConnectionStore):
         goes. Anything else refuses both halves and leaves both copies
         (``LocalCopiesDisagree``).
 
+        The comparison is on bytes, which is exact only because ``_encode`` is
+        the one thing that ever produces a record — same key order, same
+        separators, every time. Two records that mean the same thing but were
+        serialised differently would be called a conflict (Jeff 221387). Within
+        one version that cannot happen by construction; across versions it is
+        precisely the upgrade hazard, and it says that changing the
+        serialisation is not a free refactor here.
+
         What refusing costs, since it is not free either. A ``save`` or
         ``update`` whose Keychain write landed and whose sweep did **not**
         leaves two copies of one connection with different credentials — and

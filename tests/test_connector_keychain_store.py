@@ -1410,3 +1410,54 @@ def test_the_two_disagreements_are_different_types(monkeypatch, tmp_path):
     assert issubclass(ConflictingCredentials, keychain_store.LocalCopiesDisagree)
     assert not issubclass(ConflictingCredentials, ConflictingConnections)
     assert not issubclass(ConflictingConnections, ConflictingCredentials)
+
+
+def a_store_whose_copies_disagree(monkeypatch, tmp_path, *, same_connection: bool):
+    """Two local copies that cannot be reconciled, one way or the other."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    reference = SkeletonConnectionStore(legacy).load().reference
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake,
+        json.dumps(
+            {
+                "reference": reference if same_connection else "someone-else",
+                "request_ref": "q",
+                "provider": "google",
+                "credential": {"refresh_token": "OTHER"},
+            }
+        ).encode(),
+    )
+    return keychain_over(monkeypatch, fake, legacy)
+
+
+@pytest.mark.parametrize(
+    "same_connection, expected",
+    [(True, "ConflictingCredentials"), (False, "ConflictingConnections")],
+    ids=["two-credentials", "two-connections"],
+)
+@pytest.mark.asyncio
+async def test_the_claim_carries_which_disagreement_it_was(
+    monkeypatch, tmp_path, same_connection, expected
+):
+    """The type name is the only distinguisher that reaches the caller.
+
+    Every local-read failure lands on one stage, so the stage says "unreadable"
+    for a flaky read and for a computer nothing but a disconnect will unstick.
+    Jeff 221379 set "a stable, distinguishable error type" as the bar and
+    221387 measured that it holds here — but nothing in this suite was holding
+    it, so a later tidy-up of that message would take the distinction away and
+    stay green.
+    """
+    store = a_store_whose_copies_disagree(monkeypatch, tmp_path, same_connection=same_connection)
+
+    async def must_not_be_called(request_ref):
+        raise AssertionError("nothing is claimable while the copies disagree")
+
+    answer = await claim_connection("req-new", fetch=must_not_be_called, store=store)
+
+    assert answer["ok"] is False
+    assert answer["stage"] == STAGE_READ_LOCAL
+    assert expected in answer["reason"]
+    # And the credential does not ride out on the reason string.
+    assert SENTINEL not in answer["reason"]

@@ -113,6 +113,15 @@ async def _claim_while_locked(request_ref: str, *, fetch: Fetch, store: Any) -> 
     except _READ_ERRORS as exc:
         # Not the same as "no connection": that answer would invite the save
         # below to overwrite a credential this computer could not read.
+        #
+        # The exception's class name is load-bearing, not decoration. Every
+        # local-read failure lands on this one stage, so the stage cannot tell
+        # a flaky read from a computer whose two copies disagree and which
+        # nothing but a disconnect will unstick — and those need different
+        # things done about them. The class name is the only thing that
+        # survives to the caller that distinguishes them (Jeff 221379 set that
+        # as the bar; 221387 measured that it holds). The message is not read;
+        # the type name is.
         return _failure(
             request_ref, STAGE_READ_LOCAL, f"local store unreadable: {type(exc).__name__}"
         )
