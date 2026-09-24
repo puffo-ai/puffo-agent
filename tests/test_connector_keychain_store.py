@@ -33,6 +33,7 @@ from puffo_agent.portal.connector import store as store_module
 from puffo_agent.portal.connector.store import SkeletonConnectionStore
 from puffo_agent.portal.connector.keychain_store import (
     ConflictingConnections,
+    ConflictingCredentials,
     KeychainConnectionStore,
     KeychainUnavailable,
     SupersededCopyRemains,
@@ -829,32 +830,27 @@ def test_a_write_whose_sweep_failed_is_still_committed(monkeypatch, tmp_path):
     legacy = a_computer_that_connected_before_the_switch(tmp_path)
     fake = FakeSecurity()
     store = keychain_over(monkeypatch, fake, legacy)
-    reference = store.load().reference
-    # The migration on that read already swept it; put a copy back so the
-    # sweep in the update below has something to fail on. The same reference,
-    # because a file naming a different connection is now refused before any
-    # of this — that is a different cell, below.
-    legacy.write_bytes(
-        json.dumps(
-            {
-                "reference": reference,
-                "request_ref": "r",
-                "provider": "p",
-                "credential": {"t": 1},
-            }
-        ).encode()
-    )
 
     def cannot_unlink(self, missing_ok=False):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(Path, "unlink", cannot_unlink)
+    # The migration writes and verifies but cannot remove the file, so the two
+    # copies are byte-identical with the file still there — which is the state
+    # the update below then makes differ.
+    reference = store.load().reference
 
-    with pytest.raises(OSError):
+    with pytest.raises(SupersededCopyRemains):
         store.update(reference=reference, credential={"refresh_token": "second"})
 
-    # Committed anyway: this is what the caller has to know.
-    assert store.load().credential == {"refresh_token": "second"}
+    # Committed anyway: this is what the caller has to know. Read out of the
+    # Keychain rather than through ``load``, because the un-swept file now
+    # holds a second credential for this connection and ``load`` refuses to
+    # pick between them — the cost of failing closed, pinned in its own cell.
+    item = json.loads(fake.items[("Puffo Agent-connector", "mac_testmachine")])
+    assert item["credential"] == {"refresh_token": "second"}
+    with pytest.raises(ConflictingCredentials):
+        store.load()
 
 
 # ---------------------------------------------------------------------------
@@ -897,15 +893,15 @@ def test_a_move_never_overwrites_something_that_arrived_first(monkeypatch, tmp_p
     monkeypatch.setattr(keychain_store.subprocess, "run", a_refresh_lands_in_between)
     store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
 
-    loaded = store.load()
+    # Refused rather than answered — but the property this cell is about is
+    # that the older file value never lands on top of the newer Keychain one,
+    # and that is what the assertions below check.
+    with pytest.raises(ConflictingCredentials):
+        store.load()
 
-    # The newer credential survived and is what the caller got.
-    assert loaded.credential == {"refresh_token": "NEWER"}
     assert fake.items[key] == newer
-    # The file is NOT swept: same connection, different credential, and
-    # nothing here can establish that the file holds nothing newer. It cost
-    # the plaintext staying on disk, which is the trade 測試姬 221378 argued
-    # for and this cell records rather than hides.
+    # Neither copy deleted: which of the two the provider still honours is not
+    # knowable from here, so neither is thrown away.
     assert files_holding(tmp_path, SENTINEL) == [legacy]
 
 
@@ -1231,22 +1227,12 @@ def test_a_write_that_landed_but_could_not_sweep_says_so_by_its_type(monkeypatch
     legacy = a_computer_that_connected_before_the_switch(tmp_path)
     fake = FakeSecurity()
     store = keychain_over(monkeypatch, fake, legacy)
-    reference = store.load().reference
-    legacy.write_bytes(
-        json.dumps(
-            {
-                "reference": reference,
-                "request_ref": "r",
-                "provider": "p",
-                "credential": {"t": 1},
-            }
-        ).encode()
-    )
 
     def cannot_unlink(self, missing_ok=False):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(Path, "unlink", cannot_unlink)
+    reference = store.load().reference
 
     with pytest.raises(SupersededCopyRemains):
         store.update(reference=reference, credential={"refresh_token": "second"})
@@ -1302,17 +1288,18 @@ def test_a_disconnect_still_clears_both_copies_while_a_conflict_is_present(
     assert fake.items == {}
 
 
-def test_one_connection_with_two_credentials_is_answered_but_not_swept(
+def test_one_connection_with_two_credentials_is_refused_and_nothing_is_deleted(
     monkeypatch, tmp_path, caplog
 ):
-    """The two legs need different propositions, and only one is available.
+    """Both legs need a proposition this daemon cannot evaluate.
 
-    Jeff 221374 measured the version that deleted here: the Keychain holding
-    an older credential and the file a newer one under one reference, and the
-    newer one gone. Answering from the Keychain is sound — the connection's
-    identity is not in doubt — but deleting needs "the file holds nothing the
-    Keychain does not", which matching references do not give and this daemon
-    cannot establish (測試姬 221378). So it answers and keeps.
+    Jeff 221374 measured the version that deleted: the Keychain holding an
+    older credential and the file a newer one under one reference, and the
+    newer one gone. Deleting needs "the file holds nothing the Keychain does
+    not"; answering needs "this credential still works". Matching references
+    give neither, and a daemon that treats the credential as opaque cannot get
+    either (測試姬 221378, 221381; Jeff 221379 for why answering is not the
+    safe half it looks like).
     """
     legacy = tmp_path / "connection.json"
     legacy.write_bytes(
@@ -1328,14 +1315,15 @@ def test_one_connection_with_two_credentials_is_answered_but_not_swept(
     store = keychain_over(monkeypatch, fake, legacy)
 
     with caplog.at_level(logging.ERROR, logger=keychain_store.__name__):
-        loaded = store.load()
+        with pytest.raises(ConflictingCredentials):
+            store.load()
 
-    # Answered from the Keychain: one connection, and that is the copy in use.
-    assert loaded.credential == {"refresh_token": "OLDER-IN-THE-KEYCHAIN"}
-    # Not deleted: it may be the only credential the provider still honours.
+    # Neither deleted: either could be the one the provider still honours.
     assert files_holding(tmp_path, "NEWER-IN-THE-FILE") == [legacy]
-    # And not silent, because it is a credential left readable on disk.
+    assert fake.items[("Puffo Agent-connector", "mac_testmachine")]
+    # And not silent, because two credentials are readable on this disk.
     assert "different credentials for connection r" in caplog.text
+    assert "disconnect" in caplog.text
 
 
 def test_a_conflict_is_loud_enough_to_tell_apart_from_a_flaky_read(
@@ -1371,3 +1359,54 @@ def test_a_conflict_is_loud_enough_to_tell_apart_from_a_flaky_read(
     assert "disconnect" in said
     # And the credential itself never reaches the log.
     assert SENTINEL not in said
+
+
+def test_a_failed_cleanup_after_a_refresh_costs_the_connection_until_a_disconnect(
+    monkeypatch, tmp_path
+):
+    """The price of failing closed, written down rather than discovered.
+
+    A write whose Keychain half landed and whose sweep did not leaves one
+    connection with two credentials — and from the next read on this computer
+    refuses to load at all. A cleanup failure becomes an outage, and the way
+    out is a disconnect. Nobody in the review raised this; it is the cost of
+    the trade and it belongs in real-machine acceptance, so it gets a cell
+    rather than a sentence.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+    # A migration whose sweep failed: two byte-identical copies, which load
+    # still handles. The refresh on top of it is what makes them differ.
+    reference = store.load().reference
+    with pytest.raises(SupersededCopyRemains):
+        store.update(reference=reference, credential={"refresh_token": "fresh"})
+    monkeypatch.undo()  # the permission problem goes away
+    monkeypatch.setattr(keychain_store.subprocess, "run", fake)
+
+    # It does not converge, and it does not answer.
+    with pytest.raises(ConflictingCredentials):
+        store.load()
+
+    # A disconnect is the way out, and it works: both copies go.
+    asyncio.run(disconnect(store))
+    assert store.load() is None
+    assert not legacy.exists()
+
+
+def test_the_two_disagreements_are_different_types(monkeypatch, tmp_path):
+    """Positive control for the pair, and the thing that makes them usable.
+
+    The claim flattens both into one ``read_local`` stage, so a stable type is
+    what an operator has to tell them apart by (Jeff 221379). One base so a
+    caller can catch "the copies disagree" without knowing which.
+    """
+    assert issubclass(ConflictingConnections, keychain_store.LocalCopiesDisagree)
+    assert issubclass(ConflictingCredentials, keychain_store.LocalCopiesDisagree)
+    assert not issubclass(ConflictingCredentials, ConflictingConnections)
+    assert not issubclass(ConflictingConnections, ConflictingCredentials)

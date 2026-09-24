@@ -89,16 +89,50 @@ class KeychainUnavailable(OSError):
     """
 
 
-class ConflictingConnections(OSError):
-    """Both places hold a record, and they name different connections.
+class LocalCopiesDisagree(OSError):
+    """The two places this computer keeps a connection do not agree.
 
     An ``OSError`` for the same reason ``KeychainUnavailable`` is one: every
     caller above already reads that as "cannot tell", which is exactly what
-    this is. The two references are random hex minted at save time — they carry
-    no order, so nothing here can say which record is the current one, and
-    guessing costs a live credential either way (Boris 221354, reproduced by
-    Jeff 221356; 測試姬 221362 for why answering with one of them is the same
-    mistake as deleting the other).
+    this is. Nothing is deleted and nothing is answered with — both halves,
+    because both rest on knowing which copy is current and neither subclass
+    below can be told that from here.
+
+    Two subclasses rather than one type with two messages: an operator has to
+    be able to tell this apart from an ordinary flaky read, and the claim
+    flattens everything into one ``read_local`` stage. A stable, distinguishable
+    error type is what that needs (Jeff 221379); the references in the message
+    help and are not the mechanism.
+    """
+
+
+class ConflictingConnections(LocalCopiesDisagree):
+    """The two records name different connections.
+
+    The references are random hex minted at save time — they carry no order, so
+    nothing here can say which record is the current one, and guessing costs a
+    live credential either way (Boris 221354, reproduced by Jeff 221356;
+    測試姬 221362 for why answering with one of them is the same mistake as
+    deleting the other).
+    """
+
+
+class ConflictingCredentials(LocalCopiesDisagree):
+    """One connection, and the two places hold different credentials for it.
+
+    Refusing both halves, which took three rounds to get to. Deleting needs
+    "the file holds nothing the Keychain does not" — the neighbouring
+    proposition to "same reference", and not one this daemon can evaluate,
+    because it does not look inside a credential (v0.4 §4). Jeff 221374
+    measured the version that deleted: the Keychain holding an older credential
+    and the file a newer one, the newer one gone.
+
+    Answering is refused too, and that is the part I had wrong after fixing the
+    delete. "Worst case, one stale read" assumes the credential handed back can
+    still be refreshed, which is exactly the thing that cannot be established
+    from here — the same unsupported step, one paragraph further down
+    (Jeff 221379; 測試姬 221381 withdrew the return-side exemption she had
+    proposed in 221378).
     """
 
 
@@ -189,14 +223,11 @@ class KeychainConnectionStore(ConnectionStore):
                                     used to take the file with them before
                                     anything checked them.
     - byte-identical both places  → one copy twice, and the file goes.
-    - same reference, other bytes → answered from the Keychain, and the file
-                                    is **kept**. Deleting needs "the file
-                                    holds nothing newer", which matching
-                                    references do not give and this daemon
-                                    cannot establish. Logged at error level on
-                                    every read, because the credential stays
-                                    readable on disk until a write or a
-                                    disconnect takes it.
+    - same reference, other bytes → ``ConflictingCredentials``. Neither copy
+                                    deleted, neither answered with. Deleting
+                                    needs "the file holds nothing newer" and
+                                    answering needs "this one still works",
+                                    and this daemon can establish neither.
     - different references        → refused, and nothing is deleted. Two
                                     records naming two connections, with no
                                     order between them.
@@ -320,36 +351,41 @@ class KeychainConnectionStore(ConnectionStore):
         improvement on two ungated branches and still not right (測試姬
         221378, after Jeff 221374 measured the case):
 
-        - *Answering* with the Keychain copy needs "these are one connection".
-          Matching references give that. The worst case is a stale read of a
-          connection whose identity is not in doubt.
         - *Deleting* the file needs "the file holds nothing the Keychain does
           not". Matching references do **not** give that — it is the
           neighbouring proposition, and the daemon cannot establish the real
-          one, because it does not look inside a credential (v0.4 §4).
+          one, because it does not look inside a credential (v0.4 §4). Jeff
+          221374 measured the version that deleted anyway: the Keychain
+          holding an older credential and the file a newer one under one
+          reference, the newer one gone.
+        - *Answering* with the Keychain copy looks weaker, and is not. "Worst
+          case, one stale read of a connection whose identity is not in doubt"
+          assumes the credential handed back can still be refreshed — the same
+          step that cannot be taken from here, one paragraph further down. I
+          wrote it anyway while fixing the delete (Jeff 221379; 測試姬 221381
+          withdrew the return-side exemption she had proposed).
 
-        So they are split. Byte-identical copies are one copy twice and the
-        file goes. Same reference with different bytes is answered from the
-        Keychain and the file is **kept**, with an error logged: one of those
-        two credentials is the current one and nothing here can say which.
-        Jeff 221374 measured the version that deleted — the Keychain holding
-        an older credential and the file a newer one under one reference, the
-        newer one deleted — and the sentence that used to stand here, that the
-        cost of that is "a refresh, not a connection", was a guarantee nobody
-        had established (his 221376 narrowing: the deletion is observed, the
-        lost connection is the risk it carries, not a measured outcome).
+        So only byte-identical copies are swept: one copy twice, and the file
+        goes. Anything else refuses both halves and leaves both copies
+        (``LocalCopiesDisagree``).
 
-        What keeping costs, since it is not free either. A ``save`` or
-        ``update`` whose Keychain write landed and whose sweep did not leaves
-        the previous credential in the clear, and now nothing sweeps it on a
-        read — the next explicit write does, and a disconnect does, and until
-        then it is logged on every read. That is a worse *residue* and a better
-        *failure* than deleting a credential that may be the only usable one:
-        a file left behind is visible to the acceptance scan (測試姬 219875)
-        and recoverable, and a deleted credential is neither. The migration
-        path still converges across restarts, which is what Jeff 221335/221343
-        asked for, because there the two copies are byte-identical by
-        construction.
+        What refusing costs, since it is not free either. A ``save`` or
+        ``update`` whose Keychain write landed and whose sweep did **not**
+        leaves two copies of one connection with different credentials — and
+        from the next read on, this computer refuses to load at all until
+        somebody disconnects. A cleanup failure becomes an outage. That path is
+        narrow (the Keychain write verified, the ``unlink`` failed) and it is
+        already reported at the time it happens, by ``SupersededCopyRemains``;
+        it is called out here because nobody else has, and it belongs in
+        real-machine acceptance rather than in a docstring's confidence.
+
+        The trade taken: never delete a credential that may be the only usable
+        one, and never answer with one that may not be. A file left behind is
+        visible to the acceptance scan (測試姬 219875) and recoverable; a
+        deleted credential is neither, and a silently dead one is worse than a
+        refusal. The migration path still converges across restarts, which is
+        what Jeff 221335/221343 asked for, because there the two copies are
+        byte-identical by construction.
 
         Rolling this store back with a live connection remains unsupported:
         disconnect first. That is an instruction to whoever does it, not a
@@ -392,18 +428,19 @@ class KeychainConnectionStore(ConnectionStore):
                 "answered with, because their references carry no order"
             )
         if older != from_keychain:
-            # One connection, two credentials. Answered from the Keychain and
-            # the file kept: deleting it needs a proposition about which
-            # credential is current, and this daemon has no way to ask.
             logger.error(
                 "connector: the Keychain and the file store hold different "
-                "credentials for connection %s. The Keychain's is the one in "
-                "use; the file is kept because nothing here can tell which "
-                "credential is current, and it stays readable on disk until a "
-                "write or a disconnect takes it",
+                "credentials for connection %s, and nothing here can tell "
+                "which one is current. Neither was deleted and neither is "
+                "answered with. A disconnect clears both and is the way out",
                 held,
             )
-            return
+            raise ConflictingCredentials(
+                f"this computer holds two credentials for connection {held}, "
+                "one in the Keychain and one in the file store. Neither was "
+                "deleted and neither is answered with, because which of them "
+                "the provider still honours cannot be known from here"
+            )
         self._erase_quietly()
 
     def _read_from_keychain(self) -> bytes | None:
