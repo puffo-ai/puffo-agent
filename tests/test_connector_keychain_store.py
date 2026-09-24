@@ -423,6 +423,22 @@ def test_a_value_that_is_not_our_record_is_refused_and_never_decoded(monkeypatch
     assert "not decoded on a guess" in str(refused.value)
 
 
+def test_a_value_that_will_not_even_decode_does_not_name_its_own_bytes(monkeypatch):
+    """The refusal above must not become a way to read the value one byte at a
+    time. A ``UnicodeDecodeError`` names the byte it choked on, and this message
+    travels out through the claim's save-stage reason."""
+    fake = FakeSecurity()
+    store = keychain(monkeypatch, fake)
+    fake.items[("Puffo Agent-connector", "mac_testmachine")] = b"\xffabc"
+
+    with pytest.raises(KeychainUnavailable) as refused:
+        store.load()
+
+    assert "not decoded on a guess" in str(refused.value)
+    assert "0xff" not in str(refused.value)
+    assert "UnicodeDecodeError" in str(refused.value)
+
+
 def test_a_name_that_would_need_quoting_rules_nobody_measured_is_refused(monkeypatch):
     """A space is measured working (Jeff 220737); an embedded quote is not, and
     guessing could write the item somewhere else entirely."""
@@ -449,23 +465,43 @@ def test_a_service_name_with_a_space_is_not_refused(monkeypatch):
     assert spaced.load().reference == saved.reference
 
 
-def test_a_failure_message_does_not_carry_the_value_back_out(monkeypatch):
+@pytest.mark.parametrize(
+    "echo",
+    [
+        pytest.param(
+            ('{"credential":"' + SENTINEL + '"}').encode().hex().encode(), id="hex"
+        ),
+        pytest.param(SENTINEL.encode(), id="plaintext"),
+        pytest.param(SENTINEL.encode()[:12], id="plaintext-fragment"),
+        # Jeff 220856: a credential can hold a number that looks like an
+        # OSStatus, which is what killed the previous, narrower version.
+        pytest.param(b'{"token":"SYNTHETIC -123456"}', id="negative-number"),
+    ],
+)
+def test_a_failure_message_does_not_carry_the_value_back_out(monkeypatch, echo):
     """A pipe does not leak; what you do with what you read out of it can
-    (Jeff 220786). A failing command that echoes the hex must not put it into
-    an exception string."""
-    body = b'{"credential":"' + SENTINEL.encode() + b'"}'
+    (Jeff 220786).
 
-    def echoes_the_hex(argv, *, input=None, **_kwargs):
+    Three shapes rather than one, because the earlier version of this checked
+    only the hex — and a pattern that masks hex says nothing about plaintext.
+    Jeff 220838 put an ordinary sentinel through it and it came out whole. The
+    answer is not a better pattern: stderr's free text is not forwarded at all.
+    """
+
+    def echoes_the_value(argv, *, input=None, **_kwargs):
         return subprocess.CompletedProcess(
-            argv, 1, b"", b"security: bad argument -X " + body.hex().encode()
+            argv, 1, b"", b"security: bad argument -X " + echo + b" (-25299)\n"
         )
 
-    monkeypatch.setattr(keychain_store.subprocess, "run", echoes_the_hex)
+    monkeypatch.setattr(keychain_store.subprocess, "run", echoes_the_value)
     store = KeychainConnectionStore("mac_testmachine")
 
     with pytest.raises(KeychainUnavailable) as failed:
         store.save(request_ref="r", provider="p", credential={"t": SENTINEL})
 
-    assert "<redacted>" in str(failed.value)
-    assert body.hex() not in str(failed.value)
+    # Equality, not absence. "the sentinel is not in there" is a test of this
+    # sentinel; "the text is exactly the exit code" is a test of the rule, and
+    # it is the only form that cannot be passed by a cleverer filter.
+    assert str(failed.value).endswith("exit_code=1")
+    assert echo.decode() not in str(failed.value)
     assert SENTINEL not in str(failed.value)

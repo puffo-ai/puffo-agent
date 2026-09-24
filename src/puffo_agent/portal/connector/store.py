@@ -77,6 +77,7 @@ class ConnectionStore:
         if raw is None:
             return None
         record = json.loads(raw)
+        _check(record)
         return Connection(
             reference=record["reference"],
             request_ref=record["request_ref"],
@@ -148,18 +149,64 @@ class ConnectionStore:
         raise NotImplementedError
 
 
+# The record's own fields, as opposed to the credential inside it. The daemon
+# does know these three — it mints ``reference`` itself and carries the other
+# two in from the claim — which is exactly why it is entitled to insist on
+# them. ``credential`` is the one field whose shape it is not told (v0.4 §4).
+_NAMED_FIELDS = ("reference", "request_ref", "provider")
+
+
+def _check(record: Any) -> None:
+    """Refuse a record this daemon could not have written.
+
+    ``json.loads`` answers "is this JSON", which is less than "is this a
+    connection". Without this, a record whose ``reference`` is null loads as a
+    Connection and the claim answers ``connected: True`` with a null
+    reference — a computer reporting it is connected to nothing, and a page
+    that would show 已连接 for it (Jeff 220838, reproduced before fixing).
+
+    Every refusal is a ``ValueError``, which is what ``json.loads`` already
+    raises for malformed JSON and what the claim already reads as "local store
+    unreadable". That matters for the non-object cases — ``[]``, ``123``,
+    ``null`` — which previously came out as ``TypeError`` from the subscript
+    below and escaped the claim's handling entirely, because ``TypeError`` is
+    deliberately excluded from it as this module's own bug. They are not our
+    bug; they are an unreadable store, and they now say so.
+
+    Nothing here looks inside ``credential``: that it is present is a fact
+    about the record, while anything further would be inventing the coupling
+    v0.4 §4 declines to create.
+    """
+    if not isinstance(record, dict):
+        raise ValueError(
+            f"the stored record is a JSON {type(record).__name__}, not an object"
+        )
+    for field in _NAMED_FIELDS:
+        value = record.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"the stored record's {field} is not a non-empty string")
+    if record.get("credential") is None:
+        raise ValueError("the stored record carries no credential")
+
+
 def _encode(connection: Connection) -> bytes:
     """The record as stored. One line of ASCII JSON, no trailing newline —
     ``json.dumps`` escapes non-ASCII by default, which keeps the record
-    printable through stores that hand it back through a pipe."""
-    return json.dumps(
-        {
-            "reference": connection.reference,
-            "request_ref": connection.request_ref,
-            "provider": connection.provider,
-            "credential": connection.credential,
-        }
-    ).encode()
+    printable through stores that hand it back through a pipe.
+
+    Checked on the way out under the same rule as on the way in. A store that
+    can write a record it would then refuse to read is one bad argument away
+    from a connection that cannot be loaded or replaced, only cleared — and
+    adding the read check without this one is what would have created that.
+    """
+    record = {
+        "reference": connection.reference,
+        "request_ref": connection.request_ref,
+        "provider": connection.provider,
+        "credential": connection.credential,
+    }
+    _check(record)
+    return json.dumps(record).encode()
 
 
 class SkeletonConnectionStore(ConnectionStore):

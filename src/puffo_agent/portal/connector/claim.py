@@ -30,9 +30,12 @@ STAGE_ALREADY_CONNECTED = "already_connected"
 STAGE_FETCH = "fetch"
 STAGE_SAVE = "save"
 
-# Reading the local store can fail in these ways: absent field, bad JSON, or
-# the file system. TypeError is deliberately absent — that would be this
-# module's own bug, and swallowing it would hide it as a claim failure.
+# Reading the local store can fail in these ways: a record that is not a
+# connection, bad JSON, or the file system. TypeError is deliberately absent —
+# that would be this module's own bug, and swallowing it would hide it as a
+# claim failure. Which is why the store raises ValueError for a malformed
+# record rather than letting a subscript raise TypeError on it: the store
+# holding nonsense is not this module being wrong (Jeff 220838).
 _READ_ERRORS = (OSError, ValueError, KeyError)
 
 
@@ -143,9 +146,12 @@ async def _claim_while_locked(request_ref: str, *, fetch: Fetch, store: Any) -> 
         connection = store.save(
             request_ref=request_ref, provider=provider, credential=credential
         )
-    except OSError as exc:
-        # The credential reached this computer but did not survive to disk, so
-        # the page must not show connected (v0.4 §7, local-save row).
+    except (OSError, ValueError) as exc:
+        # The credential reached this computer but did not survive into the
+        # store, so the page must not show connected (v0.4 §7, local-save row).
+        # ValueError is the store refusing to write a record it would not be
+        # able to read back — a fetch that answered with no provider, say. Same
+        # outcome as a disk that would not take it: nothing was saved.
         return _failure(request_ref, STAGE_SAVE, f"{type(exc).__name__}: {exc}")
 
     logger.info(

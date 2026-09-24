@@ -43,28 +43,38 @@ def connection_path() -> Path:
     return directory / "connection.json"
 
 
-# macOS keeps the file store, and now for a measured reason rather than an
-# unverified one. The Keychain backend writes through ``security`` with the
-# value piped to a trailing ``-w``, and on a real Keychain that stores an EMPTY
-# password while exiting 0 on both the write and the read back (Jeff 220726,
-# synthetic data). The backend's read-back check turns that into a loud
-# failure, so nothing silently stores nothing — but a write cannot currently
-# succeed at all.
+# macOS keeps the file store, and the reason is now one specific piece of
+# unfinished work rather than doubt about the backend.
 #
-# What flips this: move the write to ``security -i`` with the value as hex
-# through ``-X``, which keeps argv clean and is measured working on a real
-# Keychain, including a service name with a space (Jeff 220731/220737/220759).
-# Not ``SecItemAdd`` — it would pin the item's trusted application to whichever
-# Python called it, and that path moves with the venv, after which reads want
-# an authorization prompt a daemon has nobody to answer. Then the confirming
-# run, on a computer with a daemon's HOME: save, load, update, clear, and
-# nothing left behind afterwards.
+# The transport question is settled and measured. Writing with the value piped
+# to a trailing ``-w`` stored an EMPTY password while exiting 0 on both the
+# write and the read back (Jeff 220726, synthetic data) — ``-w`` last reads a
+# terminal, not stdin. The write now goes through ``security -i`` with the
+# value as hex through ``-X``, which keeps argv clean; Jeff 220838
+# independently ran save, load, update and clear against a real Keychain on a
+# random service and account and got equality both ways, the reference kept
+# across the update, and exit 44 from an outside lookup after the clear.
 #
-# The same change owes one more thing: a computer that already holds a
-# ``connection.json`` keeps it after the switch, because ``clear`` only reaches
-# the store it was handed. That file has to be swept, or a disconnect would
-# report cleared while the old credential stayed readable on disk — the breach
-# 4bf86f72 closed for the temporary file, arriving by the other door.
+# Not ``SecItemAdd``. It would pin the item's trusted application to whichever
+# Python called it, and that path moves with the venv. What happens next is no
+# longer inferred, though the observation is a narrow one: on one machine, from
+# an agent's session, four calls to it each raised an authorization dialog on
+# the logged-in operator's screen and each returned -60006
+# (errAuthorizationCanceled) to the caller. Four attempts in one environment do
+# not establish what every daemon would see, and this is not a claim that the
+# ``security`` path never prompts — nobody has watched that screen while it
+# ran. What it does establish is that the prompt is not visible from the
+# calling process at all: -60006 is the whole of what the caller learns, and it
+# reads like an unreachable Keychain rather than like an interrupted person. A
+# credential path whose side effects are invisible to the side making them is
+# not one to hand a daemon.
+#
+# What this still owes, and the only reason the flag below is False: a computer
+# that already holds a ``connection.json`` keeps it after the switch, because
+# ``clear`` only reaches the store it was handed. That file has to be swept, or
+# a disconnect would report cleared while the old credential stayed readable on
+# disk — the breach 4bf86f72 closed for the temporary file, arriving by the
+# other door.
 _KEYCHAIN_VERIFIED = False
 
 

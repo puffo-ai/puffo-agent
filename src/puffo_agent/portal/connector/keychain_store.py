@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 
 from ..._proc import no_window_kwargs
@@ -144,10 +143,16 @@ class KeychainConnectionStore(ConnectionStore):
             try:
                 json.loads(raw)
             except ValueError as exc:
+                # The type, not the exception's text. Same rule as in
+                # ``_explain`` and for the same reason: a JSONDecodeError says
+                # only where it gave up, but a UnicodeDecodeError names the
+                # offending byte of the value, and this message travels out
+                # through the claim's save-stage reason. The type is what there
+                # is to diagnose by here anyway.
                 raise KeychainUnavailable(
                     "the Keychain returned something this computer did not "
                     "write — it will not parse as a connection record, and it "
-                    f"is not decoded on a guess: {exc}"
+                    f"is not decoded on a guess ({type(exc).__name__})"
                 ) from None
             return raw
         if found.returncode == _ITEM_NOT_FOUND:
@@ -235,23 +240,24 @@ class KeychainConnectionStore(ConnectionStore):
             ) from exc
 
 
-# Long enough that a stray word cannot match, short enough to catch a truncated
-# echo of the value. Our records run to hundreds of hex characters.
-_HEX_RUN = re.compile(r"[0-9a-fA-F]{32,}")
-
-
 def _explain(completed) -> str:
-    """What ``security`` said, kept out of the exception's own wording.
+    """Why the command failed: the exit code, and nothing read from stderr.
 
-    The stderr line is the only thing that distinguishes a locked Keychain
-    from a missing one from a denied one, and none of those are worth their own
-    branch — but losing the sentence would leave nothing to diagnose by.
+    Three versions of this got progressively narrower and the lesson is the
+    reason it is now this blunt. It began by masking long hex runs; Jeff 220838
+    put an ordinary plaintext sentinel through that and it came out whole. The
+    repair was to forward only the OSStatus numbers — and Jeff 220856 put
+    ``-123456`` inside a credential and got it back as ``security_status``.
+
+    Each of those was an argument about which shapes of value the filter
+    happens to catch, and the set of shapes a credential can take is not ours
+    to enumerate. So stderr is not read at all. This is the shape Boris landed
+    in the diagnostic at `e4b94e2d` — deliberately not the `f60c9c8e` one,
+    which is the version with the bug.
+
+    What that costs is real: a locked Keychain, a missing one and a denied one
+    now look the same from here. The exit code still separates "no such item"
+    (44) from the rest, which is the only distinction any caller branches on.
+    Diagnosing the others means looking at the Keychain, not at our logs.
     """
-    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-    # The value reaches this process as hex on the way in and as itself on the
-    # way out; either could be echoed back by a failing command. Nothing here
-    # is worth putting a credential into an exception string for, so the long
-    # hex runs go first (Jeff 220786: a pipe does not leak, what you do with
-    # what you read out of it does).
-    stderr = _HEX_RUN.sub("<redacted>", stderr)
-    return f"exit {completed.returncode}" + (f": {stderr}" if stderr else "")
+    return f"exit_code={completed.returncode}"

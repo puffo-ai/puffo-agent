@@ -14,6 +14,7 @@ back off the store rather than taken from the return value (测试姬 220601).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -281,3 +282,137 @@ async def test_a_disconnect_is_not_undone_by_a_claim_that_was_already_running(tm
 
     assert store.load() is None
     assert files_holding(tmp_path, SECOND) == []
+
+
+# ---------------------------------------------------------------------------
+# What counts as a record at all.
+#
+# ``json.loads`` answers "is this JSON", which is strictly less than "is this a
+# connection". Jeff 220838 drove a well-formed but meaningless record into
+# ``_read`` and the claim answered ``connected: True`` with a null reference:
+# a computer reporting a connection to nothing, and a page that would show it
+# as 已连接. These cells fix what a record has to be, and check that the answer
+# to a bad one is the fail-closed one the claim already knows how to give.
+
+
+class InjectedStore(store_module.ConnectionStore):
+    """A store handing back bytes nobody here wrote.
+
+    Deliberately not the Keychain or the file store: the question is what
+    ``ConnectionStore`` does with a record that got corrupted somehow, and
+    routing it through a real backend would only test that backend's ability
+    to hold the bytes.
+    """
+
+    def __init__(self, raw: bytes | None) -> None:
+        self.raw = raw
+        self.written: list[bytes] = []
+
+    def _read(self):
+        return self.raw
+
+    def _put(self, body: bytes) -> None:
+        self.written.append(body)
+
+    def _erase(self) -> None:
+        self.raw = None
+
+
+MALFORMED = {
+    "null-reference": b'{"reference":null,"request_ref":"r","provider":"p","credential":{"t":1}}',
+    "empty-reference": b'{"reference":"","request_ref":"r","provider":"p","credential":{"t":1}}',
+    "non-string-provider": b'{"reference":"a","request_ref":"r","provider":false,"credential":{"t":1}}',
+    "missing-request_ref": b'{"reference":"a","provider":"p","credential":{"t":1}}',
+    "null-credential": b'{"reference":"a","request_ref":"r","provider":"p","credential":null}',
+    "missing-credential": b'{"reference":"a","request_ref":"r","provider":"p"}',
+    # Valid JSON, but not an object. These used to raise TypeError out of the
+    # subscript, which the claim deliberately does not catch because it means
+    # "our own bug" — so they escaped its handling entirely.
+    "a-JSON-array": b"[]",
+    "a-JSON-number": b"123",
+    "a-JSON-string": b'"hello"',
+    "a-JSON-null": b"null",
+}
+
+
+@pytest.mark.parametrize("raw", MALFORMED.values(), ids=list(MALFORMED))
+def test_a_record_that_is_not_a_connection_is_not_read_as_one(raw):
+    with pytest.raises(ValueError):
+        InjectedStore(raw).load()
+
+
+@pytest.mark.parametrize("raw", MALFORMED.values(), ids=list(MALFORMED))
+@pytest.mark.asyncio
+async def test_a_malformed_record_never_reports_connected(raw):
+    """The whole point of the exercise: fail closed, and never with a null
+    reference in a success answer."""
+    from puffo_agent.portal.connector.claim import STAGE_READ_LOCAL, claim_connection
+
+    async def must_not_be_called(request_ref):
+        raise AssertionError("a store that cannot be read must not be overwritten")
+
+    answer = await claim_connection("r", fetch=must_not_be_called, store=InjectedStore(raw))
+
+    assert answer["ok"] is False
+    assert answer["connected"] is False
+    assert answer["stage"] == STAGE_READ_LOCAL
+    assert "connection_ref" not in answer
+
+
+def test_a_well_formed_record_still_loads():
+    """Positive control: the refusals above have to be refusing something."""
+    good = b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":1}}'
+
+    loaded = InjectedStore(good).load()
+
+    assert loaded is not None
+    assert (loaded.reference, loaded.request_ref, loaded.provider) == ("a", "r", "p")
+    assert loaded.credential == {"t": 1}
+
+
+def test_the_credential_is_still_opaque():
+    """Checking the record's own fields is not licence to check inside it.
+
+    The daemon is not told the credential's shape (v0.4 §4), so anything that
+    is not None goes through — a string, a list, a number.
+    """
+    for credential in ("a string", ["a", "list"], 0, False, {}, ""):
+        raw = json.dumps(
+            {"reference": "a", "request_ref": "r", "provider": "p", "credential": credential}
+        ).encode()
+
+        assert InjectedStore(raw).load().credential == credential
+
+
+def test_the_store_refuses_to_write_what_it_would_refuse_to_read():
+    """Otherwise the read check above would be the bug.
+
+    A record written through a gap in the write path could never be loaded or
+    refreshed afterwards, only cleared — so the same rule guards both doors.
+    """
+    store = InjectedStore(None)
+
+    with pytest.raises(ValueError):
+        store.save(request_ref="r", provider="", credential={"t": 1})
+    with pytest.raises(ValueError):
+        store.save(request_ref="r", provider="p", credential=None)
+
+    assert store.written == []
+
+
+@pytest.mark.asyncio
+async def test_a_save_the_store_refuses_is_reported_as_a_failed_save():
+    """Not connected, and not an exception out of the command either: the page
+    still has to be able to stop waiting (v0.4 §7)."""
+    from puffo_agent.portal.connector.claim import STAGE_SAVE, claim_connection
+
+    async def answers_with_no_provider(request_ref):
+        return "", {"refresh_token": FIRST}
+
+    answer = await claim_connection(
+        "r", fetch=answers_with_no_provider, store=InjectedStore(None)
+    )
+
+    assert answer["ok"] is False
+    assert answer["connected"] is False
+    assert answer["stage"] == STAGE_SAVE
