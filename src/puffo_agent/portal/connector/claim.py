@@ -30,6 +30,14 @@ STAGE_ALREADY_CONNECTED = "already_connected"
 STAGE_FETCH = "fetch"
 STAGE_SAVE = "save"
 
+# A refresh walks the same three segments — read the store, talk to the server,
+# write what came back — so it reuses ``read_local`` and ``save`` rather than
+# minting near-synonyms for them. Only the middle segment and the two endings
+# a claim does not have need their own names.
+STAGE_STALE = "stale"
+STAGE_EXCHANGE = "exchange"
+STAGE_CLEAR = "clear"
+
 # Reading the local store can fail in these ways: a record that is not a
 # connection, bad JSON, or the file system. TypeError is deliberately absent —
 # that would be this module's own bug, and swallowing it would hide it as a

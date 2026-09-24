@@ -392,6 +392,22 @@ async def execute_command(
         from ..connector.command import run_claim_command
 
         return await run_claim_command(params, server_url)
+    if op == "connector.refresh":
+        # Machine-level for the same reason as the claim. Note the route behind
+        # this does not exist server-side yet (Boris 221525 / Jeff 221526); the
+        # daemon half is wired so the other end has something to land against.
+        if not server_url:
+            return {"ok": False, "error": "connector.refresh: no server_url"}
+        from ..connector.command import run_refresh_command
+
+        return await run_refresh_command(params, server_url)
+    if op == "connector.disconnect":
+        # No server_url check: a disconnect clears this computer and calls
+        # nobody, so requiring one would make the local credential's removal
+        # depend on knowing where the server is (Jeremy 217298 / Jeff 217299).
+        from ..connector.command import run_disconnect_command
+
+        return await run_disconnect_command(params)
     if op == "create":
         return await _create_agent_command(
             params, server_url, paired_root_pubkey, resolve_model=resolve_model,

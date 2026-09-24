@@ -1,15 +1,22 @@
-"""The ``connector.claim`` computer command: wiring, not policy.
+"""The ``connector.*`` computer commands: wiring, not policy.
 
-Machine-level, like ``refresh_usage`` — a claim is about this computer's
-connection, not about one agent. The command carries only the request
-reference; which computer is claiming is NOT taken from it. That travels in the
-machine signature the server verifies (``machine_auth.signed_headers``), so the
-server reads the claimant from a verified header rather than from a field the
-caller filled in.
+Machine-level, like ``refresh_usage`` — a connection is about this computer,
+not about one agent. No command carries which computer it is about: that
+travels in the machine signature the server verifies
+(``machine_auth.signed_headers``), so the server reads the caller from a
+verified header rather than from a field the caller filled in.
+
+Three ops, and only the first has an agreed server contract behind it. The
+claim route is interface v1 (Bob 219652). The refresh route is not: the server
+has no refresh handler at all yet (Boris 221525 read #406; Jeff 221526
+confirmed), so what is wired below is the agreed *body* with a *guessed* path,
+marked as such at ``_REFRESH_PATH``. The disconnect is local only and reaches
+no server at all.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import platform
 from pathlib import Path
@@ -21,9 +28,19 @@ from ..control import machine_auth
 from ..control.store import MachineControlIdentity, load_or_create_machine
 from ..host_assets import _ensure_private_directory
 from ..state import home_dir
-from .claim import ClaimFailed, claim_connection
+from .claim import (
+    STAGE_CLEAR,
+    STAGE_EXCHANGE,
+    STAGE_READ_LOCAL,
+    STAGE_SAVE,
+    STAGE_STALE,
+    ClaimFailed,
+    claim_connection,
+    disconnect,
+    refresh_connection,
+)
 from .keychain_store import KeychainConnectionStore
-from .store import ConnectionStore, SkeletonConnectionStore
+from .store import ConnectionStore, SkeletonConnectionStore, StaleConnection
 
 logger = logging.getLogger(__name__)
 
@@ -198,3 +215,222 @@ def _read_claimed(payload: Any) -> tuple[str, Any]:
     if "credential" not in payload:
         raise ClaimFailed("claim response carried no credential")
     return provider, payload["credential"]
+
+
+class RefreshRefused(Exception):
+    """The server did not hand back a replacement credential.
+
+    Separate from ``ClaimFailed`` on purpose, and not a rename of it. The claim
+    has a contract with a closed list of reason codes (``_REFUSALS``); the
+    refresh has neither, because the endpoint does not exist yet. Sharing one
+    type would put refresh failures through a table written for a different
+    route and read like the two had the same contract behind them — which is
+    the reading Jeff 221524 asked for in as many words: do not treat the claim
+    path as a confirmed refresh API.
+
+    Raised and caught in this module. ``refresh_connection`` does not catch it:
+    unlike a claim it has no result dict to put a failure in, so the exception
+    travels out through it to the entry point below.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+# ASSUMED, NOT AGREED — this path is this file's guess.
+#
+# What is agreed is the body and nothing else (Jeff 221524): the request is
+# ``{connection_ref, credential}`` with the credential whole and no
+# ``request_ref``, and the answer is the replacement credential, whole. The
+# path and the response wrapping are @engineer-ed1df917's to give, and until
+# they arrive there is no server to be wrong against: #406 has no refresh
+# handler at all (Boris 221525, confirmed by Jeff 221526).
+#
+# So this is wired to be cheap to correct rather than to be right by luck. The
+# path is one constant and the unwrapping is one function; nothing else in the
+# daemon looks at either. It is deliberately NOT the claim root with a
+# different leaf — a borrowed-looking path is how "we already have a refresh
+# API" gets believed.
+_REFRESH_PATH = "/v2/machines/me/oauth-connections/refresh"
+
+
+async def run_refresh_command(params: dict, server_url: str) -> dict:
+    """Entry point for the dispatcher. Always returns a command result.
+
+    The result says whether the credential was replaced. It deliberately
+    carries no ``connected`` key, unlike a claim: a refresh that fails at any
+    stage but the last leaves this computer holding the connection it had, and
+    answering ``connected: False`` would report an outage that did not happen.
+    "Did the refresh work" and "is this computer connected" are two questions
+    and only one of them was asked.
+    """
+    reference = str(params.get("connection_ref") or "").strip()
+    if not reference:
+        # Nothing to correlate a failure to, same as a claim without a request
+        # reference: a malformed command, not a failed refresh.
+        logger.error("connector: refresh command carried no connection_ref")
+        return {"ok": False, "stage": "command", "reason": "no connection_ref"}
+
+    machine = load_or_create_machine()
+    base = server_url.rstrip("/")
+    # Which segment an OSError came from, and the only thing that tells them
+    # apart. A store that would not read and a replacement that would not save
+    # both raise OSError, and they are not the same news: one leaves the
+    # credential untouched, the other means the server has already been asked
+    # for a replacement that is now nowhere. The exception cannot say which —
+    # having reached the server is a fact about this call, so this call keeps
+    # it.
+    #
+    # "Answered", not "was asked", and the distinction only stays harmless
+    # because a transport error cannot arrive here as an OSError:
+    # ``_exchange_with_server`` turns every one of them into ``RefreshRefused``
+    # first, which is pinned by a cell of its own rather than left as a habit.
+    # Without that, a refused connection would be reported as an unreadable
+    # local store — a network fault described as a disk one.
+    reached_the_server = False
+
+    async def exchange(credential: Any) -> Any:
+        nonlocal reached_the_server
+        replacement = await _exchange_with_server(base, machine, reference, credential)
+        reached_the_server = True
+        return replacement
+
+    try:
+        refreshed = await refresh_connection(
+            reference, exchange=exchange, store=connection_store(machine)
+        )
+    except StaleConnection as exc:
+        return _refresh_failure(reference, STAGE_STALE, str(exc))
+    except RefreshRefused as exc:
+        return _refresh_failure(reference, STAGE_EXCHANGE, exc.reason)
+    except (OSError, ValueError, KeyError) as exc:
+        # The type name is carried through for the same reason the claim
+        # carries it (Jeff 221379): the two copies of a connection disagreeing
+        # is not a flaky read, needs a different thing done about it, and the
+        # class name is the only part of that which survives to the caller.
+        if reached_the_server:
+            return _refresh_failure(
+                reference,
+                STAGE_SAVE,
+                f"the server answered and this computer could not keep it: "
+                f"{type(exc).__name__}: {exc}",
+            )
+        return _refresh_failure(
+            reference, STAGE_READ_LOCAL, f"local store unreadable: {type(exc).__name__}"
+        )
+
+    logger.info("connector: refreshed connection %s", refreshed.reference)
+    return {"ok": True, "connection_ref": refreshed.reference}
+
+
+def _refresh_failure(reference: str, stage: str, reason: str) -> dict:
+    """Log where and why, keyed by the connection the refresh was for."""
+    logger.error("connector: refresh %s failed at %s: %s", reference, stage, reason)
+    return {"ok": False, "stage": stage, "reason": reason}
+
+
+async def _exchange_with_server(
+    base: str, machine: MachineControlIdentity, reference: str, credential: Any
+) -> Any:
+    """Hand the stored credential over and get the replacement back, whole.
+
+    ``connection_ref`` is this computer's own reference, minted locally at save
+    time — the only thing the daemon has that is named that. Whether the server
+    can resolve it is unknown here and does not matter to this side: the
+    credential travels with it, so the server needs nothing looked up to do the
+    exchange. If it turns out the field was meant to be the request reference
+    instead, this line is where that changes, and the store holds both.
+
+    The body is signed, not just sent. A claim signs zero body bytes because it
+    has no body; this one has one, so the bytes that are signed and the bytes
+    that are posted must be the same object — hence ``data=body`` rather than
+    ``json=``, which would re-serialise and could sign one string and send
+    another.
+    """
+    body = json.dumps(
+        {"connection_ref": reference, "credential": credential}
+    ).encode()
+    headers = machine_auth.signed_headers(machine, "POST", _REFRESH_PATH, body)
+    headers["content-type"] = "application/json"
+    try:
+        async with create_remote_http_session(base) as session:
+            async with session.post(
+                f"{base}{_REFRESH_PATH}", data=body, headers=headers
+            ) as response:
+                if response.status != 200:
+                    # No reason table here, unlike the claim. The claim's table
+                    # exists because interface v1 fixes the codes; nothing
+                    # fixes these, so the raw code goes in the log rather than
+                    # a sentence this file made up about it.
+                    reason = await _reason_of(response)
+                    raise RefreshRefused(
+                        f"server refused the refresh ({response.status}, reason={reason!r})"
+                    )
+                return _read_refreshed(await response.json())
+    except RefreshRefused:
+        raise
+    except Exception as exc:  # noqa: BLE001 - transport and decoding both end it
+        raise RefreshRefused(
+            f"refresh call did not complete: {type(exc).__name__}"
+        ) from exc
+
+
+def _read_refreshed(payload: Any) -> Any:
+    """Pull the replacement credential out of the refresh response.
+
+    The wrapping is assumed to be the claim's — ``{"credential": ...}`` — and
+    that assumption is unconfirmed (Jeff 221524 left the response wrapping to
+    @engineer-ed1df917). It is the assumption to make anyway, because the two
+    ways of being wrong do not cost the same. Requiring the wrapper and getting
+    a bare package fails here, loudly, and writes nothing. Accepting a bare
+    body and getting a wrapper would store the *envelope* as the credential —
+    a connection quietly holding the wrong bytes, discovered whenever it is
+    next used. Fail on the readable one.
+
+    No provider is read. A refresh replaces a credential, not a connection; the
+    store keeps the provider it already has, and taking one from this response
+    would let the server change it by answering.
+    """
+    if not isinstance(payload, dict):
+        raise RefreshRefused("refresh response was not an object")
+    if "credential" not in payload:
+        raise RefreshRefused("refresh response carried no credential")
+    return payload["credential"]
+
+
+async def run_disconnect_command(params: dict) -> dict:
+    """Entry point for the dispatcher. Always returns a command result.
+
+    Local only. This clears the credential on this computer and tells nobody:
+    no server call, no Google revocation. That is the decided order — the local
+    copy goes first and is not held hostage to a remote confirmation (Jeremy
+    217298 / Jeff 217299) — but the remote half is genuinely *missing*, not
+    deferred by design, and a server that still lists this computer as
+    connected will say so in the UI until someone builds the other end.
+
+    ``params`` is accepted and not read. A ``connection_ref`` to check against
+    would be the obvious addition and is deliberately absent: a disconnect is
+    also the documented way out of a computer whose two local copies disagree,
+    where ``load`` raises and no reference can be read at all. A check that
+    needed the store to be readable would take that exit away, which is the one
+    case the exit exists for. The race it would close — a different connection
+    claimed between the click and the command — needs a re-authorization to
+    complete inside that window on a product that refuses to claim while a
+    connection is present.
+    """
+    store = connection_store(load_or_create_machine())
+    try:
+        await disconnect(store)
+    except OSError as exc:
+        # Not reported as done. A disconnect that could not clear must not look
+        # like one that did: the credential is still readable on this computer.
+        logger.error("connector: disconnect did not clear this computer: %s", exc)
+        return {
+            "ok": False,
+            "connected": True,
+            "stage": STAGE_CLEAR,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    logger.info("connector: this computer's connection was cleared")
+    return {"ok": True, "connected": False}
