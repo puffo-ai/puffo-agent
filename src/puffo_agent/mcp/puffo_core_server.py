@@ -77,11 +77,10 @@ def _validate_refresh_inference_level(harness: str, level: str) -> None:
 
 
 def _captured_tool_schema(fn) -> dict[str, object]:
-    """Stable, address-free description of one tool for the fingerprint:
-    docstring plus each parameter's name, annotation, kind, and whether it
-    is required. Default *values* are deliberately excluded — a sentinel
-    default (e.g. ``object()``) renders with a process address, which would
-    make the fingerprint differ every restart and rotate every session."""
+    """One tool's schema for the fingerprint: docstring + each param's name,
+    annotation, kind, required-ness. Default *values* are excluded — a
+    sentinel default renders with a process address, which would move the
+    hash every restart and rotate every session."""
     import inspect
 
     params = [
@@ -100,11 +99,10 @@ def _captured_tool_schema(fn) -> dict[str, object]:
 
 
 def _capture_tool_surface() -> dict[str, dict[str, object]]:
-    """Tool name → schema the model is offered, under the *live* config —
-    the exact input ``mcp_tool_fingerprint`` hashes. Mirrors ``build_server``
-    (core + local + memory) so enabling monid, renaming a tool, or editing a
-    param/docstring is reflected. Split out so the fingerprint's coverage
-    (the monid gate, the memory family) is directly assertable."""
+    """Tool name → schema the model is offered under the live config — the
+    input ``mcp_tool_fingerprint`` hashes. Mirrors ``build_server`` (core +
+    local + memory). Split out so coverage (the monid gate, the memory
+    family) is directly testable."""
     import types
 
     from .config import monid_tools_enabled
@@ -143,18 +141,12 @@ def _capture_tool_surface() -> dict[str, dict[str, object]]:
 
 
 def mcp_tool_fingerprint() -> str:
-    """Hash of the puffo MCP tool surface the model is offered: every
-    registered tool's name, parameter schema, and docstring, under the
-    *live* enabled state (monid gate) and full coverage (core + local +
-    memory).
-
-    A change here means a running codex session's cached tool list is stale,
-    so the daemon rotates those sessions at startup (see
-    ``_respawn_codex_on_mcp_change_at_startup``). Enabling monid, renaming a
-    tool, or editing a param/docstring now all move the hash; the earlier
-    version hashed only names + param names under a dummy (monid-disabled)
-    config and never registered the memory tools, so those changes were
-    invisible and the session kept a stale surface."""
+    """Hash of the tool surface the model is offered (see
+    ``_capture_tool_surface``). When it changes, the daemon rotates stale
+    codex sessions at startup (``_respawn_codex_on_mcp_change_at_startup``).
+    The earlier version hashed only names + param names under a dummy
+    monid-disabled config and skipped the memory tools, so enabling monid
+    never moved the hash and the session kept a monid-less surface."""
     import hashlib
     import json
 
