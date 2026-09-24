@@ -7,10 +7,10 @@ travels in the machine signature the server verifies
 verified header rather than from a field the caller filled in.
 
 Three ops. The claim route is interface v1 (Bob 219652) and has run. The
-refresh route is agreed in full (Bob 221549) and has not: the handler is being
-written, and until it exists nothing here has been near a server. The
-disconnect is local only and reaches no server at all — the remote half of a
-disconnect is missing rather than deferred.
+refresh route is agreed in full (Bob 221549) and has not: a handler exists on
+the other side now (#406 at ``127ee329``) and these two ends have never spoken.
+The disconnect is local only and reaches no server at all — the remote half of
+a disconnect is missing rather than deferred.
 """
 
 from __future__ import annotations
@@ -249,9 +249,11 @@ class RefreshRefused(Exception):
 # exchanges it, and hands back the replacement (Bob 221549). A path that looked
 # a connection up would describe a server that does not exist.
 #
-# What is NOT established: that any of this works. The handler is being written
-# now; before that it did not exist at all (Boris 221525 read #406; Jeff 221526
-# confirmed). Nothing below has run against a server, only against stand-ins.
+# What is NOT established: that any of this works. The handler now exists —
+# puffo-server #406 at ``127ee329``, same shape both ways (Bob 221596) — but it
+# has not been compiled locally, its integration is untested, and nothing has
+# been sent to Google through it. Nothing below has run against a server
+# either, only against stand-ins here.
 _REFRESH_PATH = "/v2/machines/me/oauth-credentials/refresh"
 
 
