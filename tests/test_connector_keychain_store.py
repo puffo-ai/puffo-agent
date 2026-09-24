@@ -340,3 +340,43 @@ def test_a_disconnect_against_an_unreachable_keychain_is_not_reported_as_cleared
 
     with pytest.raises(KeychainUnavailable):
         store.clear()
+
+
+def test_a_stored_record_is_always_printable_ascii():
+    """The constraint the Keychain transport turned out to need, for free.
+
+    Jeff 220731/220737 measured that ``security`` hands a value back as hex
+    rather than raw bytes once it contains non-ASCII, a trailing newline, an
+    inner newline or a tab — so a writer has to keep everything inside
+    0x20–0x7e or the read side becomes ambiguous. Boris's diagnostic has to
+    *refuse* values that miss it, because the Claude blob's shape is not ours.
+
+    This store never has to refuse: ``_encode`` is ``json.dumps`` with the
+    default ``ensure_ascii``, which escapes every code point outside that
+    range — including DEL, which JSON does not require escaping and which
+    CPython escapes anyway (verified 0x00–0x2000 exhaustively and sampled
+    above, on 3.12). The property is what the transport depends on, so it is
+    pinned here rather than left as a fact about a library default.
+    """
+    from puffo_agent.portal.connector.store import Connection, _encode
+
+    awkward = {
+        "non_ascii": "令牌",
+        "emoji": "\U0001f600",
+        "inner_newline": "a\nb",
+        "inner_tab": "a\tb",
+        "trailing_newline": "abc\n",
+        "del_character": "a\x7fb",
+        "nul": "a\x00b",
+        "quotes": 'a"\\b',
+        "nested": [1, {"deep\x7f": None}],
+    }
+    body = _encode(
+        Connection(reference="r", request_ref="q", provider="p", credential=awkward)
+    )
+
+    outside = sorted({byte for byte in body if not 0x20 <= byte <= 0x7E})
+    assert outside == [], [hex(b) for b in outside]
+    # Positive control: the same scan does flag a byte that is out of range,
+    # so the empty result above is a measurement and not a vacuous one.
+    assert [b for b in "a\nb".encode() if not 0x20 <= b <= 0x7E] == [0x0A]
