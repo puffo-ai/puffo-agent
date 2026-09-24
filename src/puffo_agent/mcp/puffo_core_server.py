@@ -76,21 +76,47 @@ def _validate_refresh_inference_level(harness: str, level: str) -> None:
         )
 
 
-def mcp_tool_fingerprint() -> str:
-    """Hash of the puffo MCP tool surface — tool names + their params."""
-    import hashlib
+def _captured_tool_schema(fn) -> dict[str, object]:
+    """Stable, address-free description of one tool for the fingerprint:
+    docstring plus each parameter's name, annotation, kind, and whether it
+    is required. Default *values* are deliberately excluded — a sentinel
+    default (e.g. ``object()``) renders with a process address, which would
+    make the fingerprint differ every restart and rotate every session."""
     import inspect
-    import json
+
+    params = [
+        {
+            "name": name,
+            "annotation": (
+                "" if p.annotation is inspect.Parameter.empty
+                else str(p.annotation)
+            ),
+            "kind": p.kind.name,
+            "required": p.default is inspect.Parameter.empty,
+        }
+        for name, p in inspect.signature(fn).parameters.items()
+    ]
+    return {"doc": inspect.getdoc(fn) or "", "params": params}
+
+
+def _capture_tool_surface() -> dict[str, dict[str, object]]:
+    """Tool name → schema the model is offered, under the *live* config —
+    the exact input ``mcp_tool_fingerprint`` hashes. Mirrors ``build_server``
+    (core + local + memory) so enabling monid, renaming a tool, or editing a
+    param/docstring is reflected. Split out so the fingerprint's coverage
+    (the monid gate, the memory family) is directly assertable."""
     import types
 
+    from .config import monid_tools_enabled
+    from .memory_tools import MemoryToolsConfig, register_memory_tools
     from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
 
-    captured: dict[str, list[str]] = {}
+    captured: dict[str, dict[str, object]] = {}
 
     class _Capture:
         def tool(self, *a, **k):
             def deco(fn):
-                captured[fn.__name__] = list(inspect.signature(fn).parameters)
+                captured[fn.__name__] = _captured_tool_schema(fn)
                 return fn
             return deco
 
@@ -100,17 +126,41 @@ def mcp_tool_fingerprint() -> str:
         def prompt(self, *a, **k):
             return lambda fn: fn
 
-    dummy = PuffoCoreToolsConfig(
+    core_cfg = PuffoCoreToolsConfig(
         slug="", device_id="",
         keystore=types.SimpleNamespace(),
         http_client=types.SimpleNamespace(),
         data_client=types.SimpleNamespace(),
+        monid_tools_enabled=monid_tools_enabled(),
     )
     cap = _Capture()
-    register_core_tools(cap, dummy)
+    register_core_tools(cap, core_cfg)
     _register_local_tools(cap, "", "", "")
+    register_memory_tools(
+        cap, MemoryToolsConfig(memory_root="", workspace="", maintenance=False),
+    )
+    return captured
+
+
+def mcp_tool_fingerprint() -> str:
+    """Hash of the puffo MCP tool surface the model is offered: every
+    registered tool's name, parameter schema, and docstring, under the
+    *live* enabled state (monid gate) and full coverage (core + local +
+    memory).
+
+    A change here means a running codex session's cached tool list is stale,
+    so the daemon rotates those sessions at startup (see
+    ``_respawn_codex_on_mcp_change_at_startup``). Enabling monid, renaming a
+    tool, or editing a param/docstring now all move the hash; the earlier
+    version hashed only names + param names under a dummy (monid-disabled)
+    config and never registered the memory tools, so those changes were
+    invisible and the session kept a stale surface."""
+    import hashlib
+    import json
+
+    surface = _capture_tool_surface()
     payload = json.dumps(
-        {name: captured[name] for name in sorted(captured)}, sort_keys=True,
+        {name: surface[name] for name in sorted(surface)}, sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
