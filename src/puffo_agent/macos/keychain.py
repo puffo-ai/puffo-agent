@@ -12,7 +12,8 @@ read a per-agent ``.credentials.json`` without round-tripping through
 
 This module provides the storage primitives only:
 
-  - **Keychain read / write** via the ``security`` CLI.
+  - **Keychain read / write** via the ``security`` CLI (writes keep the
+    secret off the command line; see ``writeback_to_keychain``).
   - **CredentialCache** — atomic-write JSON blob to
     ``~/.puffo-agent/run/claude-credentials.json``, daemon-owned.
   - **Bootstrap** — populate the cache from Keychain on first call.
@@ -224,6 +225,9 @@ def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainRea
     return KeychainReadResult(True, selected.blob, None, None, selected.service)
 
 
+_PRINTABLE_ASCII = frozenset(range(0x20, 0x7F))
+
+
 def writeback_to_keychain(
     blob: str,
     timeout: float = SECURITY_TIMEOUT_SECONDS,
@@ -231,28 +235,42 @@ def writeback_to_keychain(
 ) -> tuple[bool, Optional[str]]:
     """Upsert the JSON blob into the Keychain entry. Best-effort.
 
-    Only used by external-rotation poll when we detect Keychain drifted
-    from cache for some reason; the canonical refresh path lets claude
-    itself update Keychain.
+    Only the operator diagnostic ``puffo-agent test keychain-write`` calls
+    this; the canonical refresh path lets claude itself update Keychain.
+
+    The blob never goes on the command line, where every process of the same
+    user can read it. It travels on stdin, hex-encoded, inside a
+    ``security -i`` command. ``security`` reads a value back byte for byte
+    only when every byte is printable ASCII (anything else comes back as
+    hex), so other blobs are refused rather than stored in a form the next
+    read would misreport. ``security -i`` does not reliably report a failed
+    inner command in its exit status, so callers must read the item back.
     """
     if not is_macos():
         return (False, "not_macos")
     target_service = service or KEYCHAIN_SERVICE
+    account = os.environ.get("USER", "claude")
+    data = blob.encode("utf-8")
+    if not data or not set(data) <= _PRINTABLE_ASCII:
+        return (False, "unsupported_blob: only printable ASCII reads back intact")
+    for name, value in (("service", target_service), ("account", account)):
+        # Names are single-quoted in the command; a quote would end them early.
+        if not value or "'" in value or not set(value.encode("utf-8")) <= _PRINTABLE_ASCII:
+            return (False, f"unsupported_{name}_name")
+    secret = data.hex()
+    command = (
+        f"add-generic-password -U -s '{target_service}' -a '{account}' -X {secret}\n"
+    )
     try:
         result = subprocess.run(
-            [
-                "security", "add-generic-password",
-                "-U",
-                "-s", target_service,
-                "-a", os.environ.get("USER", "claude"),
-                "-w", blob,
-            ],
-            capture_output=True, text=True, timeout=timeout,
+            ["security", "-i"],
+            input=command, capture_output=True, text=True, timeout=timeout,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return (False, f"security_failed: {exc}")
+        return (False, f"security_failed: {type(exc).__name__}")
     if result.returncode != 0:
-        return (False, f"exit_code={result.returncode}; stderr={result.stderr.strip()!r}")
+        stderr = result.stderr.strip().replace(secret, "<redacted>")
+        return (False, f"exit_code={result.returncode}; stderr={stderr!r}")
     return (True, None)
 
 

@@ -197,6 +197,11 @@ def probe_keychain_write() -> ProbeReport:
     rpt.add("prerequisite-read", VERDICT_OK, "captured existing blob")
 
     ok, reason = writeback_to_keychain(pre.blob, service=pre.service)
+    if not ok and reason and reason.startswith("unsupported_"):
+        # Not a Keychain failure: this blob cannot be written without putting
+        # it on the command line or storing it in a form reads misreport.
+        rpt.add("write", VERDICT_NEEDS_ATTENTION, f"writeback not attempted: {reason}")
+        return rpt
     if not ok:
         rpt.add("write", VERDICT_FAIL, f"upsert failed: {reason}")
         return rpt
