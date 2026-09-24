@@ -91,6 +91,12 @@ def monid_tools_enabled() -> bool:
     return os.environ.get(MONID_TOOLS_ENABLED_ENV, "true").strip().lower() != "false"
 
 
+#: Monid paid-data tool names — single source of truth. Registered by
+#: ``mcp.core_monid_tools`` when ``monid_tools_enabled()``; spliced into
+#: ``PUFFO_CORE_TOOL_NAMES`` and reused by the MCP tool fingerprint.
+MONID_TOOL_NAMES = ("monid_prepare", "monid_spend")
+
+
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
     "send_message_with_attachments",
@@ -123,9 +129,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "add_dm_allowlist",
     "update_dm_blocklist",
     "refresh",
-    # Monid paid-data tools (registered by mcp.core_monid_tools, default-off gate).
-    "monid_prepare",
-    "monid_spend",
+    # Monid paid-data tools (registered by mcp.core_monid_tools when enabled).
+    *MONID_TOOL_NAMES,
     # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",
