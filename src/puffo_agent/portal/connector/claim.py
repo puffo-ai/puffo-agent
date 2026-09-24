@@ -167,3 +167,21 @@ async def replace_credential(reference: str, credential: Any, *, store: Any) -> 
     """
     async with _claim_lock():
         return store.update(reference=reference, credential=credential)
+
+
+async def disconnect(store: Any) -> None:
+    """Give up this computer's connection, serialised with everything else.
+
+    Under the same lock as the claim and the refresh, because a disconnect
+    races them for real: a claim that read "nothing here" and is still waiting
+    on the server would otherwise save *after* the clear and hand the user back
+    the connection they just gave up. The reference check in ``update`` cannot
+    catch that one — the connection being written did not exist yet when the
+    disconnect ran (Jeff 220610).
+
+    Whatever ``clear`` raises comes out. A disconnect that could not clear must
+    not be reported as done: the promise is that the local credential goes
+    first (Jeremy 217298 / Jeff 217299).
+    """
+    async with _claim_lock():
+        store.clear()

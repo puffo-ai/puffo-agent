@@ -178,3 +178,39 @@ async def test_the_refresh_entry_point_raises_rather_than_reporting_a_dict(tmp_p
 
     with pytest.raises(StaleConnection):
         await replace_credential("nothing-here", {"refresh_token": SECOND}, store=store)
+
+
+@pytest.mark.asyncio
+async def test_a_disconnect_is_not_undone_by_a_claim_that_was_already_running(tmp_path):
+    """The user disconnects while a claim is waiting on the server.
+
+    The claim read "nothing here" before the disconnect, so its save has
+    nothing to compare against — the reference check cannot help. Only
+    serialising the two keeps the connection from coming back after the user
+    gave it up (Jeff 220610).
+    """
+    import asyncio
+
+    from puffo_agent.portal.connector.claim import claim_connection, disconnect
+
+    store = store_at(tmp_path)
+    reached_the_server = asyncio.Event()
+    let_it_finish = asyncio.Event()
+
+    async def slow(request_ref):
+        reached_the_server.set()
+        await let_it_finish.wait()
+        return "fake", {"refresh_token": SECOND}
+
+    claiming = asyncio.create_task(claim_connection("req-1", fetch=slow, store=store))
+    await reached_the_server.wait()
+
+    disconnecting = asyncio.create_task(disconnect(store))
+    # Give an unserialised disconnect every chance to run first and be wrong.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    let_it_finish.set()
+    await asyncio.gather(claiming, disconnecting)
+
+    assert store.load() is None
+    assert files_holding(tmp_path, SECOND) == []
