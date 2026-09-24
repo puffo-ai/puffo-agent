@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,9 +258,8 @@ def writeback_to_keychain(
         # Names are single-quoted in the command; a quote would end them early.
         if not value or "'" in value or not set(value.encode("utf-8")) <= _PRINTABLE_ASCII:
             return (False, f"unsupported_{name}_name")
-    secret = data.hex()
     command = (
-        f"add-generic-password -U -s '{target_service}' -a '{account}' -X {secret}\n"
+        f"add-generic-password -U -s '{target_service}' -a '{account}' -X {data.hex()}\n"
     )
     try:
         result = subprocess.run(
@@ -269,8 +269,11 @@ def writeback_to_keychain(
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return (False, f"security_failed: {type(exc).__name__}")
     if result.returncode != 0:
-        stderr = result.stderr.strip().replace(secret, "<redacted>")
-        return (False, f"exit_code={result.returncode}; stderr={stderr!r}")
+        # Report only the exit code and any OSStatus codes. Redacting the hex
+        # would not cover every form stderr could echo the value in, so none
+        # of stderr's free text is passed on.
+        statuses = ",".join(re.findall(r"(?<![\w-])-\d{1,6}\b", result.stderr)) or "none"
+        return (False, f"exit_code={result.returncode}; security_status={statuses}")
     return (True, None)
 
 
