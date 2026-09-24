@@ -1,9 +1,13 @@
 """Where a claimed connection lives on this computer.
 
-v0.4 §8 runs the first chain against a test store deliberately: the real store
-brings OS keychain integration, which belongs to step two. This one is a plain
-file so the whole chain can be exercised now, and it is the piece step two
-replaces — nothing above it parses what it holds.
+``ConnectionStore`` is the shape; there are two of them. On macOS the record
+goes in the login Keychain (``keychain_store``), which is what v0.4 §8 means
+by the real store. Everywhere else it goes in a private file, which is also
+what the first chain was built and verified against.
+
+Both inherit the two rules that would be expensive to get differently right
+twice: a store that cannot be read is not an empty one, and a refresh may only
+replace the connection it names.
 
 The credential is stored verbatim. The daemon is not told which provider it is
 holding (v0.4 §4: credential shape is agreed between the provider adapter and
@@ -51,21 +55,26 @@ class StaleConnection(Exception):
     """
 
 
-class SkeletonConnectionStore:
-    """One connection per computer, in one file. Step two swaps this out."""
+class ConnectionStore:
+    """What every connection store does, and the rules that do not depend on
+    where the bytes end up.
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    Subclasses supply three things — read the record, put the record there,
+    remove it — and inherit the rest. The rules below are the ones it would be
+    expensive to get differently right twice: that an unreadable store is not
+    an empty one, and that a refresh may only land on the connection it names.
+    """
 
     def load(self) -> Connection | None:
         """The saved connection, or None when this computer has none.
 
-        An unreadable file is not "no connection": answering None would invite
-        the caller to overwrite a credential it could not read.
+        A store that cannot be read is not "no connection": answering None
+        would invite the caller to overwrite a credential it could not read.
+        Subclasses say "absent" by returning None from ``_read`` and say
+        "cannot tell" by raising — they must never confuse the two.
         """
-        try:
-            raw = self.path.read_bytes()
-        except FileNotFoundError:
+        raw = self._read()
+        if raw is None:
             return None
         record = json.loads(raw)
         return Connection(
@@ -83,7 +92,7 @@ class SkeletonConnectionStore:
             provider=provider,
             credential=credential,
         )
-        self._write(connection)
+        self._put(_encode(connection))
         return connection
 
     def update(self, *, reference: str, credential: Any) -> Connection:
@@ -118,8 +127,52 @@ class SkeletonConnectionStore:
             provider=current.provider,
             credential=credential,
         )
-        self._write(refreshed)
+        self._put(_encode(refreshed))
         return refreshed
+
+    def clear(self) -> None:
+        """Remove this computer's connection."""
+        self._erase()
+
+    def _read(self) -> bytes | None:
+        """The stored record, or None when there is none. Raises when the
+        store cannot be read — which is not the same answer."""
+        raise NotImplementedError
+
+    def _put(self, body: bytes) -> None:
+        """Make ``body`` the stored record, or leave the store unchanged."""
+        raise NotImplementedError
+
+    def _erase(self) -> None:
+        """Remove the stored record, leaving no readable copy behind."""
+        raise NotImplementedError
+
+
+def _encode(connection: Connection) -> bytes:
+    """The record as stored. One line of ASCII JSON, no trailing newline —
+    ``json.dumps`` escapes non-ASCII by default, which keeps the record
+    printable through stores that hand it back through a pipe."""
+    return json.dumps(
+        {
+            "reference": connection.reference,
+            "request_ref": connection.request_ref,
+            "provider": connection.provider,
+            "credential": connection.credential,
+        }
+    ).encode()
+
+
+class SkeletonConnectionStore(ConnectionStore):
+    """One connection per computer, in one file.
+
+    The non-macOS backend, and the one the first chain was built against. It
+    is not what step two replaces after all: a computer without a Keychain
+    still has to keep a connection somewhere, so this stays as that computer's
+    store while ``KeychainConnectionStore`` takes over on macOS.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
 
     def clear(self) -> None:
         """Remove this computer's connection, temporary file included.
@@ -135,7 +188,16 @@ class SkeletonConnectionStore:
         self.path.unlink(missing_ok=True)
         self.path.with_suffix(".partial").unlink(missing_ok=True)
 
-    def _write(self, connection: Connection) -> None:
+    def _read(self) -> bytes | None:
+        try:
+            return self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def _erase(self) -> None:
+        self.clear()
+
+    def _put(self, body: bytes) -> None:
         """Put the whole record on disk, or leave nothing new behind.
 
         Written whole, then renamed: a crash mid-write must not leave a
@@ -146,14 +208,6 @@ class SkeletonConnectionStore:
         same guarantee as a first one — there is only one way a credential
         reaches this disk, and so only one place that has to be right.
         """
-        body = json.dumps(
-            {
-                "reference": connection.reference,
-                "request_ref": connection.request_ref,
-                "provider": connection.provider,
-                "credential": connection.credential,
-            }
-        ).encode()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".partial")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

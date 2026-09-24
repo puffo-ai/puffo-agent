@@ -11,6 +11,7 @@ caller filled in.
 from __future__ import annotations
 
 import logging
+import platform
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -21,7 +22,8 @@ from ..control.store import MachineControlIdentity, load_or_create_machine
 from ..host_assets import _ensure_private_directory
 from ..state import home_dir
 from .claim import ClaimFailed, claim_connection
-from .store import SkeletonConnectionStore
+from .keychain_store import KeychainConnectionStore
+from .store import ConnectionStore, SkeletonConnectionStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,42 @@ def connection_path() -> Path:
     return directory / "connection.json"
 
 
+# The Keychain backend is written and tested against a stand-in for
+# ``security``, but the leg from it to a real login Keychain has never been
+# run: an agent environment has no login Keychain to write to, and reaching the
+# operator's would mean changing HOME. The stdin form of ``-w`` this depends on
+# is documented by ``security`` itself and nothing more — so until that one run
+# exists macOS keeps the file store, because a store that failed closed on
+# every macOS computer would take the integration chain down with it.
+#
+# What flips this: on a computer with a daemon's HOME, a save, a load, an
+# update and a clear through ``KeychainConnectionStore``, and
+# ``security find-generic-password -s "Puffo Agent-connector" -a <machine_id>``
+# finding nothing afterwards. Then one line, and the tests below already cover
+# which backend each platform gets.
+#
+# The same change owes one more thing: a computer that already holds a
+# ``connection.json`` keeps it after the switch, because ``clear`` only reaches
+# the store it was handed. That file has to be swept, or a disconnect would
+# report cleared while the old credential stayed readable on disk — the breach
+# 4bf86f72 closed for the temporary file, arriving by the other door.
+_KEYCHAIN_VERIFIED = False
+
+
+def connection_store(machine: MachineControlIdentity) -> ConnectionStore:
+    """Where this computer keeps its connection.
+
+    Keyed on the machine identity rather than the home directory: one login
+    Keychain serves every puffo home on a computer, while a connection belongs
+    to the identity that claimed it, so two daemons must not land on one item.
+    Not a caller's choice — which store holds a credential is a property of the
+    computer, and a parameter here would make it a setting.
+    """
+    if _KEYCHAIN_VERIFIED and platform.system() == "Darwin":
+        return KeychainConnectionStore(machine.machine_id)
+    return SkeletonConnectionStore(connection_path())
+
+
 async def run_claim_command(params: dict, server_url: str) -> dict:
     """Entry point for the dispatcher. Always returns a command result."""
     request_ref = str(params.get("request_ref") or "").strip()
@@ -57,7 +95,7 @@ async def run_claim_command(params: dict, server_url: str) -> dict:
         return await _fetch_from_server(base, machine, reference)
 
     return await claim_connection(
-        request_ref, fetch=fetch, store=SkeletonConnectionStore(connection_path())
+        request_ref, fetch=fetch, store=connection_store(machine)
     )
 
 
