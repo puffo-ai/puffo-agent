@@ -124,6 +124,30 @@ async def test_a_credential_that_does_not_reach_disk_is_not_reported_connected(t
     assert result["stage"] == STAGE_SAVE
 
 
+def test_a_connection_does_not_print_its_credential(tmp_path):
+    """One ``%s`` must not be able to put a live token in a log file.
+
+    The default dataclass repr prints every field. Nothing in this package
+    logs a Connection — every line passes ``.reference`` — so this is about
+    the line somebody adds later, and about the tracebacks and pytest failures
+    nobody writes on purpose. The same field was flagged on the server half
+    for the same reason (Boris 221597, on a derived ``Debug``).
+    """
+    store = store_at(tmp_path)
+    saved = store.save(
+        request_ref="req-1", provider="google",
+        credential={"refresh_token": "SENTINEL8d31f0c2token", "nested": ["SENTINEL8d31f0c2token"]},
+    )
+
+    for shown in (repr(saved), str(saved), f"{saved}", "%s" % (saved,)):
+        assert "SENTINEL8d31f0c2token" not in shown
+    # Not achieved by printing nothing: the three non-secret fields are what
+    # a log line would have wanted, and hiding them just moves the print.
+    assert saved.reference in repr(saved)
+    assert "google" in repr(saved)
+    assert "req-1" in repr(saved)
+
+
 def test_the_stored_credential_is_never_parsed(tmp_path):
     """The daemon is not told the credential's shape (v0.4 §4), so a shape it
     has never seen must round-trip untouched."""

@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Connection:
     """A saved connection, as this computer knows it.
 
@@ -43,6 +43,27 @@ class Connection:
     request_ref: str
     provider: str
     credential: Any
+
+    def __repr__(self) -> str:
+        """Everything except the credential.
+
+        A dataclass prints every field it has, so one ``%s`` on a Connection
+        anywhere — a log line, a pytest failure, a traceback that happens to
+        carry the frame it lives in — writes a working Google refresh token
+        into a file. Nothing does that today; every log line in this package
+        passes ``.reference``. This is about the day somebody adds one, which
+        is the same reason the server half was asked to stop deriving ``Debug``
+        on its request type (Boris 221597).
+
+        The other three fields stay readable. A repr that showed nothing would
+        just get replaced at the call site by a print of the field somebody
+        wanted, and none of those three is a secret.
+        """
+        return (
+            f"Connection(reference={self.reference!r}, "
+            f"request_ref={self.request_ref!r}, "
+            f"provider={self.provider!r}, credential=<not shown>)"
+        )
 
 
 class StaleConnection(Exception):
