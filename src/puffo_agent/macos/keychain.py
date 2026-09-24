@@ -44,7 +44,6 @@ import json
 import logging
 import os
 import platform
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -269,11 +268,10 @@ def writeback_to_keychain(
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return (False, f"security_failed: {type(exc).__name__}")
     if result.returncode != 0:
-        # Report only the exit code and any OSStatus codes. Redacting the hex
-        # would not cover every form stderr could echo the value in, so none
-        # of stderr's free text is passed on.
-        statuses = ",".join(re.findall(r"(?<![\w-])-\d{1,6}\b", result.stderr)) or "none"
-        return (False, f"exit_code={result.returncode}; security_status={statuses}")
+        # Report the exit code only. stderr can echo the value in forms no
+        # filter recognises, and even picking status codes out of it would
+        # pass through digits from an echoed credential.
+        return (False, f"exit_code={result.returncode}")
     return (True, None)
 
 

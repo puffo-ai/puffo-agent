@@ -335,10 +335,12 @@ def test_writeback_to_keychain_refuses_names_it_cannot_quote(monkeypatch, servic
     lambda blob: blob.encode().hex(),
     lambda blob: blob,
     lambda blob: blob[5:40],
-], ids=["hex", "plaintext", "fragment"])
+    lambda blob: '{"token":"SYNTHETIC -123456"}',
+], ids=["hex", "plaintext", "fragment", "negative-number"])
 def test_writeback_to_keychain_keeps_stderr_text_out_of_errors(monkeypatch, echo):
-    # Whatever form security might echo the value in, none of stderr's free
-    # text reaches the reason; only the exit code and OSStatus codes do.
+    # Whatever form security might echo the value in, nothing from stderr
+    # reaches the reason, not even digits that look like a status code
+    # (Jeff, tool-connectors 220856).
     _force_macos(monkeypatch)
     stderr = f"add-generic-password: returned -25308 near {echo(_BLOB)}"
     monkeypatch.setattr(
@@ -347,8 +349,7 @@ def test_writeback_to_keychain_keeps_stderr_text_out_of_errors(monkeypatch, echo
     )
     ok, reason = cm.writeback_to_keychain(_BLOB)
     assert ok is False
-    assert reason == "exit_code=1; security_status=-25308"
-    assert echo(_BLOB) not in reason
+    assert reason == "exit_code=1"
 
 
 def test_writeback_to_keychain_reports_failure(monkeypatch):
@@ -358,7 +359,7 @@ def test_writeback_to_keychain_reports_failure(monkeypatch):
         lambda *a, **k: _FakeCompletedProcess(1, stderr="permission denied"),
     )
     ok, reason = cm.writeback_to_keychain(_BLOB)
-    assert (ok, reason) == (False, "exit_code=1; security_status=none")
+    assert (ok, reason) == (False, "exit_code=1")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
