@@ -44,7 +44,9 @@ refusing rather than guessing:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import subprocess
 
 from ..._proc import no_window_kwargs
@@ -95,6 +97,31 @@ class KeychainConnectionStore(ConnectionStore):
         self.service = service
         self.timeout = timeout
 
+    def _write_command(self, body: bytes) -> bytes:
+        """The one line handed to ``security -i``.
+
+        The value travels as hex through ``-X``: nothing secret reaches argv,
+        and hex sidesteps every quoting question a JSON blob would raise.
+        Names are single-quoted, which Jeff 220737 measured working for a
+        service name containing a space.
+
+        Refusals rather than escaping. A name holding a quote would need the
+        shell-quoting rules of a mode nobody has characterised — Jeff's probe
+        covered a space and two wrapping styles and said so — and this store
+        picks its own names, so refusing costs nothing and guessing could
+        silently write somewhere else.
+        """
+        for label, name in (("service", self.service), ("account", self.account)):
+            if not name or "'" in name or any(not 0x20 <= b <= 0x7E for b in name.encode()):
+                raise KeychainUnavailable(
+                    f"refusing to build a Keychain command: the {label} name is "
+                    "empty, quoted, or not printable ASCII"
+                )
+        return (
+            f"add-generic-password -U -s '{self.service}' -a '{self.account}' "
+            f"-X {body.hex()}\n"
+        ).encode()
+
     def _read(self) -> bytes | None:
         found = self._run(["find-generic-password", "-s", self.service, "-a", self.account, "-w"])
         if found.returncode == 0:
@@ -102,7 +129,27 @@ class KeychainConnectionStore(ConnectionStore):
             # ``_encode`` never ends in one, so removing exactly one is exact.
             # If that ever stops being true the read-back check in ``_put``
             # turns it into a loud failure rather than a corrupted record.
-            return found.stdout.removesuffix(b"\n")
+            raw = found.stdout.removesuffix(b"\n")
+            # Parse it; do not sniff it. `security` hands a value back as hex
+            # rather than raw once it holds bytes outside 0x20-0x7e (Jeff
+            # 220731/220737), and our records never do — but "looks like hex"
+            # cannot be the test, because a hex string is printable ASCII too
+            # and so is every record we write. Whatever will not parse is not
+            # ours, and that fails closed instead of being decoded on a guess.
+            #
+            # Deliberately parsed twice, here and in ``load``: the second one
+            # costs nothing on a hundred bytes and this one buys an error that
+            # says what happened instead of a bare JSONDecodeError on a
+            # credential store.
+            try:
+                json.loads(raw)
+            except ValueError as exc:
+                raise KeychainUnavailable(
+                    "the Keychain returned something this computer did not "
+                    "write — it will not parse as a connection record, and it "
+                    f"is not decoded on a guess: {exc}"
+                ) from None
+            return raw
         if found.returncode == _ITEM_NOT_FOUND:
             self._require_a_reachable_keychain()
             return None
@@ -111,14 +158,15 @@ class KeychainConnectionStore(ConnectionStore):
         )
 
     def _put(self, body: bytes) -> None:
-        stored = self._run(
-            ["add-generic-password", "-U", "-s", self.service, "-a", self.account, "-w"],
-            stdin=body,
-        )
+        stored = self._run(["-i"], stdin=self._write_command(body))
         if stored.returncode != 0:
             raise KeychainUnavailable(
                 f"could not write the connection to the Keychain: {_explain(stored)}"
             )
+        # `security -i` does not reliably carry an inner command's failure into
+        # its own exit code (Boris 220754), so a zero here is not evidence. The
+        # read-back below is the actual gate, and it is the only reason the
+        # empty-password failure was caught rather than shipped.
         if self._read() != body:
             # Not erased. If the write simply did not take, the item still
             # holds the credential this computer was using, and deleting it
@@ -187,6 +235,11 @@ class KeychainConnectionStore(ConnectionStore):
             ) from exc
 
 
+# Long enough that a stray word cannot match, short enough to catch a truncated
+# echo of the value. Our records run to hundreds of hex characters.
+_HEX_RUN = re.compile(r"[0-9a-fA-F]{32,}")
+
+
 def _explain(completed) -> str:
     """What ``security`` said, kept out of the exception's own wording.
 
@@ -195,4 +248,10 @@ def _explain(completed) -> str:
     branch — but losing the sentence would leave nothing to diagnose by.
     """
     stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+    # The value reaches this process as hex on the way in and as itself on the
+    # way out; either could be echoed back by a failing command. Nothing here
+    # is worth putting a credential into an exception string for, so the long
+    # hex runs go first (Jeff 220786: a pipe does not leak, what you do with
+    # what you read out of it does).
+    stderr = _HEX_RUN.sub("<redacted>", stderr)
     return f"exit {completed.returncode}" + (f": {stderr}" if stderr else "")

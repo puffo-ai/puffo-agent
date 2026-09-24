@@ -14,6 +14,7 @@ Keychain is unverified and has to be run somewhere with a daemon's HOME.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 
 import pytest
@@ -52,6 +53,8 @@ class FakeSecurity:
     # stand-in that rejected it would make these tests macOS-only by accident.
     def __call__(self, argv, *, input=None, **_kwargs):
         self.calls.append((list(argv), input))
+        if argv[1] == "-i":
+            return self._interactive(argv, input)
         verb = argv[1]
         if verb == "default-keychain":
             code = 0 if self.default_keychain else 1
@@ -63,10 +66,10 @@ class FakeSecurity:
             # security appends exactly one newline to the password it prints.
             return self._done(argv, 0, self.items[key] + b"\n", b"")
         if verb == "add-generic-password":
-            # Both forms of -w are accepted on purpose: a trailing -w takes the
-            # password from stdin, -w VALUE takes it from the command line.
-            # Refusing the second here would make the argv test pass by
-            # construction instead of by what the store does.
+            # Reached only when the store writes through argv, which is the
+            # shape this file exists to rule out. Accepted rather than refused
+            # so the argv test fails on its own assertion instead of on a
+            # stand-in that made the bad shape impossible.
             self.items[key] = input if argv[-1] == "-w" else _option(argv, "-w").encode()
             return self._done(argv, 0, b"", b"")
         if verb == "delete-generic-password":
@@ -75,6 +78,22 @@ class FakeSecurity:
             del self.items[key]
             return self._done(argv, 0, b"", b"")
         raise AssertionError(f"unexpected security verb {verb!r}")
+
+    def _interactive(self, argv, script):
+        """``security -i`` reading one command off stdin.
+
+        Parsed rather than pattern-matched so a malformed command shows up as
+        a failure here instead of quietly looking like a write that worked.
+        """
+        parts = shlex.split(script.decode())
+        if not parts or parts[0] != "add-generic-password":
+            return self._done(argv, 1, b"", b"unsupported interactive command")
+        key = (_option(parts, "-s"), _option(parts, "-a"))
+        self.items[key] = bytes.fromhex(_option(parts, "-X"))
+        # security -i does not carry an inner failure out in its exit code, so
+        # this returns 0 for anything it accepted at all — the same unhelpful
+        # success the real one gives (Boris 220754).
+        return self._done(argv, 0, b"", b"")
 
     def _missing(self, argv):
         return self._done(
@@ -108,10 +127,13 @@ def test_the_credential_never_reaches_a_command_line(monkeypatch):
 
     for argv, _ in fake.calls:
         assert SENTINEL not in " ".join(argv)
-    # Positive control: the scan above can see the sentinel when it is there,
-    # so an empty result means "not in argv", not "looked in the wrong place".
+    # And argv is only ever the two words: no name, no value, nothing to read
+    # out of `ps` at all beyond the fact that a Keychain call happened.
+    assert [argv[1:] for argv, stdin in fake.calls if stdin] == [["-i"]]
+    # Positive control: the sentinel IS in what went to stdin, as hex — so the
+    # empty result above means "not in argv", not "looked in the wrong place".
     written = [stdin for _, stdin in fake.calls if stdin]
-    assert written and all(SENTINEL.encode() in body for body in written)
+    assert written and all(SENTINEL.encode().hex() in body.decode() for body in written)
 
 
 def test_a_connection_survives_a_round_trip_through_the_keychain(monkeypatch):
@@ -199,7 +221,9 @@ def test_a_write_the_keychain_did_not_take_is_not_reported_as_saved(monkeypatch)
     kept = dict(fake.items)
 
     def swallow_the_write(argv, *, input=None, **kwargs):
-        if argv[1] == "add-generic-password":
+        # Exactly what `security -i` does on an inner failure: exit 0 and
+        # store nothing (Boris 220754), which is why a zero cannot be the gate.
+        if argv[1] == "-i":
             fake.calls.append((list(argv), input))
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         return fake(argv, input=input, **kwargs)
@@ -380,3 +404,68 @@ def test_a_stored_record_is_always_printable_ascii():
     # Positive control: the same scan does flag a byte that is out of range,
     # so the empty result above is a measurement and not a vacuous one.
     assert [b for b in "a\nb".encode() if not 0x20 <= b <= 0x7E] == [0x0A]
+
+
+def test_a_value_that_is_not_our_record_is_refused_and_never_decoded(monkeypatch):
+    """`security` hands a value back as hex once it holds bytes outside
+    0x20-0x7e, and a hex string is printable ASCII just like our records are —
+    so "looks like hex" cannot be the test (Jeff 220731, who ruled that rule
+    out). Whatever will not parse is not ours and fails closed."""
+    fake = FakeSecurity()
+    store = keychain(monkeypatch, fake)
+    ours = b'{"reference":"r","request_ref":"q","provider":"p","credential":"v"}'
+    # Exactly the trap: the stored bytes are a valid hex encoding OF our record.
+    fake.items[("Puffo Agent-connector", "mac_testmachine")] = ours.hex().encode()
+
+    with pytest.raises(KeychainUnavailable) as refused:
+        store.load()
+
+    assert "not decoded on a guess" in str(refused.value)
+
+
+def test_a_name_that_would_need_quoting_rules_nobody_measured_is_refused(monkeypatch):
+    """A space is measured working (Jeff 220737); an embedded quote is not, and
+    guessing could write the item somewhere else entirely."""
+    monkeypatch.setattr(keychain_store.subprocess, "run", FakeSecurity())
+
+    with_a_quote = KeychainConnectionStore("mac_test", service="what's this")
+    with pytest.raises(KeychainUnavailable):
+        with_a_quote.save(request_ref="r", provider="p", credential={"t": SENTINEL})
+
+    not_printable = KeychainConnectionStore("mac_test", service="café")
+    with pytest.raises(KeychainUnavailable):
+        not_printable.save(request_ref="r", provider="p", credential={"t": SENTINEL})
+
+
+def test_a_service_name_with_a_space_is_not_refused(monkeypatch):
+    """Positive control for the refusal above — measured working, so the guard
+    must not be a blanket ban on anything unusual."""
+    fake = FakeSecurity()
+    monkeypatch.setattr(keychain_store.subprocess, "run", fake)
+    spaced = KeychainConnectionStore("mac_test", service="Puffo Agent connector")
+
+    saved = spaced.save(request_ref="r", provider="p", credential={"t": SENTINEL})
+
+    assert spaced.load().reference == saved.reference
+
+
+def test_a_failure_message_does_not_carry_the_value_back_out(monkeypatch):
+    """A pipe does not leak; what you do with what you read out of it can
+    (Jeff 220786). A failing command that echoes the hex must not put it into
+    an exception string."""
+    body = b'{"credential":"' + SENTINEL.encode() + b'"}'
+
+    def echoes_the_hex(argv, *, input=None, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, b"", b"security: bad argument -X " + body.hex().encode()
+        )
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", echoes_the_hex)
+    store = KeychainConnectionStore("mac_testmachine")
+
+    with pytest.raises(KeychainUnavailable) as failed:
+        store.save(request_ref="r", provider="p", credential={"t": SENTINEL})
+
+    assert "<redacted>" in str(failed.value)
+    assert body.hex() not in str(failed.value)
+    assert SENTINEL not in str(failed.value)
