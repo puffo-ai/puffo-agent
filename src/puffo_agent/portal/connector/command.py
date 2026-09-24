@@ -43,19 +43,20 @@ def connection_path() -> Path:
     return directory / "connection.json"
 
 
-# The Keychain backend is written and tested against a stand-in for
-# ``security``, but the leg from it to a real login Keychain has never been
-# run: an agent environment has no login Keychain to write to, and reaching the
-# operator's would mean changing HOME. The stdin form of ``-w`` this depends on
-# is documented by ``security`` itself and nothing more — so until that one run
-# exists macOS keeps the file store, because a store that failed closed on
-# every macOS computer would take the integration chain down with it.
+# macOS keeps the file store, and now for a measured reason rather than an
+# unverified one. The Keychain backend writes through ``security`` with the
+# value on stdin, and that form is broken: ``-w`` last prompts on a terminal,
+# so a piped value lands as an EMPTY password while ``security`` exits 0
+# (Jeff 220726, on a real Keychain with synthetic data). The backend's
+# read-back check turns that into a loud failure, so nothing silently stores
+# nothing — but it does mean a write cannot currently succeed.
 #
-# What flips this: on a computer with a daemon's HOME, a save, a load, an
-# update and a clear through ``KeychainConnectionStore``, and
-# ``security find-generic-password -s "Puffo Agent-connector" -a <machine_id>``
-# finding nothing afterwards. Then one line, and the tests below already cover
-# which backend each platform gets.
+# What flips this is therefore not "one confirming run" any more: the write has
+# to move off the CLI onto ``SecItemAdd``, which takes the value as data in a
+# dictionary — no command line to leak it into and no prompt to swallow it —
+# and which reports "no such item" as its own status instead of the CLI's 44
+# for everything. Then the confirming run, on a computer with a daemon's HOME:
+# save, load, update, clear, and nothing left behind afterwards.
 #
 # The same change owes one more thing: a computer that already holds a
 # ``connection.json`` keeps it after the switch, because ``clear`` only reaches

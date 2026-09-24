@@ -18,6 +18,8 @@ import logging
 import weakref
 from typing import Any, Awaitable, Callable
 
+from .store import StaleConnection
+
 logger = logging.getLogger(__name__)
 
 # Stages a claim can end at. Named so a log line answers "which segment"
@@ -48,6 +50,9 @@ class ClaimFailed(Exception):
 
 
 Fetch = Callable[[str], Awaitable[tuple[str, Any]]]
+# Hands the stored credential to the server and gets the replacement back,
+# whole. Mirrors ``Fetch``: one call is the whole of the server contract.
+Exchange = Callable[[Any], Awaitable[Any]]
 
 # One claim at a time in this process. `connector.claim` is a background op, so
 # two commands really do run concurrently, and read-then-save is not atomic:
@@ -60,6 +65,15 @@ Fetch = Callable[[str], Awaitable[tuple[str, Any]]]
 # binds to the loop that first awaits it and refuses any other, which would
 # break every test after the first. A daemon has one loop, so this is one lock
 # there; the weak keys let finished test loops go.
+#
+# What this is NOT: a lock between processes. It is one asyncio.Lock per event
+# loop, so it serialises this daemon against itself and nothing else. That is
+# enough only because one puffo home runs one daemon — the same assumption the
+# machine identity in ``control/machine.json`` and the single control
+# connection already make. Two daemons over one home would race here with
+# nothing to stop them, and the fix then is an OS-level lock on the home, not
+# a bigger asyncio one. Said plainly because it was previously described as
+# "anchored per puffo home", which this is not (Jeff 220726).
 _CLAIM_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
@@ -146,27 +160,33 @@ def _failure(request_ref: str, stage: str, reason: str) -> dict:
     return {"ok": False, "connected": False, "stage": stage, "reason": reason}
 
 
-async def replace_credential(reference: str, credential: Any, *, store: Any) -> Any:
-    """Write a refreshed credential onto the connection already on this computer.
+async def refresh_connection(reference: str, *, exchange: Exchange, store: Any) -> Any:
+    """Swap this computer's credential for a fresher one, end to end.
 
-    Shares the claim lock rather than taking one of its own. ``store.update``
-    reads, compares and writes, which is no more atomic than the claim's
-    read-then-save above; two separate locks would serialise each entry point
-    against itself and leave the pair free to interleave — the same hole
-    Boris 219713 found between two claims, one door further along.
+    The whole errand is inside the lock — read, exchange, write — and not just
+    the write. Two refreshes for one connection carry the *same* reference, so
+    the reference check cannot tell a late response from a current one: the
+    slow one simply writes last and the newer credential is gone. Locking only
+    the store write leaves that hole wide open, which is what it did until
+    Jeff 220726 reproduced it. Holding the lock across the exchange is also
+    what ``claim_connection`` already does with its own fetch, so this is the
+    module's existing shape rather than a new rule.
 
-    Raises ``StaleConnection`` (from the store) when the named connection is
-    not the one here. Nothing is written in that case and the caller's only
-    sound move is to drop the credential it holds: it belongs to a connection
-    this computer no longer has.
+    ``exchange`` receives the credential now on this computer and returns the
+    replacement, whole. The daemon does not take it apart in either direction
+    (v0.4 §4); which fields a refresh needs is the server adapter's business.
 
-    Unlike ``claim_connection`` this raises rather than returning a result
-    dict. There is no page waiting on it — a refresh is the daemon's own
-    errand, not an answer to a notification — so the caller is code that can
-    handle a failure, not a UI that must stop spinning.
+    Raises ``StaleConnection`` when the connection named is not the one here —
+    disconnected, or replaced, while the caller was deciding to refresh.
     """
     async with _claim_lock():
-        return store.update(reference=reference, credential=credential)
+        current = store.load()
+        if current is None or current.reference != reference:
+            raise StaleConnection(
+                f"this computer no longer holds connection {reference}"
+            )
+        replacement = await exchange(current.credential)
+        return store.update(reference=reference, credential=replacement)
 
 
 async def disconnect(store: Any) -> None:

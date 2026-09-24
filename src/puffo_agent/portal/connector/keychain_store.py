@@ -24,10 +24,16 @@ refusing rather than guessing:
 * The password goes in on stdin, never in ``argv``. ``security``'s own usage
   says ``Use of the -p or -w options is insecure. Specify -w as the last
   option to be prompted``, and on this computer another process running as the
-  same user can read a full command line out of ``ps``. The daemon cannot
-  prove the stdin form works from inside an agent environment — there is no
-  login Keychain there to write to — so every write reads itself back and
-  fails if what came out is not what went in.
+  same user can read a full command line out of ``ps``.
+
+  **That stdin form does not work, measured** (Jeff 220726): ``-w`` last
+  prompts on a *terminal*, not on stdin, so with the value piped in
+  ``security`` stores an EMPTY password and still exits 0 — on both the write
+  and the read back. The read-back check below is what caught it, which is the
+  only reason this is a known failure rather than a daemon reporting connected
+  with nothing stored. Until the write goes through ``SecItemAdd`` instead of
+  the CLI, ``_put`` cannot succeed on a real Keychain and this backend stays
+  unreachable behind ``_KEYCHAIN_VERIFIED``.
 """
 
 from __future__ import annotations
@@ -120,7 +126,16 @@ class KeychainConnectionStore(ConnectionStore):
 
     def _erase(self) -> None:
         removed = self._run(["delete-generic-password", "-s", self.service, "-a", self.account])
-        if removed.returncode in (0, _ITEM_NOT_FOUND):
+        if removed.returncode == 0:
+            return
+        if removed.returncode == _ITEM_NOT_FOUND:
+            # The same 44 as in ``_read``, and it needs the same control. A
+            # delete that never reached the right Keychain also answers "no
+            # such item", and taking that for "already gone" would report a
+            # disconnect as done while the credential sat there — the exact
+            # breach this method exists to prevent (Jeff 220726: ``_erase``
+            # was reading 44 as success without probing).
+            self._require_a_reachable_keychain()
             return
         # A disconnect that could not clear must not report success: the
         # promise is that the local credential goes first (Jeremy 217298 /

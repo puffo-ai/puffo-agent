@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from puffo_agent.portal.connector import store as store_module
-from puffo_agent.portal.connector.claim import replace_credential
+from puffo_agent.portal.connector.claim import refresh_connection
 from puffo_agent.portal.connector.store import SkeletonConnectionStore, StaleConnection
 
 # Distinct per generation of the credential, so "the new one is here" and "the
@@ -157,27 +157,94 @@ def test_a_refresh_that_fails_after_writing_keeps_the_connection_and_spills_noth
 
 
 @pytest.mark.asyncio
-async def test_the_refresh_entry_point_writes_through_to_the_store(tmp_path):
-    """``replace_credential`` exists to take the claim lock; prove it still
-    reaches the store rather than only holding it."""
+async def test_a_refresh_hands_the_stored_credential_over_and_writes_what_comes_back(
+    tmp_path,
+):
+    """Whole in, whole out: the daemon does not take the credential apart in
+    either direction (v0.4 §4)."""
     store = store_at(tmp_path)
     original = connected(store, "req-1", FIRST)
+    handed_over = []
 
-    await replace_credential(
-        original.reference, {"refresh_token": SECOND}, store=store
-    )
+    async def exchange(credential):
+        handed_over.append(credential)
+        return {"refresh_token": SECOND}
 
+    await refresh_connection(original.reference, exchange=exchange, store=store)
+
+    assert handed_over == [{"refresh_token": FIRST}]
     assert store_at(tmp_path).load().credential == {"refresh_token": SECOND}
 
 
 @pytest.mark.asyncio
-async def test_the_refresh_entry_point_raises_rather_than_reporting_a_dict(tmp_path):
-    """No page is waiting on a refresh, so a failure is an exception, not a
-    result dict a UI would have to interpret."""
+async def test_a_refresh_for_a_connection_that_is_gone_never_reaches_the_server(
+    tmp_path,
+):
+    """Nothing to refresh, so nothing to ask for — and an exception, not a
+    result dict: no page is waiting on a refresh."""
     store = store_at(tmp_path)
+    asked = []
+
+    async def exchange(credential):
+        asked.append(credential)
+        return {"refresh_token": SECOND}
 
     with pytest.raises(StaleConnection):
-        await replace_credential("nothing-here", {"refresh_token": SECOND}, store=store)
+        await refresh_connection("nothing-here", exchange=exchange, store=store)
+
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_slow_refresh_cannot_overwrite_a_newer_one_for_the_same_connection(
+    tmp_path,
+):
+    """Two refreshes for one connection carry the *same* reference.
+
+    So the reference check cannot tell a late response from a current one —
+    the slow one just writes last and the newer credential is gone. Only
+    holding the lock across the exchange closes it, which is why the lock went
+    around the whole errand rather than the store write (Jeff 220726
+    reproduced this against the version that locked only the write).
+    """
+    import asyncio
+
+    store = store_at(tmp_path)
+    original = connected(store, "req-1", FIRST)
+    first_is_talking_to_the_server = asyncio.Event()
+    let_the_first_finish = asyncio.Event()
+    seen_by_the_second = []
+
+    async def slow(credential):
+        first_is_talking_to_the_server.set()
+        await let_the_first_finish.wait()
+        return {"refresh_token": "older-response"}
+
+    async def quick(credential):
+        seen_by_the_second.append(credential)
+        return {"refresh_token": "newer-response"}
+
+    slow_one = asyncio.create_task(
+        refresh_connection(original.reference, exchange=slow, store=store)
+    )
+    await first_is_talking_to_the_server.wait()
+    quick_one = asyncio.create_task(
+        refresh_connection(original.reference, exchange=quick, store=store)
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # The second one has not been let near the store while the first is still
+    # out at the server — otherwise it would already have written.
+    assert store.load().credential == {"refresh_token": FIRST}
+
+    let_the_first_finish.set()
+    await asyncio.gather(slow_one, quick_one)
+
+    # The second refresh saw what the first one wrote, rather than the stale
+    # credential it would have read had the two overlapped.
+    assert seen_by_the_second == [{"refresh_token": "older-response"}]
+    assert store.load().credential == {"refresh_token": "newer-response"}
 
 
 @pytest.mark.asyncio

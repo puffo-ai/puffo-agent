@@ -259,7 +259,11 @@ def test_a_disconnect_that_could_not_clear_does_not_report_success(monkeypatch):
 
 
 def test_clearing_a_connection_that_is_already_gone_is_not_a_failure(monkeypatch):
-    """44 on delete is the same "no such item"; a second disconnect is fine."""
+    """44 on delete is the same "no such item"; a second disconnect is fine.
+
+    Also the positive control for the unreachable-Keychain refusal below: with
+    a Keychain that resolves, 44 still means there was nothing to remove.
+    """
     store = keychain(monkeypatch, FakeSecurity())
 
     store.clear()
@@ -323,3 +327,16 @@ def test_macos_still_gets_the_file_store_while_the_keychain_leg_is_unverified(
     monkeypatch.setattr(command.platform, "system", lambda: "Darwin")
 
     assert isinstance(command.connection_store(a_machine()), SkeletonConnectionStore)
+
+
+def test_a_disconnect_against_an_unreachable_keychain_is_not_reported_as_cleared(
+    monkeypatch,
+):
+    """Delete answers 44 for "already gone" and for "never reached the right
+    Keychain" alike — the same ambiguity ``_read`` has, and it was missed here
+    (Jeff 220726). Reading it as done would say disconnected while the
+    credential sat there."""
+    store = keychain(monkeypatch, FakeSecurity(default_keychain=b""))
+
+    with pytest.raises(KeychainUnavailable):
+        store.clear()
