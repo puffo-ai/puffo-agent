@@ -8,7 +8,7 @@ verified header rather than from a field the caller filled in.
 
 Three ops. The claim route is interface v1 (Bob 219652) and has run. The
 refresh route is agreed in full (Bob 221549) and has not: a handler exists on
-the other side now (#406 at ``127ee329``) and these two ends have never spoken.
+the other side now (#406) and these two ends have never spoken.
 The disconnect is local only and reaches no server at all — the remote half of
 a disconnect is missing rather than deferred.
 """
@@ -249,11 +249,16 @@ class RefreshRefused(Exception):
 # exchanges it, and hands back the replacement (Bob 221549). A path that looked
 # a connection up would describe a server that does not exist.
 #
-# What is NOT established: that any of this works. The handler now exists —
-# puffo-server #406 at ``127ee329``, same shape both ways (Bob 221596) — but it
-# has not been compiled locally, its integration is untested, and nothing has
-# been sent to Google through it. Nothing below has run against a server
-# either, only against stand-ins here.
+# What is NOT established: that any of this works. A handler exists on the
+# other side — puffo-server #406, same shape both ways (Bob 221596) — and
+# nothing here has sent it a byte.
+#
+# No SHA for it on purpose. An open PR's head is built to move, and citing one
+# here pins a comment to a value that changes without anybody touching this
+# file: #406 went 127ee329 -> d44a88e0 within the hour, over CI failures that
+# had nothing to do with the contract. The fact that survives that churn is the
+# one worth writing down — these two ends have never spoken — and it stops
+# being true only when somebody measures it false.
 _REFRESH_PATH = "/v2/machines/me/oauth-credentials/refresh"
 
 

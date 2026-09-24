@@ -1,8 +1,10 @@
 """The ``connector.refresh`` and ``connector.disconnect`` computer commands.
 
 These two ends have never spoken. A handler exists on the other side now
-(puffo-server #406 at ``127ee329``, Bob 221596) and nothing here has been sent
-to it, so nothing here can check the daemon against a real one. What it can check is the
+(puffo-server #406, Bob 221596) and nothing here has been sent to it, so
+nothing here can check the daemon against a real one. No SHA for that PR: an
+open head moves on its own, and this file should not go stale because someone
+else pushed a formatting fix. What it can check is the
 part that is decided: the agreed request and response bodies (Jeff 221524, Bob
 221549), that the bytes signed are the bytes sent, and that every way this can
 fail reports the segment it failed at without claiming the computer was
