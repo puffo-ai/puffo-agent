@@ -758,3 +758,71 @@ def test_a_record_that_is_not_one_is_not_copied_into_the_keychain(monkeypatch, t
 
     assert fake.items == {}
     assert legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# What a failure part way through actually leaves behind.
+#
+# Jeff 221284, by fault injection: the old docstring claimed a partial clear
+# left the connection unusable. It does not. These cells fix what is true
+# instead, so the next person reads the behaviour rather than the wish.
+
+
+def test_a_clear_takes_the_file_even_when_the_keychain_delete_fails(monkeypatch, tmp_path):
+    """Stopping at the first error would leave a copy we could have deleted."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def cannot_delete(argv, *, input=None, **_kwargs):
+        if argv[1] == "delete-generic-password":
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", cannot_delete)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with pytest.raises(KeychainUnavailable):
+        store.clear()
+
+    # The leg that could run, ran.
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_clear_that_could_not_finish_does_not_claim_it_did(monkeypatch, tmp_path):
+    """And the connection may well still be here — said out loud, not wished away."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    store = keychain_over(monkeypatch, fake, legacy)
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+
+    with pytest.raises(OSError):
+        store.clear()
+
+    # Not "unusable": the file survived, so the connection is still readable.
+    assert store.load().request_ref == "req-old"
+
+
+def test_a_write_whose_sweep_failed_is_still_committed(monkeypatch, tmp_path):
+    """The exception says the older copy stayed, not that the write missed."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+    reference = store.load().reference
+    # The migration on that read already swept it; put a copy back so the
+    # sweep in the update below has something to fail on.
+    legacy.write_bytes(b'{"reference":"x","request_ref":"r","provider":"p","credential":{"t":1}}')
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+
+    with pytest.raises(OSError):
+        store.update(reference=reference, credential={"refresh_token": "second"})
+
+    # Committed anyway: this is what the caller has to know.
+    assert store.load().credential == {"refresh_token": "second"}

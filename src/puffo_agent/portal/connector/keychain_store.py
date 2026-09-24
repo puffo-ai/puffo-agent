@@ -84,7 +84,42 @@ class KeychainUnavailable(OSError):
 
 
 class KeychainConnectionStore(ConnectionStore):
-    """One connection per machine identity, in the login Keychain."""
+    """One connection per machine identity, in the login Keychain.
+
+    Two places to hold it, so every write and every clear has two legs, and a
+    failure in either reaches the caller as one exception. What that exception
+    means differs per cell, and guessing wrong is how a caller turns a
+    committed write into a retry, or a connection that still works into
+    "disconnected". Stated per cell rather than in prose, because prose is what
+    was wrong here before (測試姬 221299's oracle, Jeff 221284's injections):
+
+    ``save`` / ``update`` — Keychain first, the older file second:
+
+    - the Keychain write fails      → nothing committed, nothing erased. The
+                                      connection here is unchanged. Retry safe.
+    - the read-back disagrees       → nothing committed, nothing erased. The
+                                      item is left alone on purpose: it may
+                                      still hold the credential in use.
+    - sweeping the older file fails → **committed**. ``load`` returns the new
+                                      credential. What failed is the removal of
+                                      the older copy, which is still readable
+                                      on disk — that is what the exception is
+                                      about, and a retry is not free.
+
+    ``clear`` — both legs attempted, the first failure raised afterwards:
+
+    - either leg fails              → the other leg still ran. Whatever
+                                      survived is still loadable, so the
+                                      connection may still work, and a
+                                      surviving file gets migrated back into
+                                      the Keychain by the next read. Neither
+                                      "unusable" nor "nothing changed": the
+                                      disconnect is unfinished, and the honest
+                                      thing to tell the user is to retry it.
+
+    ``load`` never raises for a cleanup problem: a migration that could not
+    finish still answers with the connection it read.
+    """
 
     def __init__(
         self,
@@ -237,12 +272,20 @@ class KeychainConnectionStore(ConnectionStore):
             return
         try:
             self._put(body)
-        except KeychainUnavailable:
+        except (KeychainUnavailable, OSError):
             # Deliberately not re-raised and deliberately without the record:
             # the caller asked to read, and it is about to get a usable answer.
+            #
+            # OSError is in here because the sweep is part of ``_put``, and a
+            # file that will not unlink must not turn a working read into a
+            # read failure — which is exactly what it did when this only caught
+            # KeychainUnavailable. Note the asymmetry, which is on purpose: the
+            # same sweep failing under an explicit ``save`` or ``update`` does
+            # raise, because there the caller asked to write and is owed the
+            # news. Here the caller asked to read and the answer is good.
             logger.warning(
-                "connector: could not move the connection into the Keychain; "
-                "it stays in the file store for now"
+                "connector: could not finish moving the connection into the "
+                "Keychain; a copy may remain in the file store"
             )
             return
         logger.info("connector: moved the connection from the file store into the Keychain")
@@ -277,19 +320,46 @@ class KeychainConnectionStore(ConnectionStore):
         # when the Keychain is empty — so a file holding a connection would
         # have made the claim refuse instead of arriving here, and a file that
         # could not be read would have made it fail closed.
+        #
+        # If this raises, the write above has already happened and been read
+        # back: the new credential IS the one this computer holds, and the next
+        # ``load`` returns it. The exception means the older copy could not be
+        # removed, not that the write did not land, so a caller must not treat
+        # it as "not committed" and must not assume a retry is free (Jeff
+        # 221284). Raising is still right — the alternative is a stale
+        # credential left in the clear with nobody told.
         self._erase_superseded()
 
     def _erase(self) -> None:
         """Remove the connection from both places it could be.
 
-        The Keychain goes first and the older file second, so a failure part
-        way through leaves the connection unusable rather than half-live — the
-        same ordering ``SkeletonConnectionStore.clear`` uses for its temporary
-        file. Both legs raise on failure: a disconnect that could not clear
-        must not be reported as done.
+        Both legs are attempted even when the first one fails, and the failure
+        is raised afterwards. Stopping at the first error would leave a copy
+        this computer could have deleted, which is the wrong trade for a
+        credential: a disconnect should take everything it can reach and then
+        say it did not finish.
+
+        What a failed disconnect leaves behind, stated plainly because this
+        docstring used to claim the opposite: the connection may still be
+        usable. If a copy survives, ``load`` finds it and answers with it —
+        and, since reading the older file also migrates it, a clear that
+        removed the Keychain item but not the file will put it back in the
+        Keychain on the next read. There is no rollback here and no
+        transaction; the caller learns only that the disconnect did not
+        finish, and must not read that as "nothing changed" (Jeff 221284,
+        by fault injection).
         """
-        self._erase_from_keychain()
-        self._erase_superseded()
+        failure: Exception | None = None
+        try:
+            self._erase_from_keychain()
+        except Exception as exc:  # noqa: BLE001 - re-raised below, after the rest
+            failure = exc
+        try:
+            self._erase_superseded()
+        except Exception as exc:  # noqa: BLE001 - same
+            failure = failure or exc
+        if failure is not None:
+            raise failure
 
     def _erase_superseded(self) -> None:
         """Take the file store's copy too, temporary file included.
