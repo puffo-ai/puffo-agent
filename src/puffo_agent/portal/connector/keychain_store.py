@@ -399,6 +399,39 @@ class KeychainConnectionStore(ConnectionStore):
         disconnect first. That is an instruction to whoever does it, not a
         precondition this code reads as permission to delete (Boris 221354
         offered exactly such a precondition and it was declined).
+
+        There is a candidate fix for the outage above, deliberately not taken.
+        The process that wrote the Keychain copy knew the file was the older
+        one and threw that away; recording something about the superseded
+        file's bytes would let a later read tell its own leftovers from a
+        genuine disagreement (Boris 221385). It waits on the real-machine step,
+        because changing the record format before this line has ever run
+        against a real Keychain would make the first real measurement one of a
+        format nobody reviewed.
+
+        What is settled about it is only what is *not* settled, which is worth
+        writing down because each piece was argued to and then past:
+
+        - A run that does not reproduce "the write landed, the unlink failed"
+          records a non-reproduction, not an absence. It cannot close this
+          (Jeff 221397, correcting how the deferral was first stated here).
+        - Hashing does not obviously cost nothing. "A hash does not leak a
+          high-entropy credential" is a claim about the credential's shape, and
+          v0.4 §4 does not let this daemon know it (Boris 221396). Salting is
+          not the answer to that either: a stored salt stops precomputation
+          being reused, not a low-entropy input being guessed one try at a time
+          (Jeff 221397).
+        - Against that, and unverified: the hash would live in the same
+          Keychain entry as the credential that superseded the hashed one, so
+          whoever can read the hash can read that credential outright. It adds
+          exposure only if the older credential can do something the newer
+          cannot — provider semantics, which nobody here has checked
+          (Boris 221398, offered as a note for the evaluation, not a finding).
+        - Mechanically, the field belongs to this store and not to ``_encode``,
+          which the file store shares and through which ``update`` would drop
+          it.
+
+        So: the format is a separate evaluation, not a decision already made.
         """
         held = _reference_of(from_keychain)
         if held is None:
