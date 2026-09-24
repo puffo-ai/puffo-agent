@@ -48,8 +48,11 @@ def connection_path() -> Path:
 #
 # The transport question is settled and measured. Writing with the value piped
 # to a trailing ``-w`` stored an EMPTY password while exiting 0 on both the
-# write and the read back (Jeff 220726, synthetic data) — ``-w`` last reads a
-# terminal, not stdin. The write now goes through ``security -i`` with the
+# write and the read back (Jeff 220726, synthetic data). That phenomenon is the
+# whole of what was measured; why it happens is an untraced reading of the help
+# text, kept as such in ``keychain_store`` and deliberately not repeated here
+# as a cause. (Written as a cause twice now — Jeff 220792, then again 220903.)
+# The write now goes through ``security -i`` with the
 # value as hex through ``-X``, which keeps argv clean; Jeff 220838
 # independently ran save, load, update and clear against a real Keychain on a
 # random service and account and got equality both ways, the reference kept
@@ -69,12 +72,19 @@ def connection_path() -> Path:
 # credential path whose side effects are invisible to the side making them is
 # not one to hand a daemon.
 #
-# What this still owes, and the only reason the flag below is False: a computer
-# that already holds a ``connection.json`` keeps it after the switch, because
-# ``clear`` only reaches the store it was handed. That file has to be swept, or
-# a disconnect would report cleared while the old credential stayed readable on
-# disk — the breach 4bf86f72 closed for the temporary file, arriving by the
-# other door.
+# The older file is now handled: the Keychain store is given the file store's
+# path, reads it when the Keychain is empty, sweeps it once a write is verified,
+# and takes it on a disconnect. Without that, a computer that already held a
+# ``connection.json`` would have been reported "not connected" while the
+# credential stayed readable on disk — the breach 4bf86f72 closed for the
+# temporary file, arriving by the other door.
+#
+# So what the flag below is still waiting on is not a missing piece but a
+# measurement: none of the two-store behaviour has run against a real Keychain.
+# Every cell covering it uses a stand-in, and the one real round trip on record
+# (Jeff 220838) predates all of it and was a Keychain-only store. Flipping this
+# on stand-in evidence would be doing exactly what the last three rounds of
+# this file were spent undoing.
 _KEYCHAIN_VERIFIED = False
 
 
@@ -88,7 +98,10 @@ def connection_store(machine: MachineControlIdentity) -> ConnectionStore:
     computer, and a parameter here would make it a setting.
     """
     if _KEYCHAIN_VERIFIED and platform.system() == "Darwin":
-        return KeychainConnectionStore(machine.machine_id)
+        # Handed the file store's path as well: a computer that connected
+        # before the switch still has its credential there, and the Keychain
+        # store has to be able to find it and to take it away again.
+        return KeychainConnectionStore(machine.machine_id, superseded=connection_path())
     return SkeletonConnectionStore(connection_path())
 
 

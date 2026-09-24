@@ -36,10 +36,10 @@ refusing rather than guessing:
   (Jeff 220729, and again 220792 when this comment said otherwise).
 
   The read-back check below is what turned it into a known failure instead of
-  a daemon reporting connected with nothing stored. Until the write moves to
-  ``security -i`` with the value as hex through ``-X`` — measured working on a
-  real Keychain, Jeff 220731/220737/220759 — ``_put`` cannot succeed and this
-  backend stays unreachable behind ``_KEYCHAIN_VERIFIED``.
+  a daemon reporting connected with nothing stored, and it is still the gate
+  even now that the write goes through ``security -i`` with the value as hex
+  through ``-X`` (Jeff 220731/220737/220759, and 220838 for a full round trip
+  against a real Keychain).
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from pathlib import Path
 
 from ..._proc import no_window_kwargs
 from .store import ConnectionStore
@@ -91,10 +92,18 @@ class KeychainConnectionStore(ConnectionStore):
         *,
         service: str = SERVICE,
         timeout: float = TIMEOUT_SECONDS,
+        superseded: Path | None = None,
     ) -> None:
         self.account = account
         self.service = service
         self.timeout = timeout
+        # The file store this one takes over from. A computer that connected
+        # before the switch has a credential in that file, and a Keychain store
+        # that only ever looked in the Keychain would answer "not connected"
+        # for it and clear nothing on a disconnect — reporting the credential
+        # gone while it stayed readable on disk. That is the breach 4bf86f72
+        # closed for the temporary file, arriving by the other door.
+        self.superseded = superseded
 
     def _write_command(self, body: bytes) -> bytes:
         """The one line handed to ``security -i``.
@@ -122,6 +131,20 @@ class KeychainConnectionStore(ConnectionStore):
         ).encode()
 
     def _read(self) -> bytes | None:
+        """The record this computer holds, in either place it could be."""
+        from_keychain = self._read_from_keychain()
+        if from_keychain is not None:
+            return from_keychain
+        # Nothing in the Keychain is not yet "nothing on this computer".
+        return self._read_superseded()
+
+    def _read_from_keychain(self) -> bytes | None:
+        """The Keychain leg on its own, which is what ``_put`` verifies against.
+
+        Kept separate so the read-back gate cannot be satisfied by the file the
+        write is about to delete: the question there is whether the *Keychain*
+        took the value, and a fallback would answer a different one.
+        """
         found = self._run(["find-generic-password", "-s", self.service, "-a", self.account, "-w"])
         if found.returncode == 0:
             # ``security`` prints the password with one newline appended;
@@ -162,6 +185,29 @@ class KeychainConnectionStore(ConnectionStore):
             f"could not read the connection from the Keychain: {_explain(found)}"
         )
 
+    def _read_superseded(self) -> bytes | None:
+        """The record left in the file store, for a computer that predates this.
+
+        Returned rather than refused. Raising here would take a working
+        connection away from every computer that had one the moment the switch
+        landed, and the connection is genuinely still there — it is only in the
+        older place. Returning it keeps the claim's refusal to replace an
+        existing connection working, which is the check that would otherwise be
+        bypassed: answering None lets a second authorization save into the
+        Keychain while the first credential stays on disk, still live at the
+        provider.
+
+        Whatever the file system raises comes out, because an unreadable file
+        here is "cannot tell", not "not connected" — the same rule as the
+        Keychain leg above.
+        """
+        if self.superseded is None:
+            return None
+        try:
+            return self.superseded.read_bytes()
+        except FileNotFoundError:
+            return None
+
     def _put(self, body: bytes) -> None:
         stored = self._run(["-i"], stdin=self._write_command(body))
         if stored.returncode != 0:
@@ -172,7 +218,7 @@ class KeychainConnectionStore(ConnectionStore):
         # its own exit code (Boris 220754), so a zero here is not evidence. The
         # read-back below is the actual gate, and it is the only reason the
         # empty-password failure was caught rather than shipped.
-        if self._read() != body:
+        if self._read_from_keychain() != body:
             # Not erased. If the write simply did not take, the item still
             # holds the credential this computer was using, and deleting it
             # would turn a failed refresh into a lost connection. If something
@@ -182,8 +228,44 @@ class KeychainConnectionStore(ConnectionStore):
                 "the Keychain did not store what was written; the connection "
                 "on this computer is unchanged or unusable, not replaced"
             )
+        # The Keychain now holds this record, verified, so the older copy is a
+        # second readable copy of a credential and goes. Only in this order:
+        # the file is the fallback ``_read`` relies on until the Keychain
+        # actually has the value.
+        #
+        # This can only remove a file the caller already accounted for. A save
+        # runs only after ``load`` answered None, and ``load`` reads the file
+        # when the Keychain is empty — so a file holding a connection would
+        # have made the claim refuse instead of arriving here, and a file that
+        # could not be read would have made it fail closed.
+        self._erase_superseded()
 
     def _erase(self) -> None:
+        """Remove the connection from both places it could be.
+
+        The Keychain goes first and the older file second, so a failure part
+        way through leaves the connection unusable rather than half-live — the
+        same ordering ``SkeletonConnectionStore.clear`` uses for its temporary
+        file. Both legs raise on failure: a disconnect that could not clear
+        must not be reported as done.
+        """
+        self._erase_from_keychain()
+        self._erase_superseded()
+
+    def _erase_superseded(self) -> None:
+        """Take the file store's copy too, temporary file included.
+
+        Clearing only the Keychain would answer "disconnected" while a usable
+        credential stayed readable on disk. The ``.partial`` goes for the same
+        reason it does in the file store: a crash mid-save leaves one holding
+        the same credential in the clear.
+        """
+        if self.superseded is None:
+            return
+        self.superseded.unlink(missing_ok=True)
+        self.superseded.with_suffix(".partial").unlink(missing_ok=True)
+
+    def _erase_from_keychain(self) -> None:
         removed = self._run(["delete-generic-password", "-s", self.service, "-a", self.account])
         if removed.returncode == 0:
             return

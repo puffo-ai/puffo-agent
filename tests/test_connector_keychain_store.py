@@ -14,13 +14,17 @@ Keychain is unverified and has to be run somewhere with a daemon's HOME.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from puffo_agent.portal.connector import keychain_store
 from puffo_agent.portal.connector.claim import STAGE_READ_LOCAL, claim_connection
+from puffo_agent.portal.connector import store as store_module
+from puffo_agent.portal.connector.store import SkeletonConnectionStore
 from puffo_agent.portal.connector.keychain_store import (
     KeychainConnectionStore,
     KeychainUnavailable,
@@ -505,3 +509,174 @@ def test_a_failure_message_does_not_carry_the_value_back_out(monkeypatch, echo):
     assert str(failed.value).endswith("exit_code=1")
     assert echo.decode() not in str(failed.value)
     assert SENTINEL not in str(failed.value)
+
+
+# ---------------------------------------------------------------------------
+# The computer that connected before the switch.
+#
+# Its credential is in the file store, and a Keychain store that only ever
+# looked in the Keychain would call it "not connected" and clear nothing on a
+# disconnect — the credential reported gone while it stayed readable on disk.
+# 測試姬 220874 listed this as the last gate on default-enable.
+
+
+def files_holding(directory: Path, needle: str) -> list[Path]:
+    """Every readable file under ``directory`` whose bytes contain ``needle``.
+
+    Reads bytes directly rather than shelling out: this machine's ``grep`` is a
+    wrapper that injects ``-I`` and can drop a file while reporting "no match".
+    """
+    return [
+        path
+        for path in sorted(directory.rglob("*"))
+        if path.is_file() and needle.encode() in path.read_bytes()
+    ]
+
+
+def a_computer_that_connected_before_the_switch(tmp_path: Path) -> Path:
+    """The file store's record, written by the store that used to be here."""
+    legacy = tmp_path / "connection.json"
+    SkeletonConnectionStore(legacy).save(
+        request_ref="req-old", provider="google", credential={"refresh_token": SENTINEL}
+    )
+    return legacy
+
+
+def keychain_over(monkeypatch, fake: FakeSecurity, legacy: Path) -> KeychainConnectionStore:
+    monkeypatch.setattr(keychain_store.subprocess, "run", fake)
+    return KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+
+def test_the_scan_can_see_a_credential_that_is_there(tmp_path):
+    """Positive control: a green scan below has to mean something."""
+    (tmp_path / "left-behind").write_text(f'{{"refresh_token": "{SENTINEL}"}}')
+
+    assert files_holding(tmp_path, SENTINEL)
+
+
+def test_a_connection_made_before_the_switch_is_still_found(monkeypatch, tmp_path):
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    store = keychain_over(monkeypatch, FakeSecurity(), legacy)
+
+    loaded = store.load()
+
+    assert loaded is not None
+    assert loaded.request_ref == "req-old"
+    assert loaded.credential == {"refresh_token": SENTINEL}
+
+
+def test_a_second_authorization_cannot_slip_past_the_older_connection(monkeypatch, tmp_path):
+    """The reason the fallback returns the record instead of refusing.
+
+    Answering "not connected" would let a second authorization save into the
+    Keychain while the first credential stayed on disk and live at the
+    provider — bypassing the one refusal the claim exists to make.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    store = keychain_over(monkeypatch, FakeSecurity(), legacy)
+
+    async def must_not_be_called(request_ref):
+        raise AssertionError("a connection is already here")
+
+    answer = asyncio.run(claim_connection("req-new", fetch=must_not_be_called, store=store))
+
+    assert answer["ok"] is False
+    assert answer["connected"] is False
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+
+def test_a_disconnect_after_the_switch_takes_the_older_copy_too(monkeypatch, tmp_path):
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    # A leftover from some earlier failed save, of the kind a crash still makes.
+    (tmp_path / "connection.partial").write_text(f'{{"refresh_token": "{SENTINEL}"}}')
+    store = keychain_over(monkeypatch, FakeSecurity(), legacy)
+
+    store.clear()
+
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_save_sweeps_the_older_copy_once_the_keychain_holds_it(monkeypatch, tmp_path):
+    legacy = tmp_path / "connection.json"
+    # Not a connection — a stale file the claim already accounted for.
+    legacy.write_text("{}")
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    store.save(request_ref="req-new", provider="google", credential={"refresh_token": SENTINEL})
+
+    assert not legacy.exists()
+    assert store.load().credential == {"refresh_token": SENTINEL}
+    # And the credential is in the Keychain, not in a file.
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_keychain_write_that_failed_does_not_take_the_older_copy(monkeypatch, tmp_path):
+    """Order, not just outcome. Sweeping first would destroy the only copy of a
+    credential whose new home never accepted it."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def refuses_to_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", refuses_to_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with pytest.raises(KeychainUnavailable):
+        store.update(reference=store.load().reference, credential={"refresh_token": "second"})
+
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+
+def test_the_read_back_gate_is_not_satisfied_by_the_file_it_is_about_to_delete(
+    monkeypatch, tmp_path
+):
+    """A write that silently stored nothing must still be caught.
+
+    If the read-back fell through to the older file, a Keychain that accepted
+    the command and kept nothing would look like a successful write — and the
+    sweep would then delete the only remaining copy.
+    """
+    legacy = tmp_path / "connection.json"
+    fake = FakeSecurity()
+
+    def swallows_the_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            # Accepted, stored nothing: the exact shape Jeff 220726 measured.
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", swallows_the_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+    # The older file holds EXACTLY the bytes being written — re-saving the
+    # connection that is already here. A read-back that fell through to the
+    # file would find them, call the swallowed write good, and then the sweep
+    # would delete the only copy that exists. Anything else in the file makes
+    # the gate pass for the wrong reason and proves nothing.
+    body = store_module._encode(
+        store_module.Connection(
+            reference="r1", request_ref="r", provider="google",
+            credential={"refresh_token": SENTINEL},
+        )
+    )
+    legacy.write_bytes(body)
+
+    with pytest.raises(KeychainUnavailable) as failed:
+        store._put(body)
+
+    assert "did not store what was written" in str(failed.value)
+    # And the sweep did not run, so the only copy is still here.
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+
+def test_an_unreadable_older_copy_is_not_reported_as_not_connected(monkeypatch, tmp_path):
+    """Same rule as the Keychain leg: cannot tell is not empty."""
+    legacy = tmp_path / "connection.json"
+    legacy.mkdir()  # reading it raises, rather than saying "absent"
+    store = keychain_over(monkeypatch, FakeSecurity(), legacy)
+
+    with pytest.raises(OSError):
+        store.load()
