@@ -50,7 +50,7 @@ import subprocess
 from pathlib import Path
 
 from ..._proc import no_window_kwargs
-from .store import ConnectionStore
+from .store import ConnectionStore, _check
 
 logger = logging.getLogger(__name__)
 
@@ -204,9 +204,48 @@ class KeychainConnectionStore(ConnectionStore):
         if self.superseded is None:
             return None
         try:
-            return self.superseded.read_bytes()
+            body = self.superseded.read_bytes()
         except FileNotFoundError:
             return None
+        self._migrate(body)
+        return body
+
+    def _migrate(self, body: bytes) -> None:
+        """Move the older copy into the Keychain, here on the read path.
+
+        A write inside a read is not free, and it is here on purpose. Sweeping
+        only on write or clear leaves an already-connected computer holding its
+        credential in plaintext on disk for as long as nothing happens to write
+        — and nothing has to: a refresh is reactive, so a credential that does
+        not expire on a computer nobody sends mail from is never rewritten
+        (Boris 221279, who measured the gap in the shape of this code rather
+        than in a run). "Cleaned up whenever a write next occurs" is not a
+        property; the point of moving to the Keychain is that the plaintext
+        stops existing.
+
+        Best effort, and it can only improve matters. A record that is not one
+        is left alone — ``load`` fails closed on it, which is the right answer
+        and not something to copy into the Keychain first. A Keychain that
+        refuses the write leaves the file exactly where it was and the
+        connection still usable: a failed migration must not cost a computer a
+        connection it had. Only ``_put`` succeeding, read-back included,
+        removes the file, which is the same order the write path uses.
+        """
+        try:
+            _check(json.loads(body))
+        except ValueError:
+            return
+        try:
+            self._put(body)
+        except KeychainUnavailable:
+            # Deliberately not re-raised and deliberately without the record:
+            # the caller asked to read, and it is about to get a usable answer.
+            logger.warning(
+                "connector: could not move the connection into the Keychain; "
+                "it stays in the file store for now"
+            )
+            return
+        logger.info("connector: moved the connection from the file store into the Keychain")
 
     def _put(self, body: bytes) -> None:
         stored = self._run(["-i"], stdin=self._write_command(body))

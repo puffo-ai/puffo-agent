@@ -15,6 +15,7 @@ Keychain is unverified and has to be run somewhere with a daemon's HOME.
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import subprocess
 from pathlib import Path
@@ -582,7 +583,10 @@ def test_a_second_authorization_cannot_slip_past_the_older_connection(monkeypatc
 
     assert answer["ok"] is False
     assert answer["connected"] is False
-    assert files_holding(tmp_path, SENTINEL) == [legacy]
+    # The older connection survived the refusal — now in the Keychain, since
+    # reading it also moves it, and no longer in the clear on disk.
+    assert store.load().request_ref == "req-old"
+    assert files_holding(tmp_path, SENTINEL) == []
 
 
 def test_a_disconnect_after_the_switch_takes_the_older_copy_too(monkeypatch, tmp_path):
@@ -680,3 +684,77 @@ def test_an_unreadable_older_copy_is_not_reported_as_not_connected(monkeypatch, 
 
     with pytest.raises(OSError):
         store.load()
+
+
+# ---------------------------------------------------------------------------
+# And it does not wait for a write to happen.
+#
+# Falling back to the older file keeps the connection working, but on its own
+# it leaves the credential in plaintext on disk for as long as nothing writes
+# — and nothing has to, because a refresh is reactive (Boris 221279).
+
+
+def test_reading_the_older_copy_moves_it_into_the_keychain(monkeypatch, tmp_path):
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    store.load()
+
+    assert files_holding(tmp_path, SENTINEL) == []
+    assert fake.items[("Puffo Agent-connector", "mac_testmachine")]
+
+
+def test_the_move_keeps_the_same_connection(monkeypatch, tmp_path):
+    """Not a re-mint. The page is already holding this reference."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    before = SkeletonConnectionStore(legacy).load()
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    after = store.load()
+
+    assert (after.reference, after.request_ref, after.provider) == (
+        before.reference, before.request_ref, before.provider
+    )
+    assert after.credential == before.credential
+    # Read out of the Keychain item itself, not off the return value: without
+    # that, this cell passes just as well when no move happened at all, since
+    # the fallback answers with the same record either way.
+    carried = json.loads(fake.items[("Puffo Agent-connector", "mac_testmachine")])
+    assert carried["reference"] == before.reference
+    assert carried["credential"] == before.credential
+
+
+def test_a_move_that_fails_still_answers_with_the_connection(monkeypatch, tmp_path):
+    """A failed migration must not cost a computer a connection it had."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def refuses_to_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", refuses_to_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    loaded = store.load()
+
+    assert loaded.credential == {"refresh_token": SENTINEL}
+    # The file is still the only copy, so it had better still be there.
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+
+def test_a_record_that_is_not_one_is_not_copied_into_the_keychain(monkeypatch, tmp_path):
+    """Fail closed on it; do not carry it over first."""
+    legacy = tmp_path / "connection.json"
+    legacy.write_bytes(b'{"reference":null,"request_ref":"r","provider":"p","credential":{}}')
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    with pytest.raises(ValueError):
+        store.load()
+
+    assert fake.items == {}
+    assert legacy.exists()
