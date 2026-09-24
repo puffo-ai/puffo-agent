@@ -6,12 +6,11 @@ travels in the machine signature the server verifies
 (``machine_auth.signed_headers``), so the server reads the caller from a
 verified header rather than from a field the caller filled in.
 
-Three ops, and only the first has an agreed server contract behind it. The
-claim route is interface v1 (Bob 219652). The refresh route is not: the server
-has no refresh handler at all yet (Boris 221525 read #406; Jeff 221526
-confirmed), so what is wired below is the agreed *body* with a *guessed* path,
-marked as such at ``_REFRESH_PATH``. The disconnect is local only and reaches
-no server at all.
+Three ops. The claim route is interface v1 (Bob 219652) and has run. The
+refresh route is agreed in full (Bob 221549) and has not: the handler is being
+written, and until it exists nothing here has been near a server. The
+disconnect is local only and reaches no server at all — the remote half of a
+disconnect is missing rather than deferred.
 """
 
 from __future__ import annotations
@@ -238,21 +237,22 @@ class RefreshRefused(Exception):
         self.reason = reason
 
 
-# ASSUMED, NOT AGREED — this path is this file's guess.
+# Agreed, not yet met. The whole shape comes from Bob 221549, who owns the
+# contract and is building the server to it: ``POST`` here, machine-signed the
+# same way a claim is, ``{connection_ref, credential}`` in and ``{credential}``
+# out, with the credential whole in both directions and no ``request_ref``
+# (the body itself is Jeff 221524).
 #
-# What is agreed is the body and nothing else (Jeff 221524): the request is
-# ``{connection_ref, credential}`` with the credential whole and no
-# ``request_ref``, and the answer is the replacement credential, whole. The
-# path and the response wrapping are @engineer-ed1df917's to give, and until
-# they arrive there is no server to be wrong against: #406 has no refresh
-# handler at all (Boris 221525, confirmed by Jeff 221526).
+# Not the claim root with a different leaf, and not a ``/connections/{ref}/``
+# path either. After a claim the server keeps no credential and has no
+# connection table, so a refresh is stateless — it takes the whole credential,
+# exchanges it, and hands back the replacement (Bob 221549). A path that looked
+# a connection up would describe a server that does not exist.
 #
-# So this is wired to be cheap to correct rather than to be right by luck. The
-# path is one constant and the unwrapping is one function; nothing else in the
-# daemon looks at either. It is deliberately NOT the claim root with a
-# different leaf — a borrowed-looking path is how "we already have a refresh
-# API" gets believed.
-_REFRESH_PATH = "/v2/machines/me/oauth-connections/refresh"
+# What is NOT established: that any of this works. The handler is being written
+# now; before that it did not exist at all (Boris 221525 read #406; Jeff 221526
+# confirmed). Nothing below has run against a server, only against stand-ins.
+_REFRESH_PATH = "/v2/machines/me/oauth-credentials/refresh"
 
 
 async def run_refresh_command(params: dict, server_url: str) -> dict:
@@ -336,11 +336,10 @@ async def _exchange_with_server(
     """Hand the stored credential over and get the replacement back, whole.
 
     ``connection_ref`` is this computer's own reference, minted locally at save
-    time — the only thing the daemon has that is named that. Whether the server
-    can resolve it is unknown here and does not matter to this side: the
-    credential travels with it, so the server needs nothing looked up to do the
-    exchange. If it turns out the field was meant to be the request reference
-    instead, this line is where that changes, and the store holds both.
+    time. The server does not resolve it — it keeps no connection table and
+    uses the field for log correlation only (Bob 221549) — so this is the
+    locally minted one rather than the request reference, and nothing depends
+    on the server having seen it before.
 
     The body is signed, not just sent. A claim signs zero body bytes because it
     has no body; this one has one, so the bytes that are signed and the bytes
@@ -379,14 +378,14 @@ async def _exchange_with_server(
 def _read_refreshed(payload: Any) -> Any:
     """Pull the replacement credential out of the refresh response.
 
-    The wrapping is assumed to be the claim's — ``{"credential": ...}`` — and
-    that assumption is unconfirmed (Jeff 221524 left the response wrapping to
-    @engineer-ed1df917). It is the assumption to make anyway, because the two
-    ways of being wrong do not cost the same. Requiring the wrapper and getting
-    a bare package fails here, loudly, and writes nothing. Accepting a bare
-    body and getting a wrapper would store the *envelope* as the credential —
-    a connection quietly holding the wrong bytes, discovered whenever it is
-    next used. Fail on the readable one.
+    The wrapping is ``{"credential": ...}`` (Bob 221549), the same shape the
+    claim answers with. Strictness here is not about doubting that: the two
+    ways of being wrong do not cost the same, so this refuses anything it does
+    not recognise even though it expects to recognise everything. Requiring the
+    wrapper and getting a bare package fails here, loudly, and writes nothing.
+    Accepting whatever arrives would store an *envelope* as the credential the
+    first time the shape moved — a connection quietly holding the wrong bytes,
+    discovered whenever it was next used.
 
     No provider is read. A refresh replaces a credential, not a connection; the
     store keeps the provider it already has, and taking one from this response

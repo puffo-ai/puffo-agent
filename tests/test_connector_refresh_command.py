@@ -1,15 +1,12 @@
 """The ``connector.refresh`` and ``connector.disconnect`` computer commands.
 
-The refresh route has no server behind it yet — #406 has no refresh handler
-(Boris 221525, confirmed by Jeff 221526) — so nothing here can check the daemon
-against a real one. What it can check is the part that is already decided: the
-agreed request body (Jeff 221524), that the bytes signed are the bytes sent,
-and that every way this can fail reports the segment it failed at without
-claiming the computer was disconnected when it was not.
-
-The wrapping of the response is *assumed*, not agreed. The cell pinning it is
-named for that, and pins the direction of the assumption rather than its
-correctness: an unexpected shape must fail and write nothing.
+The refresh route has no server behind it yet — the handler is being written
+now, and #406 had none at all (Boris 221525, confirmed by Jeff 221526) — so
+nothing here can check the daemon against a real one. What it can check is the
+part that is decided: the agreed request and response bodies (Jeff 221524, Bob
+221549), that the bytes signed are the bytes sent, and that every way this can
+fail reports the segment it failed at without claiming the computer was
+disconnected when it was not.
 """
 
 from __future__ import annotations
@@ -313,14 +310,13 @@ async def test_no_failed_refresh_reports_this_computer_as_disconnected(
 async def test_a_response_the_daemon_cannot_read_is_refused_rather_than_stored(
     monkeypatch, tmp_path
 ):
-    """The direction of an assumption, pinned — not the assumption itself.
+    """What happens when the response is not the agreed shape.
 
-    The response wrapping is @engineer-ed1df917's to give and has not arrived
-    (Jeff 221524). This file assumes the claim's ``{"credential": ...}``. What
-    is held here is what happens when that assumption is wrong: it fails, and
-    the stored credential does not change. The alternative reading — take the
-    whole body as the credential — would store an envelope as a credential and
-    nothing would notice until the connection was next used.
+    The shape is agreed — ``{"credential": ...}`` (Bob 221549) — and this is
+    not doubting it. It is which way to be wrong if it ever moves. Refusing
+    fails here and changes nothing that is stored. The alternative reading,
+    taking whatever arrived as the credential, would store an envelope as a
+    credential and nothing would notice until the connection was next used.
     """
     for payload in (SECOND, {"access_token": "bare"}, ["not", "an", "object"], None):
         with pytest.raises(RefreshRefused):
