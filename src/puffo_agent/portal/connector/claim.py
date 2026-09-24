@@ -110,6 +110,12 @@ async def claim_connection(request_ref: str, *, fetch: Fetch, store: Any) -> dic
     Every path returns a dict. A claim that ends badly is still an answer: the
     page has to be able to stop waiting (v0.4 §7), so raising out of here would
     move the problem rather than report it.
+
+    Cancellation is not one of those paths. ``asyncio.CancelledError`` is a
+    ``BaseException``, is not caught anywhere along this route, and should not
+    be: it means the task is being torn down, and a tidy result dict would keep
+    a dying errand alive. "Every path" was written as if that were covered and
+    it never was.
     """
     async with _claim_lock():
         return await _claim_while_locked(request_ref, fetch=fetch, store=store)

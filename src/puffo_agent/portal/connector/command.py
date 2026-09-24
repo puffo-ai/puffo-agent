@@ -266,6 +266,13 @@ async def run_refresh_command(params: dict, server_url: str) -> dict:
     answering ``connected: False`` would report an outage that did not happen.
     "Did the refresh work" and "is this computer connected" are two questions
     and only one of them was asked.
+
+    "Always" excludes cancellation, and that is not a loophole being reserved.
+    ``asyncio.CancelledError`` is a ``BaseException`` and is deliberately not
+    caught here: it says the task is being torn down, and answering it with a
+    tidy result dict would keep a dying errand alive. Nothing is waiting on
+    that answer in that case, because whatever is cancelling this is taking the
+    control connection with it.
     """
     reference = str(params.get("connection_ref") or "").strip()
     if not reference:
@@ -294,7 +301,24 @@ async def run_refresh_command(params: dict, server_url: str) -> dict:
 
     async def exchange(credential: Any) -> Any:
         nonlocal reached_the_server
-        replacement = await _exchange_with_server(base, machine, reference, credential)
+        try:
+            replacement = await _exchange_with_server(base, machine, reference, credential)
+        except RefreshRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the server leg, whatever it was
+            # Not redundant with the wrapping inside ``_exchange_with_server``.
+            # That one exists to give the caller a typed reason; this one is
+            # what makes the classification below structural. Without it, an
+            # ``OSError`` escaping the server leg would fall into the handler
+            # for the store and be reported as "local store unreadable" — a
+            # network fault described as a disk one, measured rather than
+            # imagined. It is unreachable today only because a wrapper two
+            # functions away happens to be exhaustive, and "unreachable
+            # because something distant is careful" is the kind of guarantee
+            # that stops holding without anybody editing this file.
+            raise RefreshRefused(
+                f"refresh call did not complete: {type(exc).__name__}"
+            ) from exc
         reached_the_server = True
         return replacement
 

@@ -11,6 +11,7 @@ disconnected when it was not.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -385,6 +386,70 @@ async def test_a_replacement_that_could_not_be_stored_says_the_server_already_an
     # And it is a different stage from the same exception raised before the
     # server was reached — the cell above pins that side.
     assert result["stage"] != STAGE_READ_LOCAL
+
+
+@pytest.mark.asyncio
+async def test_a_server_leg_failure_is_never_reported_as_a_broken_local_store(
+    monkeypatch, tmp_path
+):
+    """The classification must not depend on a wrapper two functions away.
+
+    ``_exchange_with_server`` turns every transport error into
+    ``RefreshRefused``, and while it does, nothing else can happen. But an
+    ``OSError`` that got past it would land in the handler for the store and be
+    reported as "local store unreadable" — a network fault described as a disk
+    one. That was measured, not imagined: with the guard removed this cell
+    reports ``read_local``.
+
+    So the entry point classifies at the boundary of the leg rather than
+    trusting the leg's insides. Unreachable-because-something-distant-is-
+    careful is the kind of guarantee that stops holding with nobody editing
+    the file that relies on it.
+    """
+    store = store_at(tmp_path)
+    original = connected(store)
+    wired(monkeypatch, store)
+
+    async def leaks(base, machine, reference, credential):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(connector_command, "_exchange_with_server", leaks)
+
+    result = await connector_command.run_refresh_command(
+        {"connection_ref": original.reference}, "https://test.invalid"
+    )
+
+    assert result["stage"] == STAGE_EXCHANGE
+    assert result["stage"] != STAGE_READ_LOCAL
+    assert "OSError" in result["reason"]
+    assert store_at(tmp_path).load().credential == FIRST
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_refresh_is_not_answered_with_a_result(monkeypatch, tmp_path):
+    """Cancellation gets out, and the docstring says "always returns" anyway.
+
+    ``asyncio.CancelledError`` is a ``BaseException``: it is not caught here
+    and must not be, because a tidy result dict would keep a dying errand
+    alive. This cell exists so that "always returns a command result" cannot
+    quietly grow to cover a case nobody checked — it is pinned as the
+    exception it is.
+    """
+    store = store_at(tmp_path)
+    original = connected(store)
+    wired(monkeypatch, store)
+
+    async def cancelled(base, machine, reference, credential):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(connector_command, "_exchange_with_server", cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await connector_command.run_refresh_command(
+            {"connection_ref": original.reference}, "https://test.invalid"
+        )
+
+    assert store_at(tmp_path).load().credential == FIRST
 
 
 @pytest.mark.asyncio
