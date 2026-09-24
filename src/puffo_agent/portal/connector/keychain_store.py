@@ -89,6 +89,31 @@ class KeychainUnavailable(OSError):
     """
 
 
+class ConflictingConnections(OSError):
+    """Both places hold a record, and they name different connections.
+
+    An ``OSError`` for the same reason ``KeychainUnavailable`` is one: every
+    caller above already reads that as "cannot tell", which is exactly what
+    this is. The two references are random hex minted at save time — they carry
+    no order, so nothing here can say which record is the current one, and
+    guessing costs a live credential either way (Boris 221354, reproduced by
+    Jeff 221356; 測試姬 221362 for why answering with one of them is the same
+    mistake as deleting the other).
+    """
+
+
+class SupersededCopyRemains(OSError):
+    """The Keychain took the value; the older copy could not be removed.
+
+    Raised only after the write has been read back, which makes it the one
+    failure out of ``_put`` that means the new credential IS what this computer
+    holds. Named so the migration can tell it apart from a write that never
+    landed — those two need opposite things said about them, and saying the
+    wrong one is how "will not be retried until this process restarts" ended up
+    logged for a move that had in fact succeeded (Jeff 221356).
+    """
+
+
 class KeychainConnectionStore(ConnectionStore):
     """One connection per machine identity, in the login Keychain.
 
@@ -142,9 +167,37 @@ class KeychainConnectionStore(ConnectionStore):
     - the move is refused         → answered with the file's connection, and
                                     not attempted again until this process
                                     restarts.
-    - something arrived first     → that value wins and is returned; the file
-                                    is swept, never written over.
+    - the write landed, the sweep → answered with the connection. It is in the
+      did not                       Keychain; the next read sweeps the file.
+    - something arrived first     → the re-read finds it and it is returned
+                                    instead of being written over. That is a
+                                    narrower window, not a closed one: a writer
+                                    landing between the re-read and the write
+                                    still overwrites (Jeff 221356 injected
+                                    exactly that). What closes it is the
+                                    caller's lock, below.
     - the record is not one       → not moved; ``load`` fails closed on it.
+
+    ``load`` — when the Keychain holds a value, the older file is superseded
+    and swept. "Holds a value" is not "holds the connection", and every cell
+    below was one branch before Jeff 221356 and 測試姬 221362 took it apart:
+
+    - the value is not a record   → nothing is swept. ``load`` fails closed on
+                                    it a moment later, and the older copy has
+                                    to still be there when it does — ``null``,
+                                    ``{}`` and ``[]`` all parse, and all three
+                                    used to take the file with them before
+                                    anything checked them.
+    - same reference both places  → the file is a second copy of one
+                                    connection, and it goes.
+    - different references        → refused, and nothing is deleted. Two
+                                    records naming two connections, with no
+                                    order between them.
+    - the file cannot be read     → refused, and nothing is deleted. Same rule
+                                    as everywhere else here: cannot tell is not
+                                    absent. The cost is real and deliberate —
+                                    an unreadable file takes down a read the
+                                    Keychain could have answered.
 
     **What serialises any of this is the caller, not this class.** There is no
     lock here. ``connector.claim`` holds one asyncio lock across load, save,
@@ -204,24 +257,87 @@ class KeychainConnectionStore(ConnectionStore):
         """The record this computer holds, in either place it could be."""
         from_keychain = self._read_from_keychain()
         if from_keychain is not None:
-            # An older copy alongside a Keychain entry is superseded, and it is
-            # swept here rather than only when a write happens. Without this the
-            # cleanup never converges: a move whose write landed but whose
-            # unlink failed leaves the entry in place, so every later read —
-            # including after a restart, because the entry outlives the
-            # process — short-circuits right here and never reaches the
+            # An older copy alongside a Keychain entry is usually superseded,
+            # and it is swept here rather than only when a write happens.
+            # Without this the cleanup never converges: a move whose write
+            # landed but whose unlink failed leaves the entry in place, so every
+            # later read — including after a restart, because the entry outlives
+            # the process — short-circuits right here and never reaches the
             # migration again. The plaintext would then sit there until some
             # explicit write or clear happened to come along (Jeff 221335, and
             # 221343 for the restart half; 測試姬 221338 withdrew "bounded
-            # window" on the strength of it). Filesystem only, so no Keychain
-            # call and no prompt.
-            self._erase_quietly()
+            # window" on the strength of it).
+            #
+            # "Usually" is the whole of the gate below, and returning the value
+            # is behind the same gate as deleting the file: both assume the
+            # Keychain holds *the* connection, and both are wrong in the same
+            # cases (測試姬 221362).
+            self._sweep_what_the_keychain_supersedes(from_keychain)
             return from_keychain
         # Nothing in the Keychain is not yet "nothing on this computer".
         older = self._read_superseded()
         if older is None:
             return None
         return self._migrate(older)
+
+    def _sweep_what_the_keychain_supersedes(self, from_keychain: bytes) -> None:
+        """Remove the older copy, once it is provably a copy of the same thing.
+
+        One gate in front of two decisions — delete the file, and hand
+        ``from_keychain`` back as the connection — because they rest on the
+        same assumption and it fails in the same places. Checking only the
+        delete side leaves a stale value being returned silently, and an
+        invalid one at least gets refused downstream while a *valid* record for
+        a different connection does not (測試姬 221362).
+
+        What "provably" rules out, each one measured on this code:
+
+        - **The Keychain value is not a connection.** ``null``, ``{}`` and
+          ``[]`` are all valid JSON, so the Keychain leg's parse says yes to
+          every one of them; ``load`` refuses them a moment later, but the
+          sweep used to have already run. Delete-then-validate is backwards,
+          and it cost the only readable copy of a live credential in all three
+          cases (Jeff 221356, reproduced).
+        - **The two records name different connections.** The rollback path is
+          real: turn this store off, the file store reports not connected, the
+          user reconnects into the file, turn it back on — now the Keychain's
+          record is the one the provider may already have revoked, and it was
+          deleting the live one on the first read (Boris 221354, reproduced by
+          Jeff 221356 by injection).
+        - **The file cannot be read.** Then there is no reference to compare,
+          and "cannot tell" has never meant "absent" anywhere else in this
+          file.
+
+        What this is **not**: a freshness test. Matching references prove the
+        two copies are one connection — which is what makes removing one of
+        them lose no connection — and prove nothing about which credential is
+        newer. The narrow case that leaves open is both copies naming one
+        connection with the file holding the fresher credential, where the
+        cost is a refresh, not a connection (Jeff 221356 made this point and
+        he is right; it is not an argument for deleting less carefully).
+        """
+        held = _reference_of(from_keychain)
+        if held is None:
+            # Nothing is superseded by a value that is not a connection. The
+            # caller gets it anyway and ``load`` fails closed on it there.
+            return
+        older = self._read_superseded()
+        if older is None:
+            # No record to compare, and the ``.partial`` is never one: nothing
+            # reads it, so it cannot be the connection this computer holds. It
+            # is residue holding a credential in the clear, and it goes — the
+            # sweep has to converge here too, or a clear that removed the
+            # record but not the leftover leaves the leftover for good.
+            self._erase_partial_quietly()
+            return
+        if _reference_of(older) != held:
+            raise ConflictingConnections(
+                "this computer holds two records naming different connections: "
+                f"the Keychain has {held}, the file store has "
+                f"{_reference_of(older)}. Nothing was deleted and neither is "
+                "answered with, because their references carry no order"
+            )
+        self._erase_quietly()
 
     def _read_from_keychain(self) -> bytes | None:
         """The Keychain leg on its own, which is what ``_put`` verifies against.
@@ -309,16 +425,19 @@ class KeychainConnectionStore(ConnectionStore):
 
         - A record that is not one is left alone. ``load`` fails closed on it,
           which is the right answer and not something to copy over first.
-        - **It never overwrites.** The Keychain is re-read immediately before
-          the write, and anything found there wins and is returned instead —
-          it is newer than a file this store was about to supersede. Without
-          that, a refresh committing between "the Keychain is empty" and this
-          write would be overwritten by the older file value, the read-back
-          would pass because it reads back what it just wrote, the sweep would
-          delete the file, and a rotated credential would be silently dead
-          (Boris 221326). Two adjacent lookups is not an atomic compare-and-set
-          and this does not pretend to be one — see the class docstring for
-          what actually serialises these.
+        - **It re-reads the Keychain immediately before writing, and whatever
+          is already there wins.** Without that, a refresh committing between
+          "the Keychain is empty" and this write would be overwritten by the
+          older file value, the read-back would pass because it reads back what
+          it just wrote, the sweep would delete the file, and a rotated
+          credential would be silently dead (Boris 221326).
+
+          Not "never overwrites", which is what this bullet used to lead with:
+          Jeff 221356 put a writer between the re-read and the write and the
+          older value landed on top of it just the same. Two adjacent lookups
+          are not a compare-and-set. The re-read narrows the window; the
+          caller's lock is what closes it, and an uncoordinated writer gets no
+          guarantee from here — see the class docstring.
         - One attempt per process per item. A Keychain that refuses the write
           leaves the file, and retrying on *every* read would mean a fresh
           ``security`` call — and any prompt it raises on the operator's
@@ -334,9 +453,12 @@ class KeychainConnectionStore(ConnectionStore):
 
         newer = self._read_from_keychain()
         if newer is not None:
-            # Something committed while the file was being read. It supersedes
-            # the file by construction, so the file goes and its value does not.
-            self._erase_quietly()
+            # Something committed while the file was being read. Through the
+            # same gate as the short-circuit in ``_read``: this is the second
+            # of the two places that decided "the Keychain has a value" meant
+            # "the file is superseded", and it was wrong here for exactly the
+            # reasons it was wrong there (測試姬 221362).
+            self._sweep_what_the_keychain_supersedes(newer)
             return newer
 
         key = (self.service, self.account)
@@ -346,15 +468,29 @@ class KeychainConnectionStore(ConnectionStore):
 
         try:
             self._put(body)
+        except SupersededCopyRemains:
+            # The write landed and was read back; only the unlink failed. The
+            # move is done, and saying "will not be retried until this process
+            # restarts" here — which this branch used to, because it was one
+            # branch — describes a retry that is neither needed nor what
+            # happens: the next read finds the value in the Keychain and sweeps
+            # the file from there (Jeff 221356).
+            logger.warning(
+                "connector: the connection is now in the Keychain, but the "
+                "superseded copy could not be removed from the file store; "
+                "a later read sweeps it"
+            )
+            return body
         except (KeychainUnavailable, OSError):
             # Deliberately not re-raised and deliberately without the record:
             # the caller asked to read, and it is about to get a usable answer.
             #
-            # OSError is in here because the sweep is part of ``_put``, and a
-            # file that will not unlink must not turn a working read into a
-            # read failure. Note the asymmetry, which is on purpose: the same
-            # sweep failing under an explicit ``save`` or ``update`` does raise,
-            # because there the caller asked to write and is owed the news.
+            # OSError as well as KeychainUnavailable because the sweep is part
+            # of ``_put``, and a file that will not unlink must not turn a
+            # working read into a read failure. Note the asymmetry, which is on
+            # purpose: the same sweep failing under an explicit ``save`` or
+            # ``update`` does raise, because there the caller asked to write and
+            # is owed the news.
             logger.warning(
                 "connector: could not move the connection into the Keychain; "
                 "it stays in the file store and will not be retried until "
@@ -371,6 +507,18 @@ class KeychainConnectionStore(ConnectionStore):
         except OSError:
             logger.warning(
                 "connector: a superseded copy of the connection could not be "
+                "removed from the file store"
+            )
+
+    def _erase_partial_quietly(self) -> None:
+        """Sweep only the leftover, for when there is no record to compare to."""
+        if self.superseded is None:
+            return
+        try:
+            self.superseded.with_suffix(".partial").unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "connector: a leftover from an interrupted save could not be "
                 "removed from the file store"
             )
 
@@ -413,7 +561,13 @@ class KeychainConnectionStore(ConnectionStore):
         # it as "not committed" and must not assume a retry is free (Jeff
         # 221284). Raising is still right — the alternative is a stale
         # credential left in the clear with nobody told.
-        self._erase_superseded()
+        try:
+            self._erase_superseded()
+        except OSError as exc:
+            raise SupersededCopyRemains(
+                "the Keychain holds the new connection, but the superseded "
+                f"copy could not be removed from the file store: {exc}"
+            ) from exc
 
     def _erase(self) -> None:
         """Remove the connection from both places it could be.
@@ -514,6 +668,23 @@ class KeychainConnectionStore(ConnectionStore):
                 f"{SECURITY} did not answer within {self.timeout:g}s; "
                 "an authorization prompt may be waiting for someone"
             ) from exc
+
+
+def _reference_of(body: bytes) -> str | None:
+    """The connection reference in ``body``, or None when it is not a record.
+
+    Parsed and then run past the same ``_check`` ``load`` uses, rather than
+    subscripted: the question these comparisons ask is "is this a connection
+    this daemon wrote", and it has to get the same answer ``load`` will give a
+    moment later. A looser test here would sweep against a record ``load`` is
+    about to refuse, which is the shape of the defect this exists to close.
+    """
+    try:
+        record = json.loads(body)
+        _check(record)
+    except ValueError:
+        return None
+    return record["reference"]
 
 
 def _explain(completed) -> str:

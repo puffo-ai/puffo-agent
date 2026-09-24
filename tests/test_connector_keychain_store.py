@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 import subprocess
 from pathlib import Path
@@ -27,8 +28,10 @@ from puffo_agent.portal.connector.claim import STAGE_READ_LOCAL, claim_connectio
 from puffo_agent.portal.connector import store as store_module
 from puffo_agent.portal.connector.store import SkeletonConnectionStore
 from puffo_agent.portal.connector.keychain_store import (
+    ConflictingConnections,
     KeychainConnectionStore,
     KeychainUnavailable,
+    SupersededCopyRemains,
 )
 
 # Distinctive enough that finding it anywhere is unambiguous.
@@ -824,8 +827,19 @@ def test_a_write_whose_sweep_failed_is_still_committed(monkeypatch, tmp_path):
     store = keychain_over(monkeypatch, fake, legacy)
     reference = store.load().reference
     # The migration on that read already swept it; put a copy back so the
-    # sweep in the update below has something to fail on.
-    legacy.write_bytes(b'{"reference":"x","request_ref":"r","provider":"p","credential":{"t":1}}')
+    # sweep in the update below has something to fail on. The same reference,
+    # because a file naming a different connection is now refused before any
+    # of this — that is a different cell, below.
+    legacy.write_bytes(
+        json.dumps(
+            {
+                "reference": reference,
+                "request_ref": "r",
+                "provider": "p",
+                "credential": {"t": 1},
+            }
+        ).encode()
+    )
 
     def cannot_unlink(self, missing_ok=False):
         raise OSError("read-only file system")
@@ -853,7 +867,18 @@ def test_a_move_never_overwrites_something_that_arrived_first(monkeypatch, tmp_p
     legacy = a_computer_that_connected_before_the_switch(tmp_path)
     fake = FakeSecurity()
     key = ("Puffo Agent-connector", "mac_testmachine")
-    newer = b'{"reference":"r2","request_ref":"q2","provider":"google","credential":{"refresh_token":"NEWER"}}'
+    # A refresh, which is the scenario Boris described: the same connection
+    # with a fresher credential. The reference is the file's own, because a
+    # refresh keeps it — an injected value for some *other* connection is a
+    # different property and has its own cell below.
+    newer = json.dumps(
+        {
+            "reference": SkeletonConnectionStore(legacy).load().reference,
+            "request_ref": "req-old",
+            "provider": "google",
+            "credential": {"refresh_token": "NEWER"},
+        }
+    ).encode()
 
     lookups = []
 
@@ -953,10 +978,11 @@ def test_a_read_that_converges_does_not_need_the_keychain_twice(monkeypatch, tmp
     the once-per-process guard exists to prevent.
     """
     legacy = tmp_path / "connection.json"
+    # One connection, two copies — which is the only shape that gets swept.
     legacy.write_bytes(b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":1}}')
     fake = FakeSecurity()
     fake.items[("Puffo Agent-connector", "mac_testmachine")] = (
-        b'{"reference":"b","request_ref":"r","provider":"p","credential":{"t":2}}'
+        b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":2}}'
     )
     store = keychain_over(monkeypatch, fake, legacy)
 
@@ -964,3 +990,276 @@ def test_a_read_that_converges_does_not_need_the_keychain_twice(monkeypatch, tmp
 
     assert fake.verbs() == ["find-generic-password"]
     assert not legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# One gate in front of the sweep and the answer.
+#
+# Both places can hold a record, and both read paths used to take "the Keychain
+# has a value" for "the Keychain has the connection" — then delete the file and
+# return the value on the strength of it. Jeff 221356 and 測試姬 221362 took
+# that apart from two sides: validate before deleting, and do not silently
+# answer with a value you could not establish is the current one.
+
+
+def a_keychain_holding(fake: FakeSecurity, body: bytes) -> None:
+    fake.items[("Puffo Agent-connector", "mac_testmachine")] = body
+
+
+@pytest.mark.parametrize("value", [b"null", b"{}", b"[]"], ids=["null", "object", "array"])
+def test_a_keychain_value_that_is_not_a_connection_does_not_take_the_file(
+    monkeypatch, tmp_path, value
+):
+    """Delete-then-validate, in the order that cost the only readable copy.
+
+    All three parse, so the Keychain leg says yes to them; ``load`` refuses
+    them a moment later, but the sweep had already run and the credential the
+    file was holding was gone (Jeff 221356, all three reproduced).
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    (tmp_path / "connection.partial").write_text(f'{{"refresh_token": "{SENTINEL}"}}')
+    fake = FakeSecurity()
+    a_keychain_holding(fake, value)
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    with pytest.raises(ValueError):
+        store.load()
+
+    # Refused, and the copy that is actually a connection is still here.
+    assert sorted(files_holding(tmp_path, SENTINEL)) == sorted(
+        [legacy, tmp_path / "connection.partial"]
+    )
+    assert SkeletonConnectionStore(legacy).load().credential == {"refresh_token": SENTINEL}
+
+
+@pytest.mark.parametrize("value", [b"null", b"{}", b"[]"], ids=["null", "object", "array"])
+def test_a_value_that_is_not_a_connection_does_not_take_the_file_during_a_move_either(
+    monkeypatch, tmp_path, value
+):
+    """The second entry point, which had the same bug for the same reason.
+
+    ``_migrate`` re-reads the Keychain before writing, and whatever it finds
+    there went down the same "it has a value, so sweep" path (測試姬 221362:
+    both places, one gate).
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    lookups = []
+
+    def something_lands_before_the_recheck(argv, *, input=None, **_kwargs):
+        if argv[1] == "find-generic-password":
+            lookups.append(1)
+            if len(lookups) == 2:
+                a_keychain_holding(fake, value)
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", something_lands_before_the_recheck)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with pytest.raises(ValueError):
+        store.load()
+
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+
+def test_a_file_naming_another_connection_is_neither_deleted_nor_talked_over(
+    monkeypatch, tmp_path
+):
+    """The rollback path, which is a real one (Boris 221354, Jeff 221356).
+
+    Turn this store off, the file store says not connected, the user
+    reconnects into the file, turn it back on. The Keychain's record may be the
+    one the provider revoked. Deleting the file destroys the live credential;
+    answering with the Keychain's value hands out the dead one. Their
+    references are random hex, so nothing here can order them.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake,
+        b'{"reference":"someone-else","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"STALE"}}',
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    with pytest.raises(ConflictingConnections):
+        store.load()
+
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+    assert fake.items[("Puffo Agent-connector", "mac_testmachine")].endswith(b'"STALE"}}')
+
+
+def test_another_connection_arriving_during_a_move_is_refused_rather_than_answered(
+    monkeypatch, tmp_path
+):
+    """Same conflict, reached through ``_migrate``'s re-read.
+
+    The re-read exists so a value that arrived first is not written over. That
+    is still true here — but "not written over" is not "hand it to the caller":
+    a record for a different connection is no more orderable at this entry
+    point than at the other one.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    other = (
+        b'{"reference":"someone-else","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"OTHER"}}'
+    )
+    lookups = []
+
+    def another_connection_lands_in_between(argv, *, input=None, **_kwargs):
+        if argv[1] == "find-generic-password":
+            lookups.append(1)
+            if len(lookups) == 2:
+                a_keychain_holding(fake, other)
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", another_connection_lands_in_between)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with pytest.raises(ConflictingConnections):
+        store.load()
+
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+    assert fake.items[("Puffo Agent-connector", "mac_testmachine")] == other
+
+
+def test_a_file_that_cannot_be_read_is_not_assumed_to_agree(monkeypatch, tmp_path):
+    """Cannot tell is not absent — and here, not "nothing that could disagree".
+
+    The cost is deliberate and worth writing down: a file this store cannot
+    read takes down a load the Keychain could have answered on its own.
+    """
+    legacy = tmp_path / "connection.json"
+    legacy.mkdir()  # reading it raises, rather than saying "absent"
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake, b'{"reference":"r","request_ref":"q","provider":"p","credential":{"t":1}}'
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    with pytest.raises(OSError):
+        store.load()
+
+    assert legacy.exists()
+
+
+def test_a_leftover_is_still_swept_when_there_is_no_record_to_compare_it_to(
+    monkeypatch, tmp_path
+):
+    """The hole the reference guard would otherwise open.
+
+    A clear that removed the record but not the ``.partial`` leaves a
+    credential in the clear with nothing left to compare against. Nothing ever
+    reads a ``.partial``, so it cannot be the connection this computer holds —
+    it is residue, and the sweep has to converge on it too.
+    """
+    legacy = tmp_path / "connection.json"
+    (tmp_path / "connection.partial").write_text(f'{{"refresh_token": "{SENTINEL}"}}')
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake, b'{"reference":"r","request_ref":"q","provider":"p","credential":{"t":1}}'
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    assert store.load().reference == "r"
+
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_move_whose_only_failure_was_the_sweep_does_not_say_it_will_not_retry(
+    monkeypatch, tmp_path, caplog
+):
+    """The log line Jeff 221356 caught contradicting the code under it.
+
+    A write that landed and was read back is done; there is nothing to retry,
+    and the next read sweeps the file. It shared a branch — and therefore a
+    message — with a write that never landed, which needs the opposite said
+    about it.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+    with caplog.at_level(logging.WARNING, logger=keychain_store.__name__):
+        assert store.load().credential == {"refresh_token": SENTINEL}
+
+    said = caplog.text
+    assert "now in the Keychain" in said
+    assert "restarts" not in said
+    # And the write really did land, which is what makes the message true.
+    assert fake.items[("Puffo Agent-connector", "mac_testmachine")]
+
+
+def test_a_move_the_keychain_refused_does_say_it_will_not_retry(monkeypatch, tmp_path, caplog):
+    """Positive control for the cell above: the other branch still says it."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def refuses_to_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", refuses_to_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with caplog.at_level(logging.WARNING, logger=keychain_store.__name__):
+        assert store.load().credential == {"refresh_token": SENTINEL}
+
+    assert "will not be retried until this process restarts" in caplog.text
+    assert "now in the Keychain" not in caplog.text
+
+
+def test_a_write_that_landed_but_could_not_sweep_says_so_by_its_type(monkeypatch, tmp_path):
+    """The caller of an explicit save needs the two apart as well.
+
+    ``_put`` raising used to leave "did the write land" to be read out of a
+    message. The committed case has its own type now, and it is a subclass of
+    ``OSError`` so nothing upstream had to learn about it.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+    reference = store.load().reference
+    legacy.write_bytes(
+        json.dumps(
+            {
+                "reference": reference,
+                "request_ref": "r",
+                "provider": "p",
+                "credential": {"t": 1},
+            }
+        ).encode()
+    )
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+
+    with pytest.raises(SupersededCopyRemains):
+        store.update(reference=reference, credential={"refresh_token": "second"})
+
+
+def test_a_write_the_keychain_refused_is_not_that_type(monkeypatch, tmp_path):
+    """Positive control: the type has to be capable of not being raised."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+
+    def refuses_to_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", refuses_to_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    with pytest.raises(KeychainUnavailable) as refused:
+        store.update(reference=store.load().reference, credential={"refresh_token": "second"})
+
+    assert not isinstance(refused.value, SupersededCopyRemains)

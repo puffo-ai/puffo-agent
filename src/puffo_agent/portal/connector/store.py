@@ -141,7 +141,18 @@ class ConnectionStore:
         raise NotImplementedError
 
     def _put(self, body: bytes) -> None:
-        """Make ``body`` the stored record, or leave the store unchanged."""
+        """Make ``body`` the stored record.
+
+        On failure, what this computer holds is whatever the next ``_read``
+        says. This used to promise "or leave the store unchanged", which the
+        file store below does keep — it writes a temporary file and renames —
+        and which the Keychain store cannot: ``security -i`` does not reliably
+        carry an inner failure into its own exit code (Boris 220754), so a
+        reported failure is not evidence the item is untouched, and a read-back
+        that disagrees proves only that the new value is not in effect. The
+        promise was written once for both and was false for one of them
+        (Jeff 221356).
+        """
         raise NotImplementedError
 
     def _erase(self) -> None:
