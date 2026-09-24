@@ -45,18 +45,20 @@ def connection_path() -> Path:
 
 # macOS keeps the file store, and now for a measured reason rather than an
 # unverified one. The Keychain backend writes through ``security`` with the
-# value on stdin, and that form is broken: ``-w`` last prompts on a terminal,
-# so a piped value lands as an EMPTY password while ``security`` exits 0
-# (Jeff 220726, on a real Keychain with synthetic data). The backend's
-# read-back check turns that into a loud failure, so nothing silently stores
-# nothing — but it does mean a write cannot currently succeed.
+# value piped to a trailing ``-w``, and on a real Keychain that stores an EMPTY
+# password while exiting 0 on both the write and the read back (Jeff 220726,
+# synthetic data). The backend's read-back check turns that into a loud
+# failure, so nothing silently stores nothing — but a write cannot currently
+# succeed at all.
 #
-# What flips this is therefore not "one confirming run" any more: the write has
-# to move off the CLI onto ``SecItemAdd``, which takes the value as data in a
-# dictionary — no command line to leak it into and no prompt to swallow it —
-# and which reports "no such item" as its own status instead of the CLI's 44
-# for everything. Then the confirming run, on a computer with a daemon's HOME:
-# save, load, update, clear, and nothing left behind afterwards.
+# What flips this: move the write to ``security -i`` with the value as hex
+# through ``-X``, which keeps argv clean and is measured working on a real
+# Keychain, including a service name with a space (Jeff 220731/220737/220759).
+# Not ``SecItemAdd`` — it would pin the item's trusted application to whichever
+# Python called it, and that path moves with the venv, after which reads want
+# an authorization prompt a daemon has nobody to answer. Then the confirming
+# run, on a computer with a daemon's HOME: save, load, update, clear, and
+# nothing left behind afterwards.
 #
 # The same change owes one more thing: a computer that already holds a
 # ``connection.json`` keeps it after the switch, because ``clear`` only reaches

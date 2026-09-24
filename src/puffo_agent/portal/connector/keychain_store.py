@@ -26,14 +26,20 @@ refusing rather than guessing:
   option to be prompted``, and on this computer another process running as the
   same user can read a full command line out of ``ps``.
 
-  **That stdin form does not work, measured** (Jeff 220726): ``-w`` last
-  prompts on a *terminal*, not on stdin, so with the value piped in
-  ``security`` stores an EMPTY password and still exits 0 — on both the write
-  and the read back. The read-back check below is what caught it, which is the
-  only reason this is a known failure rather than a daemon reporting connected
-  with nothing stored. Until the write goes through ``SecItemAdd`` instead of
-  the CLI, ``_put`` cannot succeed on a real Keychain and this backend stays
-  unreachable behind ``_KEYCHAIN_VERIFIED``.
+  **That stdin form does not work.** Measured on a real Keychain with
+  synthetic data (Jeff 220726): the value piped in, ``security`` exits 0 on
+  both the write and the read back, and what comes back is an EMPTY password.
+  That is the whole of the measurement. *Why* is Boris 220727's reading of the
+  help text — ``-w`` last means "prompt", and a prompt reads a terminal rather
+  than our pipe — which fits but which nobody has traced through the
+  implementation, so it stays an explanation and not a located root cause
+  (Jeff 220729, and again 220792 when this comment said otherwise).
+
+  The read-back check below is what turned it into a known failure instead of
+  a daemon reporting connected with nothing stored. Until the write moves to
+  ``security -i`` with the value as hex through ``-X`` — measured working on a
+  real Keychain, Jeff 220731/220737/220759 — ``_put`` cannot succeed and this
+  backend stays unreachable behind ``_KEYCHAIN_VERIFIED``.
 """
 
 from __future__ import annotations
