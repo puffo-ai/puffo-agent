@@ -6,6 +6,70 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.9] - 2026-09-24
+
+### Requires
+
+- **LingTai kernel 1.0.9 or newer for any LingTai agent.** Loading or creating
+  a LingTai agent now asks the kernel for its resident socket
+  (`lingtai-agent acp-socket-path`), which kernel 1.0.8 and older do not have.
+  Against an older kernel the import stops with "LingTai kernel 1.0.9 or
+  newer is required … upgrade the LingTai kernel, then retry import" before
+  anything is registered, so the same folder can be imported after the
+  upgrade (#417). Release the kernel first. Agents that are not LingTai are
+  unaffected.
+
+### Added
+
+- **LingTai: connect to an Agent that is already running instead of starting
+  a second one.** Loading an existing LingTai Agent whose resident process is
+  running now attaches Puffo to that process over its local socket. Puffo no
+  longer starts another `lingtai-agent acp` on the same directory. The choice
+  is stored per agent as `runtime.lingtai_attach`. (#414, with
+  Lingtai-AI/lingtai-kernel#1758)
+  - **How the mode is chosen at import:** attach when the resident's socket
+    answers; start a new process only when there is no socket at all. Any other
+    case (a socket that refuses or times out, an unexpected path) stops the
+    import and asks the user to start or restart the LingTai Agent and retry.
+    The choice is made once at import and is not re-checked later.
+  - **Never falls back to starting LingTai.** If an attach agent's Agent
+    cannot be found, the worker fails to start. Stopping, reloading or rolling
+    over an attach agent disconnects; it never stops the resident.
+  - **The setting is checked:** off by default, must be `true` or `false`, and
+    only accepted for a cli-local `acp` runtime with a LingTai `puffo-v1`
+    command.
+  - **Discovery reads both registries** (Puffo's older one and the resident's
+    default) and keeps the more restrictive state when they disagree. A source
+    whose registry could not be read is not offered for import, whether it
+    shows as available or as revoked (#418).
+  - The Driver-authority endpoint handed to an attached Agent names the
+    runtime it was issued for, so it cannot be reused for another runtime.
+
+### Fixed
+
+- **ACP: text an Agent sends just before a turn ends now belongs to that
+  turn.** The ACP SDK could settle the turn's result before handling the last
+  text update, so the reply came out empty and the text arrived belonging to
+  no turn. Puffo now waits for earlier updates before ending a turn, whether
+  the turn succeeded, returned an error, or the request failed. The wait is
+  bounded; an update the SDK drops is reported as `session_updates_unsettled`.
+  This affects every ACP agent, spawned or attached. (#414)
+- **An ACP agent that cannot resume a saved session starts a fresh one at
+  once,** instead of after three failed attempts. (#414)
+- **LingTai: a folder whose earlier import failed can be imported again.**
+  Checking the kernel version before registering the folder means a failed
+  import no longer leaves it marked revoked (#417). Folders already left
+  revoked by an earlier failure can be selected again in the web import
+  screen, which reconnects them under a new registration
+  (puffo-ai/puffo-core-han-group#1218, shipped with the web app, not this
+  package).
+- **Cloud agents are no longer told a reply was not delivered after they sent
+  it.** Under the cli-local runtime the harness drivers never reported the
+  sends of a turn, so every cloud turn that ended in a closing sentence
+  triggered the "your last reply was NOT delivered" prompt, and some models
+  posted the same reply twice. The daemon now also counts the sends it
+  committed during the turn. (#409)
+
 ## [2.0.8] - 2026-09-22
 
 ### Added
