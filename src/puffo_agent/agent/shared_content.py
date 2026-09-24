@@ -1104,6 +1104,48 @@ top-level post. Channel ids are raw `ch_<uuid>` (no `#name`).
 """
 
 
+DEFAULT_SKILL_PAID_DATA = """\
+# Skill: paid data (monid)
+
+Some data is only reliable from a paid source — social posts and
+timelines, live prices, company or people records, or anything behind a
+login or paywall. Free or built-in web search of these is often stale,
+partial, or blocked (rate limits, 403s), so buy the real thing through
+monid instead of passing off a free scrape as authoritative.
+
+**Tools:** `mcp__puffo__monid_prepare` (FREE) then
+`mcp__puffo__monid_spend` (PAID).
+
+**When to use monid instead of free search:**
+- Social posts / timelines, live prices or quotes, company or people
+  records, or anything gated by a login or paywall.
+- You're about to present a free-scraped result as if it were
+  authoritative — buy it instead.
+Free search stays fine for low-stakes facts it covers reliably.
+
+**How to use it well:**
+1. Call `monid_prepare` first — it's FREE and only looks things up. It
+   returns the `provider`, `endpoint`, a `price` quote (micro-dollars),
+   and the `input` schema. If nothing matches, the data isn't available
+   via monid; you may answer from elsewhere but MUST label it NOT a monid
+   result.
+2. Read the quoted `price`, then pass a `max_cost_micro` ceiling to
+   `monid_spend` so a call above that ceiling is rejected before any
+   money moves.
+3. Call `monid_spend` with the `provider`/`endpoint` from prepare and an
+   `input` built to the prepared schema's envelope(s) (`body` /
+   `queryParams` / `pathParams`).
+4. If a spend fails ambiguously, retry the SAME arguments — spend reuses
+   its idempotency key so billing dedupes and you're not charged twice.
+   Pass an explicit `idempotency_key` only to tie retries to your own
+   logical operation; a genuinely new purchase needs new arguments.
+
+You never hold the monid key or the money: Puffo holds the key, checks
+your budget, pays, and returns the result. Never install or run a monid
+CLI, and never ask for or hold your own monid key.
+"""
+
+
 DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "send-message": (
         "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
@@ -1163,6 +1205,11 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         "Read and post sticky-note status markers (Waiting / Processing "
         "/ Complete) on Puffo threads.",
         DEFAULT_SKILL_USE_PUFFO_NOTES,
+    ),
+    "paid-data": (
+        "Buy live or paywalled data (social posts, prices, people/company "
+        "records) through monid instead of a stale free scrape.",
+        DEFAULT_SKILL_PAID_DATA,
     ),
 }
 
