@@ -27,6 +27,8 @@ _STATE_RANK = {
     "policy_version_mismatch": 2, "stale_binding": 3,
     "bound": 4, "revoked": 5, "available": 6,
 }
+# LingTai registers a revoked source again under a new runtime id.
+_IMPORTABLE = frozenset({"available", "revoked"})
 
 
 def _absolute(value: object, field: str, *, resolve: bool = True) -> Path:
@@ -296,10 +298,10 @@ async def _discover(params: dict, operator: str) -> dict:
         result["warnings"].append("discovery_timeout")
         failed_roots.extend(roots)
     # If one registry could not be inspected, its binding might be hidden by
-    # another registry's "available" row. Never offer that source for import.
+    # another registry's importable row. Never offer that source for import.
     agents = {
         directory: agent for directory, agent in agents.items()
-        if agent["status"] != "available" or not any(
+        if agent["status"] not in _IMPORTABLE or not any(
             Path(directory).is_relative_to(root) for root in failed_roots
         )
     }

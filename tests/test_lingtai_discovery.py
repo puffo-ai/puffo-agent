@@ -538,7 +538,8 @@ async def test_legacy_binding_is_not_hidden_by_new_registry_availability(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_failed_registry_cannot_make_source_appear_available(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["available", "revoked"])
+async def test_failed_registry_cannot_make_source_appear_available(tmp_path, monkeypatch, status):
     """An unreadable legacy binding must not be mistaken for an unbound source."""
     agent = tmp_path / "agent"
     agent.mkdir()
@@ -551,7 +552,7 @@ async def test_failed_registry_cannot_make_source_appear_available(tmp_path, mon
     async def query(_executable, _root, registry):
         if registry == legacy:
             raise ValueError("unreadable registry")
-        return [{"agent_dir": str(agent), "status": "available"}]
+        return [{"agent_dir": str(agent), "status": status}]
 
     monkeypatch.setattr(discovery, "_query", query)
     result = await discovery.discover_lingtai({"root": str(tmp_path)}, operator="owner")
