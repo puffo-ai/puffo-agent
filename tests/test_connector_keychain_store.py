@@ -24,7 +24,11 @@ from pathlib import Path
 import pytest
 
 from puffo_agent.portal.connector import keychain_store
-from puffo_agent.portal.connector.claim import STAGE_READ_LOCAL, claim_connection
+from puffo_agent.portal.connector.claim import (
+    STAGE_READ_LOCAL,
+    claim_connection,
+    disconnect,
+)
 from puffo_agent.portal.connector import store as store_module
 from puffo_agent.portal.connector.store import SkeletonConnectionStore
 from puffo_agent.portal.connector.keychain_store import (
@@ -1263,3 +1267,67 @@ def test_a_write_the_keychain_refused_is_not_that_type(monkeypatch, tmp_path):
         store.update(reference=store.load().reference, credential={"refresh_token": "second"})
 
     assert not isinstance(refused.value, SupersededCopyRemains)
+
+
+def test_a_disconnect_still_clears_both_copies_while_a_conflict_is_present(
+    monkeypatch, tmp_path
+):
+    """The way out of a fail-closed state, pinned rather than assumed.
+
+    A conflict makes every read raise, so if the disconnect path ever grew a
+    ``load`` in front of its ``clear`` — to log which connection was being
+    given up, say — the only way out of the state would be deleting files by
+    hand. It has no such read today, and now that failing closed is what gets
+    a user into the state, that is worth a cell rather than an inspection
+    (Boris 221371 asked; nothing was holding it).
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    (tmp_path / "connection.partial").write_text(f'{{"refresh_token": "{SENTINEL}"}}')
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake,
+        b'{"reference":"someone-else","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"STALE"}}',
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+    # The state really is the wedged one, or the disconnect below proves nothing.
+    with pytest.raises(ConflictingConnections):
+        store.load()
+
+    asyncio.run(disconnect(store))
+
+    assert files_holding(tmp_path, SENTINEL) == []
+    assert fake.items == {}
+
+
+def test_the_same_reference_does_not_decide_which_credential_is_usable(
+    monkeypatch, tmp_path
+):
+    """The residual, recorded as behaviour rather than asserted away.
+
+    Jeff 221374 built this to falsify a sentence in the docstring that said
+    the cost of guessing wrong here is "a refresh, not a connection". The
+    Keychain holds an older credential, the file a newer one under the same
+    reference: ``load`` answers with the older and deletes the newer, and
+    nothing here knows whether the survivor still works. This cell exists so
+    that reading the code and reading the doc give the same answer, and so a
+    later change of resolution cannot happen quietly.
+    """
+    legacy = tmp_path / "connection.json"
+    legacy.write_bytes(
+        b'{"reference":"r","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"NEWER-IN-THE-FILE"}}'
+    )
+    fake = FakeSecurity()
+    a_keychain_holding(
+        fake,
+        b'{"reference":"r","request_ref":"q","provider":"google",'
+        b'"credential":{"refresh_token":"OLDER-IN-THE-KEYCHAIN"}}',
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    loaded = store.load()
+
+    assert loaded.credential == {"refresh_token": "OLDER-IN-THE-KEYCHAIN"}
+    assert not legacy.exists()
+    assert files_holding(tmp_path, "NEWER-IN-THE-FILE") == []

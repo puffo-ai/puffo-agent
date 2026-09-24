@@ -189,7 +189,11 @@ class KeychainConnectionStore(ConnectionStore):
                                     used to take the file with them before
                                     anything checked them.
     - same reference both places  → the file is a second copy of one
-                                    connection, and it goes.
+                                    connection, and it goes. Which of the two
+                                    credentials is the usable one is not
+                                    decided here and cannot be; see
+                                    ``_sweep_what_the_keychain_supersedes``
+                                    for the residual that leaves.
     - different references        → refused, and nothing is deleted. Two
                                     records naming two connections, with no
                                     order between them.
@@ -309,12 +313,33 @@ class KeychainConnectionStore(ConnectionStore):
           file.
 
         What this is **not**: a freshness test. Matching references prove the
-        two copies are one connection — which is what makes removing one of
-        them lose no connection — and prove nothing about which credential is
-        newer. The narrow case that leaves open is both copies naming one
-        connection with the file holding the fresher credential, where the
-        cost is a refresh, not a connection (Jeff 221356 made this point and
-        he is right; it is not an argument for deleting less carefully).
+        two copies name one connection. They prove nothing about which
+        credential is the usable one — and the sentence that used to stand
+        here, that the cost of getting that wrong is "a refresh, not a
+        connection", was a guarantee nobody had established. Jeff 221374
+        falsified it by construction: with the Keychain holding an older
+        credential and the file a newer one under the same reference, ``load``
+        answers with the older and deletes the newer. Whether the survivor can
+        still be refreshed is a fact about the provider, and this daemon does
+        not look inside a credential (v0.4 §4), so it is not something that can
+        be claimed from in here.
+
+        The residual, stated rather than bounded. When the references match,
+        the Keychain copy wins and the file goes. On the path that normally
+        produces that pair — a ``save`` or ``update`` whose Keychain write
+        landed and whose sweep did not — the Keychain copy is the newer one by
+        construction, and taking the file is the convergence Jeff 221335/221343
+        asked for. The same pair can be produced the other way round, by
+        rolling this store back while a connection is live and letting a
+        refresh write the file; there it is the newer credential that goes.
+        Making "same reference, different bytes" a conflict would close that
+        one and reopen the other — the plaintext copy would then stay on disk
+        for good, which is the property default-enable was gated on — so it is
+        deliberately not closed here. Rolling this store back with a live
+        connection is not a supported operation: disconnect first. That is an
+        instruction to whoever does it, not a precondition this code reads as
+        permission to delete (Boris 221354 offered exactly such a precondition
+        and it was declined for the same reason).
         """
         held = _reference_of(from_keychain)
         if held is None:
