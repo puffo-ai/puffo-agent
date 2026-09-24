@@ -37,6 +37,17 @@ SENTINEL = "SENTINELe07b2c4arefreshtoken"
 _ITEM_NOT_FOUND = 44
 
 
+@pytest.fixture(autouse=True)
+def a_fresh_process():
+    """The once-per-process move guard is module state, so each cell needs its
+    own process as far as that guard is concerned. Without this the first cell
+    to run consumes the single attempt and every later one sees a store that
+    has already given up."""
+    keychain_store._MOVE_ATTEMPTED.clear()
+    yield
+    keychain_store._MOVE_ATTEMPTED.clear()
+
+
 class FakeSecurity:
     """``/usr/bin/security``, as measured on this computer.
 
@@ -826,3 +837,130 @@ def test_a_write_whose_sweep_failed_is_still_committed(monkeypatch, tmp_path):
 
     # Committed anyway: this is what the caller has to know.
     assert store.load().credential == {"refresh_token": "second"}
+
+
+# ---------------------------------------------------------------------------
+# What the move must not do (Boris 221326, both found by reading the code).
+
+
+def test_a_move_never_overwrites_something_that_arrived_first(monkeypatch, tmp_path):
+    """The silent one: an older file value landing on top of a newer credential.
+
+    The read-back would pass — it reads back what it just wrote — the sweep
+    would delete the file, and if the provider rotated the token the surviving
+    credential is already dead. Nothing raises.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    key = ("Puffo Agent-connector", "mac_testmachine")
+    newer = b'{"reference":"r2","request_ref":"q2","provider":"google","credential":{"refresh_token":"NEWER"}}'
+
+    lookups = []
+
+    def a_refresh_lands_in_between(argv, *, input=None, **_kwargs):
+        # Empty on the first lookup, committed by the time the move re-checks.
+        if argv[1] == "find-generic-password":
+            lookups.append(1)
+            if len(lookups) == 2:
+                fake.items[key] = newer
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", a_refresh_lands_in_between)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    loaded = store.load()
+
+    # The newer credential survived and is what the caller got.
+    assert loaded.credential == {"refresh_token": "NEWER"}
+    assert fake.items[key] == newer
+    # And the superseded file is gone rather than left in the clear.
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_refused_move_is_not_retried_on_every_read(monkeypatch, tmp_path):
+    """Each retry is another ``security`` call, and any prompt it raises lands
+    on the operator's screen where this process cannot see it (220858)."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    writes = []
+
+    def refuses_to_write(argv, *, input=None, **_kwargs):
+        if argv[1] == "-i":
+            writes.append(1)
+            return subprocess.CompletedProcess(argv, 1, b"", b"security: no")
+        return fake(argv, input=input, **_kwargs)
+
+    monkeypatch.setattr(keychain_store.subprocess, "run", refuses_to_write)
+    store = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    for _ in range(5):
+        assert store.load().credential == {"refresh_token": SENTINEL}
+
+    assert len(writes) == 1
+
+
+def test_a_new_process_tries_the_move_again(monkeypatch, tmp_path):
+    """Giving up for the process is not giving up forever — positive control,
+    so "it never retries" cannot pass by the move being broken outright."""
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+    keychain_store._MOVE_ATTEMPTED.add(("Puffo Agent-connector", "mac_testmachine"))
+
+    assert store.load().credential == {"refresh_token": SENTINEL}
+    assert files_holding(tmp_path, SENTINEL) == [legacy]  # skipped, as asked
+
+    keychain_store._MOVE_ATTEMPTED.clear()  # what a restart amounts to here
+
+    assert store.load().credential == {"refresh_token": SENTINEL}
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_sweep_that_failed_during_the_move_converges_on_a_later_read(monkeypatch, tmp_path):
+    """The one a restart does not fix (Jeff 221335/221343, 測試姬 221338).
+
+    Once the Keychain holds the value, every later read short-circuits on it.
+    If the move's unlink had failed, the plaintext would sit there for good —
+    the entry outlives the process, so restarting lands in the same branch.
+    """
+    legacy = a_computer_that_connected_before_the_switch(tmp_path)
+    fake = FakeSecurity()
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    def cannot_unlink(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", cannot_unlink)
+    # The move writes and verifies, but cannot remove the file.
+    assert store.load().credential == {"refresh_token": SENTINEL}
+    assert files_holding(tmp_path, SENTINEL) == [legacy]
+
+    monkeypatch.undo()  # the permission problem goes away
+    monkeypatch.setattr(keychain_store.subprocess, "run", fake)
+    # A plain read — no write, no clear — and this is a fresh store object, so
+    # it stands in for the process restart too.
+    reread = KeychainConnectionStore("mac_testmachine", superseded=legacy)
+
+    assert reread.load().credential == {"refresh_token": SENTINEL}
+    assert files_holding(tmp_path, SENTINEL) == []
+
+
+def test_a_read_that_converges_does_not_need_the_keychain_twice(monkeypatch, tmp_path):
+    """The sweep on the short-circuit path is filesystem only.
+
+    It runs on every read, so if it cost a ``security`` call it would be a
+    Keychain round trip — and a possible prompt — per read, which is the thing
+    the once-per-process guard exists to prevent.
+    """
+    legacy = tmp_path / "connection.json"
+    legacy.write_bytes(b'{"reference":"a","request_ref":"r","provider":"p","credential":{"t":1}}')
+    fake = FakeSecurity()
+    fake.items[("Puffo Agent-connector", "mac_testmachine")] = (
+        b'{"reference":"b","request_ref":"r","provider":"p","credential":{"t":2}}'
+    )
+    store = keychain_over(monkeypatch, fake, legacy)
+
+    store.load()
+
+    assert fake.verbs() == ["find-generic-password"]
+    assert not legacy.exists()

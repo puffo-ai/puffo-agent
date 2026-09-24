@@ -54,6 +54,12 @@ from .store import ConnectionStore, _check
 
 logger = logging.getLogger(__name__)
 
+# Items this process has already tried to move out of the file store, whether
+# or not it worked. A refused move must not be retried on every read: each
+# retry is another ``security`` call, and any prompt it raises lands on the
+# operator's screen where the caller cannot see it (Boris 221326).
+_MOVE_ATTEMPTED: set[tuple[str, str]] = set()
+
 SECURITY = "/usr/bin/security"
 
 # One item per machine identity. The Keychain belongs to the login user and is
@@ -95,11 +101,21 @@ class KeychainConnectionStore(ConnectionStore):
 
     ``save`` / ``update`` — Keychain first, the older file second:
 
-    - the Keychain write fails      → nothing committed, nothing erased. The
-                                      connection here is unchanged. Retry safe.
-    - the read-back disagrees       → nothing committed, nothing erased. The
-                                      item is left alone on purpose: it may
-                                      still hold the credential in use.
+    - the Keychain write fails      → not confirmed, nothing erased. Note the
+                                      wording: ``security -i`` does not
+                                      reliably carry an inner failure into its
+                                      exit code (Boris 220754), so a reported
+                                      failure is not evidence the item is
+                                      unchanged. What the item holds is
+                                      whatever the next ``load`` says.
+    - the read-back disagrees       → the new value is **not** in effect; that
+                                      much the read-back proves. It does not
+                                      prove nothing was written, so this is
+                                      "not confirmed", not "not committed"
+                                      (Jeff 221335 — the cell this matrix had
+                                      wrong). Nothing is erased, and the item
+                                      is left alone on purpose: it may still
+                                      hold the credential in use.
     - sweeping the older file fails → **committed**. ``load`` returns the new
                                       credential. What failed is the removal of
                                       the older copy, which is still readable
@@ -119,6 +135,25 @@ class KeychainConnectionStore(ConnectionStore):
 
     ``load`` never raises for a cleanup problem: a migration that could not
     finish still answers with the connection it read.
+
+    ``load`` — when the Keychain is empty and the older file is not, reading
+    also moves it, which makes a read a write:
+
+    - the move is refused         → answered with the file's connection, and
+                                    not attempted again until this process
+                                    restarts.
+    - something arrived first     → that value wins and is returned; the file
+                                    is swept, never written over.
+    - the record is not one       → not moved; ``load`` fails closed on it.
+
+    **What serialises any of this is the caller, not this class.** There is no
+    lock here. ``connector.claim`` holds one asyncio lock across load, save,
+    update and clear, which is what makes "the Keychain is empty" still true a
+    moment later when the move writes; the re-check above narrows that window
+    but two adjacent lookups are not a compare-and-set. A caller that reads
+    outside that lock while another writes inside it gets no guarantee from
+    here. Today every caller of ``load`` is inside it (``claim.py``), and
+    ``update`` has no production caller at all.
     """
 
     def __init__(
@@ -169,9 +204,24 @@ class KeychainConnectionStore(ConnectionStore):
         """The record this computer holds, in either place it could be."""
         from_keychain = self._read_from_keychain()
         if from_keychain is not None:
+            # An older copy alongside a Keychain entry is superseded, and it is
+            # swept here rather than only when a write happens. Without this the
+            # cleanup never converges: a move whose write landed but whose
+            # unlink failed leaves the entry in place, so every later read —
+            # including after a restart, because the entry outlives the
+            # process — short-circuits right here and never reaches the
+            # migration again. The plaintext would then sit there until some
+            # explicit write or clear happened to come along (Jeff 221335, and
+            # 221343 for the restart half; 測試姬 221338 withdrew "bounded
+            # window" on the strength of it). Filesystem only, so no Keychain
+            # call and no prompt.
+            self._erase_quietly()
             return from_keychain
         # Nothing in the Keychain is not yet "nothing on this computer".
-        return self._read_superseded()
+        older = self._read_superseded()
+        if older is None:
+            return None
+        return self._migrate(older)
 
     def _read_from_keychain(self) -> bytes | None:
         """The Keychain leg on its own, which is what ``_put`` verifies against.
@@ -239,37 +289,61 @@ class KeychainConnectionStore(ConnectionStore):
         if self.superseded is None:
             return None
         try:
-            body = self.superseded.read_bytes()
+            return self.superseded.read_bytes()
         except FileNotFoundError:
             return None
-        self._migrate(body)
-        return body
 
-    def _migrate(self, body: bytes) -> None:
-        """Move the older copy into the Keychain, here on the read path.
+    def _migrate(self, body: bytes) -> bytes:
+        """Move the older copy into the Keychain, and answer with what to use.
 
         A write inside a read is not free, and it is here on purpose. Sweeping
         only on write or clear leaves an already-connected computer holding its
         credential in plaintext on disk for as long as nothing happens to write
         — and nothing has to: a refresh is reactive, so a credential that does
         not expire on a computer nobody sends mail from is never rewritten
-        (Boris 221279, who measured the gap in the shape of this code rather
-        than in a run). "Cleaned up whenever a write next occurs" is not a
-        property; the point of moving to the Keychain is that the plaintext
-        stops existing.
+        (Boris 221279, who found the gap by reading the shape of the code).
+        "Cleaned up whenever a write next occurs" is not a property; the point
+        of moving to the Keychain is that the plaintext stops existing.
 
-        Best effort, and it can only improve matters. A record that is not one
-        is left alone — ``load`` fails closed on it, which is the right answer
-        and not something to copy into the Keychain first. A Keychain that
-        refuses the write leaves the file exactly where it was and the
-        connection still usable: a failed migration must not cost a computer a
-        connection it had. Only ``_put`` succeeding, read-back included,
-        removes the file, which is the same order the write path uses.
+        Best effort, and bounded so it can only improve matters:
+
+        - A record that is not one is left alone. ``load`` fails closed on it,
+          which is the right answer and not something to copy over first.
+        - **It never overwrites.** The Keychain is re-read immediately before
+          the write, and anything found there wins and is returned instead —
+          it is newer than a file this store was about to supersede. Without
+          that, a refresh committing between "the Keychain is empty" and this
+          write would be overwritten by the older file value, the read-back
+          would pass because it reads back what it just wrote, the sweep would
+          delete the file, and a rotated credential would be silently dead
+          (Boris 221326). Two adjacent lookups is not an atomic compare-and-set
+          and this does not pretend to be one — see the class docstring for
+          what actually serialises these.
+        - One attempt per process per item. A Keychain that refuses the write
+          leaves the file, and retrying on *every* read would mean a fresh
+          ``security`` call — and any prompt it raises on the operator's
+          screen — each time anything asks whether this computer is connected
+          (Boris 221326, and 220858 for why a prompt is invisible from here).
+        - A failure still answers with the connection. A failed move must not
+          cost a computer a connection it had.
         """
         try:
             _check(json.loads(body))
         except ValueError:
-            return
+            return body
+
+        newer = self._read_from_keychain()
+        if newer is not None:
+            # Something committed while the file was being read. It supersedes
+            # the file by construction, so the file goes and its value does not.
+            self._erase_quietly()
+            return newer
+
+        key = (self.service, self.account)
+        if key in _MOVE_ATTEMPTED:
+            return body
+        _MOVE_ATTEMPTED.add(key)
+
         try:
             self._put(body)
         except (KeychainUnavailable, OSError):
@@ -278,17 +352,27 @@ class KeychainConnectionStore(ConnectionStore):
             #
             # OSError is in here because the sweep is part of ``_put``, and a
             # file that will not unlink must not turn a working read into a
-            # read failure — which is exactly what it did when this only caught
-            # KeychainUnavailable. Note the asymmetry, which is on purpose: the
-            # same sweep failing under an explicit ``save`` or ``update`` does
-            # raise, because there the caller asked to write and is owed the
-            # news. Here the caller asked to read and the answer is good.
+            # read failure. Note the asymmetry, which is on purpose: the same
+            # sweep failing under an explicit ``save`` or ``update`` does raise,
+            # because there the caller asked to write and is owed the news.
             logger.warning(
-                "connector: could not finish moving the connection into the "
-                "Keychain; a copy may remain in the file store"
+                "connector: could not move the connection into the Keychain; "
+                "it stays in the file store and will not be retried until "
+                "this process restarts"
             )
-            return
+            return body
         logger.info("connector: moved the connection from the file store into the Keychain")
+        return body
+
+    def _erase_quietly(self) -> None:
+        """Sweep the older copy without letting a read fail over it."""
+        try:
+            self._erase_superseded()
+        except OSError:
+            logger.warning(
+                "connector: a superseded copy of the connection could not be "
+                "removed from the file store"
+            )
 
     def _put(self, body: bytes) -> None:
         stored = self._run(["-i"], stdin=self._write_command(body))
@@ -307,8 +391,9 @@ class KeychainConnectionStore(ConnectionStore):
             # unreadable did land, the next load fails to parse and the claim
             # refuses — closed either way, and visible.
             raise KeychainUnavailable(
-                "the Keychain did not store what was written; the connection "
-                "on this computer is unchanged or unusable, not replaced"
+                "the Keychain did not store what was written; the new value is "
+                "not in effect, and what the item holds instead is not known "
+                "from here"
             )
         # The Keychain now holds this record, verified, so the older copy is a
         # second readable copy of a credential and goes. Only in this order:
