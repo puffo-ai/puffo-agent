@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import platform
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -38,7 +37,6 @@ from .claim import (
     disconnect,
     refresh_connection,
 )
-from .keychain_store import KeychainConnectionStore
 from .store import ConnectionStore, SkeletonConnectionStore, StaleConnection
 
 logger = logging.getLogger(__name__)
@@ -59,65 +57,26 @@ def connection_path() -> Path:
     return directory / "connection.json"
 
 
-# macOS keeps the file store, and the reason is now one specific piece of
-# unfinished work rather than doubt about the backend.
+# One store, and the choice is not a caller's.
 #
-# The transport question is settled and measured. Writing with the value piped
-# to a trailing ``-w`` stored an EMPTY password while exiting 0 on both the
-# write and the read back (Jeff 220726, synthetic data). That phenomenon is the
-# whole of what was measured; why it happens is an untraced reading of the help
-# text, kept as such in ``keychain_store`` and deliberately not repeated here
-# as a cause. (Written as a cause twice now — Jeff 220792, then again 220903.)
-# The write now goes through ``security -i`` with the
-# value as hex through ``-X``, which keeps argv clean; Jeff 220838
-# independently ran save, load, update and clear against a real Keychain on a
-# random service and account and got equality both ways, the reference kept
-# across the update, and exit 44 from an outside lookup after the clear.
-#
-# Not ``SecItemAdd``. It would pin the item's trusted application to whichever
-# Python called it, and that path moves with the venv. What happens next is no
-# longer inferred, though the observation is a narrow one: on one machine, from
-# an agent's session, four calls to it each raised an authorization dialog on
-# the logged-in operator's screen and each returned -60006
-# (errAuthorizationCanceled) to the caller. Four attempts in one environment do
-# not establish what every daemon would see, and this is not a claim that the
-# ``security`` path never prompts — nobody has watched that screen while it
-# ran. What it does establish is that the prompt is not visible from the
-# calling process at all: -60006 is the whole of what the caller learns, and it
-# reads like an unreachable Keychain rather than like an interrupted person. A
-# credential path whose side effects are invisible to the side making them is
-# not one to hand a daemon.
-#
-# The older file is now handled: the Keychain store is given the file store's
-# path, reads it when the Keychain is empty, sweeps it once a write is verified,
-# and takes it on a disconnect. Without that, a computer that already held a
-# ``connection.json`` would have been reported "not connected" while the
-# credential stayed readable on disk — the breach 4bf86f72 closed for the
-# temporary file, arriving by the other door.
-#
-# So what the flag below is still waiting on is not a missing piece but a
-# measurement: none of the two-store behaviour has run against a real Keychain.
-# Every cell covering it uses a stand-in, and the one real round trip on record
-# (Jeff 220838) predates all of it and was a Keychain-only store. Flipping this
-# on stand-in evidence would be doing exactly what the last three rounds of
-# this file were spent undoing.
-_KEYCHAIN_VERIFIED = False
+# A macOS Keychain backend exists on the full branch and is paused on product
+# direction; it is deliberately absent here so a reviewer reads only what runs.
+# Nothing below changes if it comes back: this function is the single place
+# that decides where a credential lives.
 
 
 def connection_store(machine: MachineControlIdentity) -> ConnectionStore:
     """Where this computer keeps its connection.
 
-    Keyed on the machine identity rather than the home directory: one login
-    Keychain serves every puffo home on a computer, while a connection belongs
-    to the identity that claimed it, so two daemons must not land on one item.
     Not a caller's choice — which store holds a credential is a property of the
     computer, and a parameter here would make it a setting.
+
+    ``machine`` is unused by the file store and kept because the identity is
+    what a second backend would key on: one login Keychain serves every puffo
+    home on a computer, while a connection belongs to the identity that claimed
+    it, so two daemons must not land on one item. Dropping the parameter would
+    move that decision to whoever adds the backend.
     """
-    if _KEYCHAIN_VERIFIED and platform.system() == "Darwin":
-        # Handed the file store's path as well: a computer that connected
-        # before the switch still has its credential there, and the Keychain
-        # store has to be able to find it and to take it away again.
-        return KeychainConnectionStore(machine.machine_id, superseded=connection_path())
     return SkeletonConnectionStore(connection_path())
 
 

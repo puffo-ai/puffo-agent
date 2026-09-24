@@ -1,13 +1,12 @@
 """Where a claimed connection lives on this computer.
 
-``ConnectionStore`` is the shape; there are two of them. On macOS the record
-goes in the login Keychain (``keychain_store``), which is what v0.4 §8 means
-by the real store. Everywhere else it goes in a private file, which is also
-what the first chain was built and verified against.
-
-Both inherit the two rules that would be expensive to get differently right
-twice: a store that cannot be read is not an empty one, and a refresh may only
-replace the connection it names.
+``ConnectionStore`` is the shape; ``SkeletonConnectionStore`` below is the one
+implementation that runs, a private file. The base class stays a base class:
+v0.4 §8 wants the record in the login Keychain on macOS, that backend is
+written and paused on product direction, and the two rules it would need are
+the expensive ones to get differently right twice — a store that cannot be
+read is not an empty one, and a refresh may only replace the connection it
+names. They live here rather than in either subclass.
 
 The credential is stored verbatim. The daemon is not told which provider it is
 holding (v0.4 §4: credential shape is agreed between the provider adapter and
@@ -244,10 +243,9 @@ def _encode(connection: Connection) -> bytes:
 class SkeletonConnectionStore(ConnectionStore):
     """One connection per computer, in one file.
 
-    The non-macOS backend, and the one the first chain was built against. It
-    is not what step two replaces after all: a computer without a Keychain
-    still has to keep a connection somewhere, so this stays as that computer's
-    store while ``KeychainConnectionStore`` takes over on macOS.
+    Every computer uses this today. A Keychain backend for macOS exists on the
+    full branch and is paused; this one does not go away when it returns — a
+    computer without a Keychain still has to keep a connection somewhere.
     """
 
     def __init__(self, path: Path) -> None:
