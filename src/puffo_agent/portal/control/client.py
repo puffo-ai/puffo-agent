@@ -36,7 +36,13 @@ from ...tasks import spawn
 log = logging.getLogger("puffo_agent.control")
 
 # Ops that wait on the network or a slow build run off the receive loop.
-BACKGROUND_OPS = frozenset({"create", "discover_lingtai", "unarchive"})
+BACKGROUND_OPS = frozenset(
+    # connector.claim makes an HTTP round trip (HTTP_TIMEOUT below is 30s total),
+    # and there is one machine-control receive loop — waiting on it here would
+    # stall pause/resume and every other operator. The final result still acks
+    # through the same path, so the page waits for the save, not the dispatch.
+    {"create", "discover_lingtai", "unarchive", "connector.claim"}
+)
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 # Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
@@ -376,12 +382,56 @@ async def execute_command(
             load_or_create_machine(), server_url.rstrip("/"), usage_refresh=usage_refresh
         )
         return {"ok": True, "posted": posted}
+    if op == "connector.claim":
+        # Machine-level like refresh_usage: a claim concerns this computer's
+        # connection, not one agent. The credential travels server -> daemon
+        # over the claim call and never rides in this command (design v0.4 §3);
+        # the command carries only the request reference.
+        if not server_url:
+            return {"ok": False, "error": "connector.claim: no server_url"}
+        from ..connector.command import run_claim_command
+
+        return await run_claim_command(params, server_url)
+    if op == "connector.refresh":
+        # Machine-level for the same reason as the claim. Note the route behind
+        # this does not exist server-side yet (Boris 221525 / Jeff 221526); the
+        # daemon half is wired so the other end has something to land against.
+        if not server_url:
+            return {"ok": False, "error": "connector.refresh: no server_url"}
+        from ..connector.command import run_refresh_command
+
+        return await run_refresh_command(params, server_url)
+    if op == "connector.disconnect":
+        # No server_url check: a disconnect clears this computer and calls
+        # nobody, so requiring one would make the local credential's removal
+        # depend on knowing where the server is (Jeremy 217298 / Jeff 217299).
+        from ..connector.command import run_disconnect_command
+
+        return await run_disconnect_command(params)
     if op == "create":
         return await _create_agent_command(
             params, server_url, paired_root_pubkey, resolve_model=resolve_model,
         )
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
+
+
+def _failure_text(result: dict) -> str:
+    """What an op said went wrong, whichever key it used to say it.
+
+    Most ops put a sentence under ``error``. The ``connector.*`` ops report a
+    ``stage`` and a ``reason`` instead, because for a claim or a refresh the
+    thing worth knowing is which leg failed, and one string cannot carry that.
+    Reading only ``error`` printed ``failed: None`` for exactly those ops --
+    which reads like a broken logger rather than a network or a disk -- on the
+    one path whose first real exercise is a disconnect between two machines
+    that have never spoken.
+    """
+    text = result.get("error") or result.get("reason") or result.get("error_code")
+    stage = result.get("stage")
+    if text and stage:
+        return f"{text} (stage={stage})"
+    return str(text or "no reason given")
 
 
 async def _execute_runtime_command(
@@ -925,7 +975,7 @@ class MachineControlClient:
                     "control: command %s op=%s failed: %s",
                     command_id,
                     decrypted["op"],
-                    result.get("error"),
+                    _failure_text(result),
                 )
         except ControlError as exc:
             log.warning("control: rejected command %s: %s", command_id, exc)
