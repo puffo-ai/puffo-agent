@@ -203,10 +203,20 @@ class RefreshRefused(Exception):
 # (the body itself is Jeff 221524).
 #
 # Not the claim root with a different leaf, and not a ``/connections/{ref}/``
-# path either. After a claim the server keeps no credential and has no
-# connection table, so a refresh is stateless — it takes the whole credential,
-# exchanges it, and hands back the replacement (Bob 221549). A path that looked
-# a connection up would describe a server that does not exist.
+# path either. The server has no connection table, so a refresh is stateless —
+# it takes the whole credential, exchanges it, and hands back the replacement
+# (Bob 221549). A path that looked a connection up would describe a server that
+# does not exist.
+#
+# This used to add "after a claim the server keeps no credential", and that
+# half has stopped being true. To let a computer claim again after the network
+# dropped mid-claim, the server now holds the encrypted credential on the
+# request row until it expires — bounded by the TTL, same machine only
+# (puffo-server item ①, agreed and pushed there, not deployed). None of this
+# file depends on which it is: the refresh carries the whole credential either
+# way. The sentence is corrected rather than deleted because it was describing
+# a retention property, and a stale claim about retention is the kind a later
+# reader acts on.
 #
 # What is NOT established: that any of this works. A handler exists on the
 # other side — puffo-server #406, same shape both ways (Bob 221596) — and
