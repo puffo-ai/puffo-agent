@@ -1513,3 +1513,42 @@ def spawn_task(coro):
 async def _settle():
     for _ in range(10):
         await asyncio.sleep(0)
+
+
+def test_dead_daemon_listener_does_not_recycle_provider(registered_manager, saved_states, monkeypatch):
+    """A daemon-wide listener outage must not restart otherwise live providers."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+    monkeypatch.setattr(rpc_service, "rpc_listener_available", lambda: False, raising=False)
+    _run(worker.probe_mcp_transport("t"))
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+    assert "daemon RPC listener" in worker.runtime.error
+
+
+def test_recovered_listener_waits_for_full_beacon_then_reports_real_failure(
+    registered_manager, saved_states, monkeypatch,
+):
+    """A 60s beacon must not be recycled at 30s; later errors must leave outage attribution."""
+    clock = [1000.0]
+    monkeypatch.setattr(rpc_service.time, "monotonic", lambda: clock[0])
+    mgr = registered_manager(_FakeManager("g1", 500.0))
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (600.0, 60.0)}
+    monkeypatch.setattr(rpc_service, "rpc_listener_available", lambda: False)
+    _run(worker.probe_mcp_transport("t"))
+    monkeypatch.setattr(rpc_service, "rpc_listener_available", lambda: True)
+    monkeypatch.setattr(rpc_service, "rpc_listener_recovered_at", lambda: 1000.0)
+    clock[0] = 1045.0
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == []
+    clock[0] = 1091.0
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == [False]
+    clock[0] = 1122.0
+    _run(worker.probe_mcp_transport("t"))
+    assert "after a runtime recycle" in worker.runtime.error
+    assert "daemon is recovering" not in worker.runtime.error
