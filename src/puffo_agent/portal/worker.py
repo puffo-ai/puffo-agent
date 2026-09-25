@@ -573,6 +573,8 @@ class Worker:
         if self._turn_active:
             # A reload would raise mid-turn; check again next beat.
             return
+        if await self._rpc_listener_down(agent_id):
+            return
         self._mcp_probe_strikes += 1
         if self._mcp_probe_strikes == 1:
             if current:
@@ -601,6 +603,24 @@ class Worker:
                 "agent %s: MCP transport still unreachable after recycle; "
                 "runtime.health = mcp_unreachable", agent_id,
             )
+
+    async def _rpc_listener_down(self, agent_id: str) -> bool:
+        """Fault-domain split: a missing hello proves nothing about this
+        agent's transport while the rpc listener itself is not accepting
+        (ProactorEventLoop closes it outright after an accept OSError
+        such as WinError 64). Recycling would kill more MCP subprocesses
+        mid-connect — the very storm that kills listeners — so name the
+        daemon-side fault and let the probe re-check next beat."""
+        from . import rpc_service
+
+        if await rpc_service.listener_reachable() is not False:
+            return False
+        logger.error(
+            "agent %s: hello missing but the rpc-service listener is "
+            "not accepting; daemon-side fault — skipping recycle",
+            agent_id,
+        )
+        return True
 
     async def _recycle_wedged_mcp(
         self, agent_id: str, adapter, mgr, *, cause: str, spec_gen: str,

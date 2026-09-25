@@ -591,7 +591,13 @@ class ClaudeCodeCliDriver(Driver):
     async def _read_loop(self) -> None:
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                # Cleanup can null out self._proc while this task is still
+                # scheduled; hold a local reference so the race ends the
+                # loop instead of crashing the task.
+                proc = self._proc
+                if proc is None or proc.stdout is None:
+                    break
+                line = await proc.stdout.readline()
                 if not line:
                     break
                 try:

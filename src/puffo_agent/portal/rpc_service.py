@@ -7,8 +7,10 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import os
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -21,6 +23,7 @@ from ..agent.message_store import (
 )
 from ..agent.message_store_models import LifecycleConflict
 from ..agent.reminder_scheduler import normalize_reminder_timestamp
+from ..tasks import spawn
 from . import host_mcp_handler
 from ._port import bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
@@ -823,10 +826,126 @@ async def start_rpc_service(
         )
         cfg.port = bound_port
     logger.info("rpc-service: listening on %s:%d", cfg.bind_host, cfg.port)
+    global _active_cfg
+    _active_cfg = cfg
+    if os.name == "nt":
+        _start_listener_watchdog(cfg)
     return runner
 
 
+# The config of the currently running service, for fault-domain checks:
+# a worker seeing no hello must be able to ask whether the listener
+# itself is accepting before it blames (and recycles) its own runtime.
+_active_cfg: RpcServiceConfig | None = None
+
+
+async def listener_reachable() -> bool | None:
+    """Live TCP-probe of the running service's listener.
+
+    ``None`` when the service never started (disabled or bind-window
+    exhausted), where reachability has no meaning."""
+    cfg = _active_cfg
+    if cfg is None:
+        return None
+    return await _probe_listener(cfg.bind_host, cfg.port)
+
+
+# ── Windows listener watchdog ────────────────────────────────────────
+#
+# CPython's ProactorEventLoop closes the *listening* socket outright when
+# an accept completes with an OSError such as WinError 64 ("The specified
+# network name is no longer available") — which a worker-recycle storm
+# produces routinely: an MCP subprocess is killed with a connect to this
+# service in flight, the accept fails, and asyncio logs "Accept failed on
+# a socket" and tears the listener down. aiohttp never notices, so the
+# daemon keeps running with a dead control plane and every agent goes
+# mcp_unreachable until a manual restart (observed twice on one host,
+# 2026-09-18). Probe the port on a short cadence and rebind when it
+# stops accepting.
+
+_WATCHDOG_INTERVAL_S = 15.0
+_watchdog_task: asyncio.Future | None = None
+_watchdog_runner: web.AppRunner | None = None
+
+
+def _start_listener_watchdog(cfg: RpcServiceConfig) -> None:
+    global _watchdog_task
+    if _watchdog_task is not None and not _watchdog_task.done():
+        return
+    _watchdog_task = spawn(
+        _listener_watchdog(cfg), name="rpc_listener_watchdog",
+    )
+
+
+async def _probe_listener(host: str, port: int) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=5,
+        )
+    except Exception:
+        return False
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return True
+
+
+async def _listener_watchdog(cfg: RpcServiceConfig) -> None:
+    global _watchdog_runner
+    while True:
+        await asyncio.sleep(_WATCHDOG_INTERVAL_S)
+        if await _probe_listener(cfg.bind_host, cfg.port):
+            continue
+        logger.error(
+            "rpc-service: listener on %s:%d stopped accepting "
+            "(proactor accept failure?); rebinding",
+            cfg.bind_host, cfg.port,
+        )
+        if _watchdog_runner is not None:
+            try:
+                await _watchdog_runner.cleanup()
+            except Exception:
+                pass
+            _watchdog_runner = None
+        try:
+            runner = web.AppRunner(
+                build_app(cfg),
+                access_log=logging.getLogger(
+                    "puffo_agent.portal.rpc_service.access"
+                ),
+            )
+            await runner.setup()
+            # Strict rebind on the original port only: the MCP configs on
+            # disk all point at cfg.port, so a fallback port would listen
+            # for nobody.
+            site = web.TCPSite(runner, host=cfg.bind_host, port=cfg.port)
+            await site.start()
+        except Exception:
+            logger.exception(
+                "rpc-service: rebind failed; retrying in %ss",
+                _WATCHDOG_INTERVAL_S,
+            )
+            continue
+        _watchdog_runner = runner
+        logger.info(
+            "rpc-service: listener rebound on %s:%d", cfg.bind_host, cfg.port,
+        )
+
+
 async def stop_rpc_service(runner: web.AppRunner | None) -> None:
+    global _watchdog_task, _watchdog_runner, _active_cfg
+    _active_cfg = None
+    if _watchdog_task is not None:
+        _watchdog_task.cancel()
+        _watchdog_task = None
+    if _watchdog_runner is not None:
+        try:
+            await _watchdog_runner.cleanup()
+        except Exception:
+            pass
+        _watchdog_runner = None
     if runner is None:
         return
     try:

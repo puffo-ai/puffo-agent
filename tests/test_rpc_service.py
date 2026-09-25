@@ -4,6 +4,8 @@ the MCP-side ``PuffoRpcClient`` and the daemon-side
 
 from __future__ import annotations
 
+import asyncio
+import socket
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -679,3 +681,40 @@ async def test_covers_wrong_types_are_rejected_not_dropped(app_client_factory):
             json={"covers": bad},
         )
         assert response.status == 400, f"mark covers={bad!r} accepted"
+
+
+@pytest.mark.asyncio
+async def test_listener_watchdog_rebinds_dead_listener(monkeypatch):
+    """Regression: on Windows a proactor accept failure (WinError 64
+    when a just-connected MCP subprocess is killed mid-handshake)
+    closes the listening socket while the daemon keeps running. Without
+    the watchdog the control-plane port stays dead until a manual
+    daemon restart and every agent reports mcp_unreachable."""
+    # Reserve a port, then release it so nothing listens there — the
+    # observable state ProactorEventLoop leaves behind after tearing
+    # the listener down.
+    reserve = socket.socket()
+    reserve.bind(("127.0.0.1", 0))
+    port = reserve.getsockname()[1]
+    reserve.close()
+
+    cfg = rpc_service.RpcServiceConfig(
+        enabled=True, bind_host="127.0.0.1", port=port,
+    )
+    monkeypatch.setattr(rpc_service, "_WATCHDOG_INTERVAL_S", 0.05)
+    rpc_service._start_listener_watchdog(cfg)
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while True:
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+            except OSError:
+                assert loop.time() < deadline, "watchdog never rebound"
+                await asyncio.sleep(0.05)
+                continue
+            writer.close()
+            await writer.wait_closed()
+            break
+    finally:
+        await rpc_service.stop_rpc_service(None)
