@@ -9,7 +9,10 @@ formatting from becoming part of the message lifecycle contract.
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from mcp.types import TextContent
@@ -18,6 +21,70 @@ from ..agent.message_projection import CONTEXT_VERSION, target_label_from_ref
 
 
 ToolResultSurface = Literal["stdio_mcp", "raw"]
+
+# A held result must stay small enough that the harness never spills it
+# to a file wholesale: the ``[puffo:model-visible-read:...]`` receipt in
+# its tail completes the model-visible transition only when it actually
+# enters the model's context, and ``send_anyway`` is refused without
+# that transition — so a wholesale spill disables the escape hatch in
+# exactly the busy-channel scenario it exists for. The budget is
+# conservative against known harness tool-result caps.
+_HELD_INLINE_BUDGET_CHARS = 40_000
+_HELD_CONTENT_CAP_CHARS = 2_000
+_HELD_CONTENT_FLOOR_CHARS = 300
+_HELD_MAX_INLINE_MESSAGES = 40
+_HELD_SPILL_SUBDIR = (".puffo", "held")
+
+
+def _held_spill_dir() -> Path:
+    root = os.environ.get("PUFFO_WORKSPACE") or os.getcwd()
+    return Path(root).joinpath(*_HELD_SPILL_SUBDIR)
+
+
+def _spill_held_text(text: str) -> str:
+    """Persist the full held result; the compact inline form points here."""
+    directory = _held_spill_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = directory / f"held-{stamp}-{os.urandom(4).hex()}.txt"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def _truncate_content_line(line: str, cap: int) -> str:
+    """Bound one ``content=<json>`` line, keeping it valid and marked."""
+    prefix = "content="
+    if not line.startswith(prefix) or len(line) <= cap + len(prefix):
+        return line
+    try:
+        decoded = json.loads(line[len(prefix):])
+    except Exception:
+        return line
+    if not isinstance(decoded, str) or len(decoded) <= cap:
+        return line
+    truncated = decoded[:cap] + " …[truncated; full text in the spill file]"
+    return prefix + _json(truncated)
+
+
+def _tail_message_blocks(body: str, keep: int) -> tuple[int, str, str]:
+    """Split a message-group body into (omitted_count, preamble, kept tail).
+
+    Newest messages are the reconsideration-relevant ones, so a count
+    overflow drops from the oldest end; the preamble (the ``##`` target
+    label ahead of the first message header) survives either way.
+    """
+    lines = body.split("\n")
+    starts = [
+        index for index, line in enumerate(lines)
+        if line.startswith("[message ")
+    ]
+    if len(starts) <= keep:
+        return 0, "", body
+    preamble = "\n".join(lines[: starts[0]])
+    if keep == 0:
+        return len(starts), preamble, ""
+    cut = starts[len(starts) - keep]
+    return len(starts) - keep, preamble, "\n".join(lines[cut:])
 
 
 def _json(value: Any) -> str:
@@ -315,11 +382,96 @@ def _held_result_lines(
     return lines
 
 
-def format_send_result(result: Mapping[str, Any]) -> str:
-    """Render one send result without exposing its nested transport object."""
-    reconsideration = _reconsideration(result)
-    context_version = _context_version(reconsideration)
-    state = str(result.get("state") or "unknown")
+def _held_result_lines_compact(
+    reconsideration: Mapping[str, Any],
+    *,
+    target_ref: str,
+    context_version: int,
+    spilled_to: str,
+    content_cap: int,
+    max_messages: int | None = None,
+) -> list[str]:
+    """The must-stay-inline projection of an oversized held result.
+
+    The agent's own draft echo and the already-seen basis carry no new
+    information, so they go to the spill file; the new-context window
+    (bounded per message, and per count when ``max_messages`` is set)
+    and the participation/guidance stay inline.
+    """
+    lines: list[str] = []
+    draft = reconsideration.get("draft")
+    if isinstance(draft, str):
+        lines.append(
+            f"[draft context_version={context_version} chars={len(draft)} "
+            f"spilled_to={_json(spilled_to)}]"
+        )
+
+    snapshot = reconsideration.get("participation_snapshot")
+    if isinstance(snapshot, Mapping):
+        lines.extend(_participation_lines(snapshot, context_version=context_version))
+
+    lines.extend(
+        _window_lines(
+            "held_basis",
+            f"[spilled context_version={context_version} "
+            f"spilled_to={_json(spilled_to)}]",
+            context_version=context_version,
+        )
+    )
+
+    new_context = reconsideration.get("new_channel_context")
+    body = new_context if isinstance(new_context, str) and new_context else ""
+    if body:
+        body = "\n".join(
+            _truncate_content_line(line, content_cap) for line in body.split("\n")
+        )
+    if body and max_messages is not None:
+        omitted, preamble, tail = _tail_message_blocks(body, max_messages)
+        if omitted:
+            notice = (
+                f"[messages_omitted context_version={context_version} "
+                f"omitted_count={omitted} spilled_to={_json(spilled_to)}]"
+            )
+            body = "\n".join(part for part in (preamble, notice, tail) if part)
+    raw_count = reconsideration.get("new_channel_context_count")
+    returned_count = (
+        raw_count
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+        else 0
+        if not body
+        else None
+    )
+    lines.extend(
+        _window_lines(
+            "held_new_context",
+            body or _empty_message_group(target_ref, context_version=context_version),
+            context_version=context_version,
+            returned_count=returned_count,
+        )
+    )
+
+    guidance = reconsideration.get("guidance")
+    if isinstance(guidance, str) and guidance:
+        lines.extend(
+            (
+                f"[guidance context_version={context_version} "
+                'kind="held_reconsideration"]',
+                guidance,
+                f"[end_guidance context_version={context_version} "
+                'kind="held_reconsideration"]',
+            )
+        )
+    return lines
+
+
+def _assemble_send_result(
+    result: Mapping[str, Any],
+    reconsideration: Mapping[str, Any],
+    *,
+    context_version: int,
+    state: str,
+    held_lines: list[str],
+) -> str:
     lines = [
         _send_result_header(
             result,
@@ -327,8 +479,7 @@ def format_send_result(result: Mapping[str, Any]) -> str:
             context_version=context_version,
         )
     ]
-
-    target_ref, target_lines = _target_lines(reconsideration)
+    _, target_lines = _target_lines(reconsideration)
     lines.extend(target_lines)
     lines.extend(
         _result_detail_lines(
@@ -337,16 +488,7 @@ def format_send_result(result: Mapping[str, Any]) -> str:
             context_version=context_version,
         )
     )
-
-    if state == "held" and reconsideration:
-        lines.extend(
-            _held_result_lines(
-                reconsideration,
-                target_ref=target_ref,
-                context_version=context_version,
-            )
-        )
-
+    lines.extend(held_lines)
     admission_marker = result.get("tool_result_admission")
     if isinstance(admission_marker, str) and admission_marker:
         lines.append(admission_marker)
@@ -354,6 +496,69 @@ def format_send_result(result: Mapping[str, Any]) -> str:
         f"[end_send_result context_version={context_version} state={_json(state)}]"
     )
     return "\n".join(lines)
+
+
+def format_send_result(result: Mapping[str, Any]) -> str:
+    """Render one send result without exposing its nested transport object."""
+    reconsideration = _reconsideration(result)
+    context_version = _context_version(reconsideration)
+    state = str(result.get("state") or "unknown")
+    target_ref, _ = _target_lines(reconsideration)
+
+    held_lines: list[str] = []
+    if state == "held" and reconsideration:
+        held_lines = _held_result_lines(
+            reconsideration,
+            target_ref=target_ref,
+            context_version=context_version,
+        )
+    text = _assemble_send_result(
+        result,
+        reconsideration,
+        context_version=context_version,
+        state=state,
+        held_lines=held_lines,
+    )
+    if len(text) <= _HELD_INLINE_BUDGET_CHARS or not held_lines:
+        return text
+
+    spilled_to = _spill_held_text(text)
+    overflow_note = (
+        f"[held_overflow context_version={context_version} "
+        f"spilled_to={_json(spilled_to)} "
+        f'note="full held result exceeded the inline budget; the draft '
+        f'echo and prior basis are in the spill file"]'
+    )
+    # Tiers tighten until the result provably fits: body caps first, then
+    # message-count caps, ending at a headers-only floor whose size is
+    # bounded by construction — the receipt marker is inline in every tier.
+    # That final bound assumes the non-message inline part (result header,
+    # target/detail lines, participation, guidance, spill pointers, this
+    # note, and the marker) stays well under the budget; those are fixed
+    # platform strings today, so keep them small if they ever grow.
+    for content_cap, max_messages in (
+        (_HELD_CONTENT_CAP_CHARS, None),
+        (_HELD_CONTENT_FLOOR_CHARS, None),
+        (_HELD_CONTENT_FLOOR_CHARS, _HELD_MAX_INLINE_MESSAGES),
+        (_HELD_CONTENT_FLOOR_CHARS, 0),
+    ):
+        compact = _assemble_send_result(
+            result,
+            reconsideration,
+            context_version=context_version,
+            state=state,
+            held_lines=[overflow_note] + _held_result_lines_compact(
+                reconsideration,
+                target_ref=target_ref,
+                context_version=context_version,
+                spilled_to=spilled_to,
+                content_cap=content_cap,
+                max_messages=max_messages,
+            ),
+        )
+        if len(compact) <= _HELD_INLINE_BUDGET_CHARS:
+            return compact
+    return compact
 
 
 def project_text_result(text: str, *, surface: ToolResultSurface) -> str | TextContent:
