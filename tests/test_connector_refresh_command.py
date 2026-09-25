@@ -468,6 +468,28 @@ async def test_a_disconnect_clears_this_computer_and_says_so(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_a_disconnect_on_a_computer_that_has_none_is_a_success(
+    monkeypatch, tmp_path
+):
+    """A resent disconnect must be safe, so "nothing to remove" is not a failure.
+
+    The server half reads ``ok: false`` as "that computer is still connected"
+    (Bob 223073), and a disconnect whose answer never arrived gets sent again.
+    A second send that reported failure would have the server restore a
+    connection this computer does not hold. What holds the property up is one
+    ``missing_ok=True`` inside the store's ``clear``, and every other disconnect
+    cell starts from a connected computer, so none of them can see it go.
+    """
+    store = store_at(tmp_path)
+    wired(monkeypatch, store)
+    assert store.load() is None
+
+    result = await connector_command.run_disconnect_command({})
+
+    assert result == {"ok": True, "connected": False}
+
+
+@pytest.mark.asyncio
 async def test_a_disconnect_that_could_not_clear_is_not_reported_as_done(
     monkeypatch, tmp_path
 ):
