@@ -578,3 +578,31 @@ async def test_the_refresh_command_without_a_server_url_does_not_reach_the_conne
     result = await execute_command("connector.refresh", None, {"connection_ref": "c"})
 
     assert result["ok"] is False
+
+
+def test_a_connector_failure_is_readable_in_the_line_an_operator_greps():
+    """The control layer's failure line must not say ``None`` for these ops.
+
+    Every other op puts its failure sentence under ``error``; the connector ops
+    report ``stage`` plus ``reason``, because which leg failed is the thing
+    worth knowing about a claim or a refresh. The shared line used to read only
+    ``error``, so a failed disconnect logged ``failed: None`` — indistinguishable
+    from a logging bug, on the path whose first real exercise is a disconnect
+    between two machines that have never spoken.
+    """
+    from puffo_agent.portal.control.client import _failure_text
+
+    # The three shapes these ops actually return.
+    assert _failure_text(
+        {"ok": False, "connected": True, "stage": "clear", "reason": "OSError: read-only"}
+    ) == "OSError: read-only (stage=clear)"
+    assert _failure_text(
+        {"ok": False, "stage": "exchange", "reason": "server refused the refresh (503)"}
+    ) == "server refused the refresh (503) (stage=exchange)"
+    # Ops that use the conventional key are unchanged by the fallback.
+    assert _failure_text({"ok": False, "error": "connector.refresh: no server_url"}) == (
+        "connector.refresh: no server_url"
+    )
+    # And nothing returns the empty string: a failure always says something.
+    assert _failure_text({"ok": False}) == "no reason given"
+    assert _failure_text({"ok": False, "error_code": "command_failed"}) == "command_failed"

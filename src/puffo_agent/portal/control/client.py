@@ -416,6 +416,24 @@ async def execute_command(
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
 
+def _failure_text(result: dict) -> str:
+    """What an op said went wrong, whichever key it used to say it.
+
+    Most ops put a sentence under ``error``. The ``connector.*`` ops report a
+    ``stage`` and a ``reason`` instead, because for a claim or a refresh the
+    thing worth knowing is which leg failed, and one string cannot carry that.
+    Reading only ``error`` printed ``failed: None`` for exactly those ops --
+    which reads like a broken logger rather than a network or a disk -- on the
+    one path whose first real exercise is a disconnect between two machines
+    that have never spoken.
+    """
+    text = result.get("error") or result.get("reason") or result.get("error_code")
+    stage = result.get("stage")
+    if text and stage:
+        return f"{text} (stage={stage})"
+    return str(text or "no reason given")
+
+
 async def _execute_runtime_command(
     op: str,
     slug: str | None,
@@ -957,7 +975,7 @@ class MachineControlClient:
                     "control: command %s op=%s failed: %s",
                     command_id,
                     decrypted["op"],
-                    result.get("error"),
+                    _failure_text(result),
                 )
         except ControlError as exc:
             log.warning("control: rejected command %s: %s", command_id, exc)
