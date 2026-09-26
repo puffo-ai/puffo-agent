@@ -305,6 +305,44 @@ class _ResumeFailed(Exception):
     transcript for."""
 
 
+def _tool_result_text(content: Any) -> str:
+    """Flatten a Claude tool_result block's content to text. Claude Code sends
+    it as a plain string or a list of ``{"type": "text", "text": ...}`` parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    return ""
+
+
+def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
+    """Read monid_prepare's quoted unit price from its tool-result JSON, as
+    ``(unit_price_micro, price_type)``. Returns ``None`` unless the result is
+    the expected shape — best-effort and read-only; it never raises into a turn
+    and never reflects an actual charge (that is monid_spend's settled cost)."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    price = data.get("price") if isinstance(data, dict) else None
+    if not isinstance(price, dict):
+        return None
+    micro = price.get("unit_price_micro")
+    if not isinstance(micro, int) or isinstance(micro, bool) or micro < 0:
+        return None
+    price_type = price.get("price_type")
+    return micro, price_type if isinstance(price_type, str) else None
+
+
 class ClaudeSession:
     def __init__(
         self,
@@ -370,6 +408,9 @@ class ClaudeSession:
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
+        # monid_prepare tool_use ids awaiting their result, so we can read the
+        # quoted price off the result and surface it on the status stream.
+        self._pending_monid_prepare_ids: set[str] = set()
         self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -1179,6 +1220,7 @@ class ClaudeSession:
         provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
         self._active_provider_turn_id = provider_turn_id
         self._active_puffo_tool_calls.clear()
+        self._pending_monid_prepare_ids.clear()
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
@@ -1190,6 +1232,7 @@ class ClaudeSession:
                 if admission.provider_turn_id != provider_turn_id
             ]
             self._active_puffo_tool_calls.clear()
+            self._pending_monid_prepare_ids.clear()
 
     async def _one_turn_inner(
         self,
@@ -1333,11 +1376,43 @@ class ClaudeSession:
                     await self._project_assistant_block(block, reporter, state)
         elif event_type == "system":
             self._update_session_from_event(event)
+        elif event_type == "user":
+            self._project_monid_price(event, reporter)
         elif event_type == "result":
             self._update_session_from_event(event)
             self._project_result_event(event, state)
             return True
         return False
+
+    def _project_monid_price(self, event: dict[str, Any], reporter: Any) -> None:
+        """Surface monid_prepare's quoted unit price on the status stream so the
+        inline working row can show an estimated lookup cost while the spend
+        runs. Read-only: it parses the prepare result and never touches the
+        spend/budget/ceiling path. Rides the tool_use event the row already
+        reads; a later recorded_at keeps it distinct from the prepare call."""
+        content = (event.get("message") or {}).get("content") or []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            if tool_use_id not in self._pending_monid_prepare_ids:
+                continue
+            self._pending_monid_prepare_ids.discard(tool_use_id)
+            if block.get("is_error") is True:
+                continue
+            price = _extract_monid_unit_price(block.get("content"))
+            if price is None:
+                continue
+            payload: dict[str, Any] = {
+                "tool": "monid_prepare",
+                "unit_price_micro": price[0],
+            }
+            if price[1]:
+                payload["price_type"] = price[1]
+            spawn(
+                reporter.emit(self.agent_id, "tool_use", payload),
+                name="reporter.emit:monid_price",
+            )
 
     async def _project_assistant_block(
         self,
@@ -1395,10 +1470,13 @@ class ClaudeSession:
             return
         tool_use_id = str(block.get("id") or "")
         if tool_use_id:
+            bare = name.removeprefix("mcp__puffo__")
             self._active_puffo_tool_calls[tool_use_id] = (
-                name.removeprefix("mcp__puffo__"),
+                bare,
                 {str(key): value for key, value in tool_input.items()},
             )
+            if bare == "monid_prepare":
+                self._pending_monid_prepare_ids.add(tool_use_id)
 
     def _update_session_from_event(self, event: dict[str, Any]) -> None:
         session_id = (event.get("session_id") or "").strip()
