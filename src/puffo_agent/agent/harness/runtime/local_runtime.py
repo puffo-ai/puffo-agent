@@ -1026,9 +1026,8 @@ def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
 
 
 def _codex_result_text(result: Any) -> str:
-    """Flatten a codex tool result to text. Codex surfaces an MCP tool's
-    result as a plain string, an MCP content list (``[{"type": "text",
-    "text": ...}]``), or a dict carrying ``content``/``contentItems``."""
+    """Flatten a codex tool result (string, MCP content list, or dict with
+    content/contentItems) to text."""
     if isinstance(result, str):
         return result
     if isinstance(result, dict):
@@ -1047,21 +1046,17 @@ def _codex_result_text(result: Any) -> str:
 
 def _monid_price_from_native(native: Any) -> tuple[int, str | None] | None:
     """Read monid_prepare's quoted unit price from a codex TOOL_COMPLETED
-    native payload, as ``(unit_price_micro, price_type)``. STRICTLY fail-safe:
-    the codex result shape is not empirically pinned, so any shape that does
-    not yield a clean price — an errored/omitted result (``None``), a
-    non-JSON string, an unparseable or price-less body, or a non-int/bool/
-    negative micro — returns ``None`` so nothing is emitted and the row simply
-    shows no estimate. It never falls back to 0 / a guessed price, never
-    raises into a turn, and never reflects a settled charge (that is
-    monid_spend's cost). Parallel to cli_session's Claude-side reader — the
-    codex result shape differs, so the two deliberately do not share code."""
+    native payload, as ``(unit_price_micro, price_type)``. STRICTLY fail-safe
+    since the codex result shape is not empirically pinned: any shape without a
+    clean price returns ``None`` → nothing emitted, blank row — never 0 or a
+    guess. This is a quote, never a settled charge (that is monid_spend's cost),
+    and this path is read-only — it never touches spend/budget/ceiling. Parallel
+    to cli_session's reader; the codex result shape differs."""
     if not isinstance(native, dict) or native.get("is_error") is True:
         return None
     result = native.get("result")
-    # Codex may hand the tool result back already-parsed (a dict carrying the
-    # price) or as JSON text (a string, or MCP content parts). Try the
-    # structured form first, else flatten to text and parse.
+    # Codex may hand back an already-parsed dict or JSON text; try structured
+    # first, else flatten to text and parse.
     if isinstance(result, dict) and isinstance(result.get("price"), dict):
         data: Any = result
     else:
@@ -1086,15 +1081,12 @@ class _LegacyStatusProjector:
     """Turn-scoped pre-2.0 status projection from normalized Driver events.
 
     Emits only the safe legacy surface: one bounded ``assistant_text`` per
-    completed assistant block unless the accumulated text is silent, and one
-    label-only ``tool_use`` per normalized tool start. The one exception to
-    "never read results": for monid_prepare's completed result it reads the
-    quoted unit price and emits a second ``tool_use`` carrying it, so the
-    inline working row can show an estimated lookup cost (read-only; never the
-    spend/budget/ceiling path). Otherwise it never reads the native diagnostic
-    payload, tool arguments or results, reasoning events, or unknown provider
-    frames; duplicate lifecycle events and post-terminal fragments are ignored,
-    and buffers are discarded at terminal, abandonment, or runtime teardown.
+    completed assistant block unless silent, and one label-only ``tool_use``
+    per normalized tool start. The sole exception to "never read results":
+    monid_prepare's completed result is read for its quoted unit price, emitted
+    as a second ``tool_use`` (read-only; never the spend path). Duplicate
+    lifecycle events and post-terminal fragments are ignored; buffers are
+    discarded at terminal, abandonment, or runtime teardown.
     """
 
     def __init__(self, agent_id: str) -> None:
@@ -1147,11 +1139,9 @@ class _LegacyStatusProjector:
                 _emit_status(self._agent_id, "tool_use", {"tool": label})
             return
         if kind == "turn.tool_completed":
-            # monid_prepare only: surface its quoted unit price on the same
-            # tool_use stream (a second event after the tool-start one) so the
-            # working row can show an estimated lookup cost. Read-only — never
-            # the spend path. The later event mirrors the Claude side; the FE
-            # anchors its timer to the first, so this cannot disturb the row.
+            # monid_prepare only: emit its quoted price as a second tool_use for
+            # the working row's estimate. The FE anchors its timer to the first
+            # event, so this later one cannot disturb the row.
             if _normalized_tool_label(str(data.get("label") or "")) != "monid_prepare":
                 return
             ref = str(data.get("tool_call_ref") or "")

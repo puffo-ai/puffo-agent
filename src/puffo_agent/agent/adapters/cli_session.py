@@ -323,9 +323,8 @@ def _tool_result_text(content: Any) -> str:
 
 def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
     """Read monid_prepare's quoted unit price from its tool-result JSON, as
-    ``(unit_price_micro, price_type)``. Returns ``None`` unless the result is
-    the expected shape — best-effort and read-only; it never raises into a turn
-    and never reflects an actual charge (that is monid_spend's settled cost)."""
+    ``(unit_price_micro, price_type)``, or ``None`` if the shape doesn't match.
+    Read-only; never reflects a settled charge (that is monid_spend's cost)."""
     text = _tool_result_text(content)
     if not text:
         return None
@@ -408,8 +407,7 @@ class ClaudeSession:
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
-        # monid_prepare tool_use ids awaiting their result, so we can read the
-        # quoted price off the result and surface it on the status stream.
+        # monid_prepare tool_use ids awaiting their result (to read the price).
         self._pending_monid_prepare_ids: set[str] = set()
         self._active_provider_turn_id: str | None = None
 
@@ -1385,11 +1383,9 @@ class ClaudeSession:
         return False
 
     def _project_monid_price(self, event: dict[str, Any], reporter: Any) -> None:
-        """Surface monid_prepare's quoted unit price on the status stream so the
-        inline working row can show an estimated lookup cost while the spend
-        runs. Read-only: it parses the prepare result and never touches the
-        spend/budget/ceiling path. Rides the tool_use event the row already
-        reads; a later recorded_at keeps it distinct from the prepare call."""
+        """Emit monid_prepare's quoted price as a second tool_use for the
+        working row's estimate. Read-only — never the spend path. A later
+        recorded_at keeps it distinct from the prepare call."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
