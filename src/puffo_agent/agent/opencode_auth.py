@@ -69,7 +69,14 @@ def _run_opencode_models(
                 command,
                 check=False,
                 capture_output=True,
-                text=True,
+                # OpenCode emits UTF-8; text=True alone decodes with the
+                # locale's preferred encoding, and on a CJK-locale Windows
+                # host (cp936) a non-ASCII banner byte would crash the
+                # reader thread with UnicodeDecodeError — which the except
+                # below does not catch. Malformed bytes degrade to U+FFFD
+                # instead of failing the probe; model-id lines are ASCII.
+                encoding="utf-8",
+                errors="replace",
                 env={
                     **build_child_environment(),
                     **{name: scratch for name in ("TMPDIR", "TMP", "TEMP")},
