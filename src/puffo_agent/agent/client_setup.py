@@ -82,6 +82,8 @@ def _membership_state(slug: str) -> dict[str, Any]:
         "_processed_membership_event_ids": set(),
         "_inviter_by_invitation_event_id": {},
         "_pending_invite_dms": {},
+        "_pending_redeem_dms": {},
+        "_redeem_approval_seen": {},
         "_pending_leave_dms": {},
         "_gate_left_spaces": set(),
         "_pending_dm_approvals": load_pending_dm_approvals(slug),

@@ -17,6 +17,7 @@ from .ingress_policy import (
     GateVerdict,
     blocked_gate,
     foreign_dm_gate,
+    invite_link_gate,
     operator_control_gate,
 )
 from .message_context import (
@@ -195,6 +196,9 @@ class InboundReceiptHandler:
         if outcome is not None:
             return outcome
         outcome = await self._operator_control_outcome(committer)
+        if outcome is not None:
+            return outcome
+        outcome = await self._invite_link_outcome(committer)
         if outcome is not None:
             return outcome
         # The gate decides on the text alone. Materializing attachments first
@@ -425,6 +429,19 @@ class InboundReceiptHandler:
                 payload,
                 thread_root_id=committer.stored_payload["thread_root_id"] or "",
                 text=str(payload.content) if payload.content else "",
+            ),
+        )
+
+    async def _invite_link_outcome(
+        self,
+        committer: _ReceiptCommitter,
+    ) -> TransportOutcome | None:
+        return await self._commit_verdict(
+            committer,
+            await invite_link_gate(
+                self.client,
+                committer.payload,
+                self._raw_text(committer.payload),
             ),
         )
 
