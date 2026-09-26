@@ -6,6 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **LingTai: attach or start is decided every time the agent starts, not
+  once at import.** On each start, restart and resume, Puffo asks whether the
+  LingTai Agent is running: if its socket answers, Puffo attaches; if there is
+  no socket, Puffo starts LingTai itself. An agent imported while LingTai was
+  closed now attaches once the user opens LingTai, and an agent imported
+  while LingTai was open now starts when LingTai is closed instead of failing.
+  `runtime.lingtai_attach` no longer picks the mode; it only records what the
+  import found and keeps the stricter handling below.
+  - A socket that exists but does not answer still stops an agent imported in
+    attach mode ("start or restart the LingTai Agent, then restart this
+    agent"), since it may belong to an Agent still holding the directory.
+  - An agent imported in spawn mode keeps starting LingTai when the check
+    cannot run (for example an older kernel without `acp-socket-path`), as it
+    did before.
+  - Only `lingtai run --acp-socket` (or `run` with
+    `LINGTAI_ACP_SOCKET_AGENT_DIR` set to the Agent directory) serves the
+    socket; plain `lingtai run` does not, so an Agent started that way is not
+    attached to and Puffo's own start is refused by the directory lock. The
+    `lingtai acp` process Puffo starts never serves it, so a copy Puffo
+    started earlier is never mistaken for a running Agent.
+  - Not covered here: if Puffo has started LingTai and the user then starts
+    the same Agent from the LingTai app, LingTai's directory lock refuses the
+    second one. Letting the app recognise and connect to Puffo's copy is
+    LingTai-side work.
+
 ## [2.0.9] - 2026-09-24
 
 ### Requires
