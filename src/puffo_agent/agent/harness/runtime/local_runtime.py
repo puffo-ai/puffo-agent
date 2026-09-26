@@ -1025,16 +1025,68 @@ def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
     spawn(get_reporter().emit(agent_id, event, payload), name="reporter.emit")
 
 
+def _codex_result_text(result: Any) -> str:
+    """Flatten a codex tool result (string, MCP content list, or dict with
+    content/contentItems) to text."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        parts = result.get("content")
+        if parts is None:
+            parts = result.get("contentItems")
+        return _codex_result_text(parts) if parts is not None else ""
+    if isinstance(result, list):
+        return "".join(
+            part["text"]
+            for part in result
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _monid_price_from_native(native: Any) -> tuple[int, str | None] | None:
+    """Read monid_prepare's quoted unit price from a codex TOOL_COMPLETED
+    native payload, as ``(unit_price_micro, price_type)``. STRICTLY fail-safe
+    since the codex result shape is not empirically pinned: any shape without a
+    clean price returns ``None`` → nothing emitted, blank row — never 0 or a
+    guess. This is a quote, never a settled charge (that is monid_spend's cost),
+    and this path is read-only — it never touches spend/budget/ceiling. Parallel
+    to cli_session's reader; the codex result shape differs."""
+    if not isinstance(native, dict) or native.get("is_error") is True:
+        return None
+    result = native.get("result")
+    # Codex may hand back an already-parsed dict or JSON text; try structured
+    # first, else flatten to text and parse.
+    if isinstance(result, dict) and isinstance(result.get("price"), dict):
+        data: Any = result
+    else:
+        text = _codex_result_text(result)
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+    price = data.get("price") if isinstance(data, dict) else None
+    if not isinstance(price, dict):
+        return None
+    micro = price.get("unit_price_micro")
+    if not isinstance(micro, int) or isinstance(micro, bool) or micro < 0:
+        return None
+    price_type = price.get("price_type")
+    return micro, price_type if isinstance(price_type, str) else None
+
+
 class _LegacyStatusProjector:
     """Turn-scoped pre-2.0 status projection from normalized Driver events.
 
     Emits only the safe legacy surface: one bounded ``assistant_text`` per
-    completed assistant block unless the accumulated text is silent, and one
-    label-only ``tool_use`` per normalized tool start. It never reads the
-    native diagnostic payload, tool arguments or results, reasoning events, or
-    unknown provider frames; duplicate lifecycle events and post-terminal
-    fragments are ignored, and buffers are discarded at terminal, abandonment,
-    or runtime teardown.
+    completed assistant block unless silent, and one label-only ``tool_use``
+    per normalized tool start. The sole exception to "never read results":
+    monid_prepare's completed result is read for its quoted unit price, emitted
+    as a second ``tool_use`` (read-only; never the spend path). Duplicate
+    lifecycle events and post-terminal fragments are ignored; buffers are
+    discarded at terminal, abandonment, or runtime teardown.
     """
 
     def __init__(self, agent_id: str) -> None:
@@ -1043,6 +1095,7 @@ class _LegacyStatusProjector:
         self._block_buffers: dict[str, str] = {}
         self._emitted_blocks: set[str] = set()
         self._emitted_tools: set[str] = set()
+        self._priced_tools: set[str] = set()
 
     def project(self, event: HarnessEvent) -> None:
         kind = _event_kind(event)
@@ -1084,11 +1137,34 @@ class _LegacyStatusProjector:
             label = _normalized_tool_label(str(data.get("label") or ""))
             if label:
                 _emit_status(self._agent_id, "tool_use", {"tool": label})
+            return
+        if kind == "turn.tool_completed":
+            # monid_prepare only: emit its quoted price as a second tool_use for
+            # the working row's estimate. The FE anchors its timer to the first
+            # event, so this later one cannot disturb the row.
+            if _normalized_tool_label(str(data.get("label") or "")) != "monid_prepare":
+                return
+            ref = str(data.get("tool_call_ref") or "")
+            if ref and ref in self._priced_tools:
+                return
+            price = _monid_price_from_native(event.native_diagnostic)
+            if price is None:
+                return
+            if ref:
+                self._priced_tools.add(ref)
+            payload: dict[str, Any] = {
+                "tool": "monid_prepare",
+                "unit_price_micro": price[0],
+            }
+            if price[1]:
+                payload["price_type"] = price[1]
+            _emit_status(self._agent_id, "tool_use", payload)
 
     def _reset(self) -> None:
         self._block_buffers.clear()
         self._emitted_blocks.clear()
         self._emitted_tools.clear()
+        self._priced_tools.clear()
 
 
 async def _observe_compaction_activity(
