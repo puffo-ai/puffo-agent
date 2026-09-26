@@ -264,21 +264,92 @@ def test_read_keychain_blob_skipped_off_macos(monkeypatch):
     assert result.error == "not_macos"
 
 
-def test_writeback_to_keychain_passes_blob(monkeypatch):
-    _force_macos(monkeypatch)
-    captured = {}
+def _capture_security(monkeypatch):
+    calls = []
 
     def _fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
+        calls.append((cmd, kwargs))
         return _FakeCompletedProcess(0)
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
+    return calls
+
+
+def test_writeback_to_keychain_keeps_the_blob_off_the_command_line(monkeypatch):
+    # argv is readable by every process of the same user (`ps -axww`).
+    _force_macos(monkeypatch)
+    calls = _capture_security(monkeypatch)
     ok, reason = cm.writeback_to_keychain(_BLOB)
-    assert ok is True
-    assert reason is None
-    assert "add-generic-password" in captured["cmd"]
-    assert "-U" in captured["cmd"]
-    assert _BLOB in captured["cmd"]
+    assert (ok, reason) == (True, None)
+    [(cmd, kwargs)] = calls
+    assert cmd == ["security", "-i"]
+    assert not any(_BLOB in part or _BLOB.encode().hex() in part for part in cmd)
+    command = kwargs["input"]
+    assert command.startswith("add-generic-password -U ")
+    assert f" -X {_BLOB.encode().hex()}\n" in command
+    assert _BLOB not in command
+
+
+def test_writeback_to_keychain_quotes_a_service_with_a_space(monkeypatch):
+    _force_macos(monkeypatch)
+    monkeypatch.setenv("USER", "operator")
+    calls = _capture_security(monkeypatch)
+    cm.writeback_to_keychain(_BLOB, service="Claude Code-credentials")
+    command = calls[0][1]["input"]
+    assert "-s 'Claude Code-credentials' -a 'operator' -X " in command
+
+
+@pytest.mark.parametrize("blob", [
+    _BLOB + "\n",
+    json.dumps(json.loads(_BLOB), indent=2),
+    _BLOB.replace(",", ",\t", 1),
+    json.dumps({"token": "café"}, ensure_ascii=False),
+    "",
+], ids=["trailing-newline", "pretty-printed", "tab", "non-ascii", "empty"])
+def test_writeback_to_keychain_refuses_what_would_read_back_as_hex(monkeypatch, blob):
+    # security returns such values as hex on read, so the next reader would
+    # get something other than what was written.
+    _force_macos(monkeypatch)
+    calls = _capture_security(monkeypatch)
+    ok, reason = cm.writeback_to_keychain(blob)
+    assert ok is False
+    assert reason.startswith("unsupported_blob")
+    assert calls == []
+
+
+@pytest.mark.parametrize(("service", "user", "field"), [
+    ("Claude Code's", "operator", "service"),
+    ("Claude Code-credentials", "o'perator", "account"),
+    ("Claude Code-credentials", "", "account"),
+])
+def test_writeback_to_keychain_refuses_names_it_cannot_quote(monkeypatch, service, user, field):
+    _force_macos(monkeypatch)
+    monkeypatch.setenv("USER", user)
+    calls = _capture_security(monkeypatch)
+    ok, reason = cm.writeback_to_keychain(_BLOB, service=service)
+    assert (ok, reason) == (False, f"unsupported_{field}_name")
+    assert calls == []
+
+
+@pytest.mark.parametrize("echo", [
+    lambda blob: blob.encode().hex(),
+    lambda blob: blob,
+    lambda blob: blob[5:40],
+    lambda blob: '{"token":"SYNTHETIC -123456"}',
+], ids=["hex", "plaintext", "fragment", "negative-number"])
+def test_writeback_to_keychain_keeps_stderr_text_out_of_errors(monkeypatch, echo):
+    # Whatever form security might echo the value in, nothing from stderr
+    # reaches the reason, not even digits that look like a status code
+    # (Jeff, tool-connectors 220856).
+    _force_macos(monkeypatch)
+    stderr = f"add-generic-password: returned -25308 near {echo(_BLOB)}"
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _FakeCompletedProcess(1, stderr=stderr),
+    )
+    ok, reason = cm.writeback_to_keychain(_BLOB)
+    assert ok is False
+    assert reason == "exit_code=1"
 
 
 def test_writeback_to_keychain_reports_failure(monkeypatch):
@@ -288,8 +359,7 @@ def test_writeback_to_keychain_reports_failure(monkeypatch):
         lambda *a, **k: _FakeCompletedProcess(1, stderr="permission denied"),
     )
     ok, reason = cm.writeback_to_keychain(_BLOB)
-    assert ok is False
-    assert "permission denied" in reason
+    assert (ok, reason) == (False, "exit_code=1")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
