@@ -9,6 +9,8 @@ service's own mapped messages. Only ``monid_spend`` charges.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -80,12 +82,36 @@ class _FakeHttp:
         return self._response
 
 
-def _tools(http, *, slug="agent-monid-test", monid_tools_enabled=True):
+def _write_current_turn(workspace, message_ids) -> None:
+    # Mirror the runtime's per-turn record: message_ids drive the automatic
+    # idempotency seed (single-inbound = dedup-safe; multi = fail-closed).
+    turn_dir = Path(workspace) / ".puffo-agent"
+    turn_dir.mkdir(parents=True, exist_ok=True)
+    (turn_dir / "current_turn.json").write_text(
+        json.dumps({"version": 2, "message_ids": list(message_ids)}),
+        encoding="utf-8",
+    )
+
+
+def _tools(
+    http,
+    *,
+    slug="agent-monid-test",
+    monid_tools_enabled=True,
+    workspace=None,
+    message_ids=("msg_seed_default",),
+):
+    if workspace is None:
+        workspace = tempfile.mkdtemp()
+    # message_ids=None leaves NO turn record on disk (fail-closed seed case).
+    if message_ids is not None:
+        _write_current_turn(workspace, message_ids)
     cfg = SimpleNamespace(
         http_client=http,
         keyless=http.keyless,
         slug=slug,
         monid_tools_enabled=monid_tools_enabled,
+        workspace=str(workspace),
     )
     mcp = FastMCP("test")
     register_monid_tools(mcp, cfg)
@@ -262,9 +288,12 @@ async def test_spend_forwards_and_formats_result():
 
 
 @pytest.mark.asyncio
-async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
-    """A charged-but-undecodable response must reuse the same key on retry;
-    after a settled response, a later identical call is a new spend."""
+async def test_spend_automatic_key_is_deterministic_across_replays():
+    """A charged-but-undecodable response must reuse the same key on retry. The
+    automatic key is derived from the turn's message + request, not a random
+    token, so every later replay of the SAME spend in the SAME turn recomputes
+    the SAME key and billing settles it once — no rotation reopens a 2nd charge.
+    """
     http = _FakeHttp(
         response={
             "ledger_id": "led_1",
@@ -290,6 +319,9 @@ async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
     assert "secret upstream" not in message
     first_key = http.calls[-1][2]["idempotency_key"]
     assert first_key in message
+    # A collision-resistant digest in the agent's namespace, never a uuid token.
+    assert first_key.startswith("agent-monid-test:auto:")
+    assert len(first_key.rsplit(":", 1)[1]) == 64
     assert "operator" in message
     assert "reconcile" in message
 
@@ -297,14 +329,18 @@ async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
     await _call(mcp, "monid_spend", args)
     assert http.calls[-1][2]["idempotency_key"] == first_key
 
+    # A later identical call in the same turn recomputes the SAME key (dedups),
+    # unlike the old rotating uuid which would mint a fresh charge.
     await _call(mcp, "monid_spend", args)
-    assert http.calls[-1][2]["idempotency_key"] != first_key
+    assert http.calls[-1][2]["idempotency_key"] == first_key
 
 
 @pytest.mark.asyncio
-async def test_spend_definite_failure_releases_automatic_key_for_retry():
-    """A rejected, uncharged spend must not poison the repaired retry with the
-    server's permanently failed idempotency key."""
+async def test_spend_definite_failure_keeps_deterministic_key():
+    """A rejected 4xx spend is uncharged; because the key is deterministic, a
+    retry of the same arguments reuses the same key — billing (via its
+    at-most-once source_ref), not the client, owns whether that key may run
+    again. The 4xx message stays clean, with no ambiguous-retry churn."""
     http = _FakeHttp(
         response={
             "ledger_id": "led_2",
@@ -341,13 +377,14 @@ async def test_spend_definite_failure_releases_automatic_key_for_retry():
 
     http._post_error = None
     await _call(mcp, "monid_spend", args)
-    assert http.calls[-1][2]["idempotency_key"] != first_key
+    assert http.calls[-1][2]["idempotency_key"] == first_key
 
 
 @pytest.mark.asyncio
-async def test_spend_server_failure_retains_automatic_key_for_settled_replay():
-    """A 5xx may arrive after the server settled the ledger, so its retry must
-    reuse the key and reach the non-charging already-settled replay."""
+async def test_spend_ambiguous_5xx_retry_reaches_settled_replay():
+    """A 5xx may arrive after the server settled the ledger, so its retry
+    recomputes the same key and reaches the non-charging already-settled replay.
+    """
     http = _FakeHttp(
         response={
             "ledger_id": "led_settled_before_502",
@@ -382,10 +419,20 @@ async def test_spend_server_failure_retains_automatic_key_for_settled_replay():
 
 
 @pytest.mark.asyncio
-async def test_spend_failed_key_conflict_explains_fresh_paid_retry():
-    """An unbilled 5xx retry may self-heal through 409; the model must learn
-    that the automatic key was retired and one more retry starts a new spend."""
-    http = _FakeHttp(post_error=HttpError(502, "provider failed without billing"))
+async def test_spend_409_conflict_is_mapped_cleanly():
+    """A duplicate 409 from billing is surfaced as a clean 'already attempted,
+    not recharged' message — never a raw 409, never a retry-churn loop."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            409,
+            json.dumps(
+                {
+                    "error": "CONFLICT",
+                    "message": "a prior spend with this idempotency_key did not succeed",
+                }
+            ),
+        )
+    )
     mcp = _tools(http)
     args = {
         "provider": "indeed",
@@ -396,68 +443,20 @@ async def test_spend_failed_key_conflict_explains_fresh_paid_retry():
 
     with pytest.raises(Exception) as excinfo:
         await _call(mcp, "monid_spend", args)
-    first_key = http.calls[-1][2]["idempotency_key"]
-    assert "reuse idempotency key" in str(excinfo.value)
-
-    http._post_error = HttpError(
-        409,
-        json.dumps(
-            {
-                "error": "CONFLICT",
-                "message": ("a prior spend with this idempotency_key did not succeed"),
-            }
-        ),
-    )
-    with pytest.raises(Exception) as excinfo:
-        await _call(mcp, "monid_spend", args)
-    assert http.calls[-1][2]["idempotency_key"] == first_key
     message = str(excinfo.value)
-    assert "automatic idempotency key was retired" in message
-    assert "immediate retry starts a new paid operation" in message
-
-    http._post_error = None
-    await _call(mcp, "monid_spend", args)
-    assert http.calls[-1][2]["idempotency_key"] != first_key
-
-
-@pytest.mark.asyncio
-async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch):
-    """A burst of unresolved spends must not evict an older retry key and
-    reopen the duplicate-charge window."""
-    monkeypatch.setattr("puffo_agent.mcp.core_monid_tools._RETRY_KEY_CACHE_LIMIT", 2)
-    http = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
-    mcp = _tools(http)
-
-    def args(company):
-        return {
-            "provider": "indeed",
-            "endpoint": "/get_company_profile",
-            "input": {"queryParams": {"company": company}},
-            "max_cost_micro": 10000,
-        }
-
-    for company in ("A", "B"):
-        with pytest.raises(Exception):
-            await _call(mcp, "monid_spend", args(company))
-    first_key = http.calls[0][2]["idempotency_key"]
-
-    with pytest.raises(Exception) as excinfo:
-        await _call(mcp, "monid_spend", args("C"))
-    assert "unresolved" in str(excinfo.value)
-    assert len(http.calls) == 2
-
-    http._post_error = None
-    await _call(mcp, "monid_spend", args("A"))
-    assert http.calls[-1][2]["idempotency_key"] == first_key
-
-    await _call(mcp, "monid_spend", args("C"))
-    assert http.calls[-1][2]["idempotency_key"] != first_key
+    assert "rejected as a duplicate" in message
+    assert "no new charge was made" in message
+    assert "explicit idempotency_key" in message
+    # Clean mapping: no raw status blob, no ambiguous-retry / retired-key churn.
+    assert "HTTP 409" not in message
+    assert "reuse idempotency key" not in message
+    assert "automatic idempotency key was retired" not in message
 
 
 @pytest.mark.asyncio
-async def test_spend_default_retry_cache_holds_multiple_unresolved_spends():
-    """The production cache must not silently collapse to a single unresolved
-    operation and block the next unrelated ambiguous spend."""
+async def test_spend_distinct_requests_in_one_turn_get_distinct_keys():
+    """Two different spends in the same turn derive different keys (the request
+    signature is part of the key), so one never dedups onto the other."""
     http = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
     mcp = _tools(http)
 
@@ -476,6 +475,142 @@ async def test_spend_default_retry_cache_holds_multiple_unresolved_spends():
 
     assert len(http.calls) == 2
     assert len({call[2]["idempotency_key"] for call in http.calls}) == 2
+
+
+@pytest.mark.asyncio
+async def test_spend_single_inbound_replay_reuses_key_no_second_charge():
+    """The batch-recompose guarantee: a spend in a single-inbound turn, then a
+    renotice that re-presents that same message alone (the runtime rewrites the
+    turn record to the same single id), recomputes the SAME key so billing never
+    charges twice."""
+    workspace = tempfile.mkdtemp()
+    http = _FakeHttp(
+        response={
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "cost_micro": 3000,
+            "output": {"items": []},
+        }
+    )
+    mcp = _tools(http, workspace=workspace, message_ids=("m1",))
+    args = {
+        "provider": "indeed",
+        "endpoint": "/get_company_profile",
+        "input": {"queryParams": {"company": "Google"}},
+        "max_cost_micro": 10000,
+    }
+    await _call(mcp, "monid_spend", args)
+    first_key = http.calls[-1][2]["idempotency_key"]
+
+    # Renotice re-presents m1 alone → runtime rewrites the record to the same id.
+    _write_current_turn(workspace, ("m1",))
+    await _call(mcp, "monid_spend", args)
+    assert http.calls[-1][2]["idempotency_key"] == first_key
+
+
+@pytest.mark.asyncio
+async def test_spend_multi_inbound_turn_fails_closed_without_explicit_key():
+    """A multi-message turn cannot pin the spend to one stable id, so an
+    automatic spend is refused before it mints a token or reaches billing —
+    closing the batch-recompose double-charge at origin."""
+    http = _FakeHttp(
+        response={"provider": "indeed", "endpoint": "/p", "cost_micro": 1}
+    )
+    mcp = _tools(http, message_ids=("m1", "m2"))
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp,
+            "monid_spend",
+            {
+                "provider": "indeed",
+                "endpoint": "/get_company_profile",
+                "input": {"queryParams": {"company": "Google"}},
+                "max_cost_micro": 10000,
+            },
+        )
+    message = str(excinfo.value)
+    assert "will NOT charge" in message
+    assert "more than one inbound message" in message
+    assert "explicit idempotency_key" in message
+    # Fail-closed before any side effect: no billing call, no spend-token mint.
+    assert http.calls == []
+    assert http.mint_calls == []
+
+
+@pytest.mark.asyncio
+async def test_spend_missing_turn_record_fails_closed():
+    """No turn record on disk means no stable seed → fail closed, same as the
+    multi-message case."""
+    http = _FakeHttp(
+        response={"provider": "indeed", "endpoint": "/p", "cost_micro": 1}
+    )
+    mcp = _tools(http, message_ids=None)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp,
+            "monid_spend",
+            {
+                "provider": "indeed",
+                "endpoint": "/get_company_profile",
+                "input": {"queryParams": {"company": "Google"}},
+                "max_cost_micro": 10000,
+            },
+        )
+    assert "will NOT charge" in str(excinfo.value)
+    assert http.calls == []
+    assert http.mint_calls == []
+
+
+@pytest.mark.asyncio
+async def test_spend_explicit_key_bypasses_fail_closed_seed():
+    """An explicit idempotency_key is the caller-owned escape hatch: it spends
+    even in a multi-message turn, and rides the agent namespace unchanged."""
+    http = _FakeHttp(
+        response={"provider": "indeed", "endpoint": "/profile", "cost_micro": 1}
+    )
+    mcp = _tools(http, message_ids=("m1", "m2"))
+
+    await _call(
+        mcp,
+        "monid_spend",
+        {
+            "provider": "indeed",
+            "endpoint": "/profile",
+            "input": {},
+            "max_cost_micro": 1,
+            "idempotency_key": "my-op",
+        },
+    )
+    assert http.calls[-1][2]["idempotency_key"] == "agent-monid-test:my-op"
+
+
+@pytest.mark.asyncio
+async def test_spend_different_turns_same_request_get_distinct_keys():
+    """The same request in two different turns (different triggering message)
+    derives different keys, so a genuinely new request is charged rather than
+    silently merged into the earlier turn's spend."""
+    args = {
+        "provider": "indeed",
+        "endpoint": "/get_company_profile",
+        "input": {"queryParams": {"company": "Google"}},
+        "max_cost_micro": 10000,
+    }
+    http_a = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
+    http_b = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
+    mcp_a = _tools(http_a, message_ids=("m1",))
+    mcp_b = _tools(http_b, message_ids=("m9",))
+
+    with pytest.raises(Exception):
+        await _call(mcp_a, "monid_spend", args)
+    with pytest.raises(Exception):
+        await _call(mcp_b, "monid_spend", args)
+
+    assert (
+        http_a.calls[-1][2]["idempotency_key"]
+        != http_b.calls[-1][2]["idempotency_key"]
+    )
 
 
 @pytest.mark.asyncio
