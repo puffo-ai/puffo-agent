@@ -426,7 +426,7 @@ def test_every_logged_runtime_event_name_is_supported():
     source_root = Path(puffo_agent.__file__).parent
     emitted: dict[str, str] = {}
     for module in sorted(source_root.rglob("*.py")):
-        for match in _LOGGED_EVENT_NAME.finditer(module.read_text()):
+        for match in _LOGGED_EVENT_NAME.finditer(module.read_text(encoding="utf-8")):
             emitted.setdefault(match.group(1), module.name)
 
     assert emitted, "no runtime event emission sites were found to check"
@@ -471,3 +471,19 @@ def test_assistant_blocks_are_omitted_and_terminal_metadata_is_pruned():
     assert projector._tool_refs == {}
     # The turn is still remembered as terminal, so a late event is rejected.
     assert "turn_1" in validator._finished
+
+
+def test_error_detail_field_reaches_the_log_record(caplog):
+    """error_detail is the post-mortem payload on turn.failed; an
+    allowlist miss would silently drop it (warn-once) and dead-end the
+    next provider-failure investigation."""
+    probe = logging.getLogger("puffo_agent.test.error_detail_probe")
+    with caplog.at_level(logging.ERROR, logger=probe.name):
+        log_runtime_event(
+            probe,
+            "turn.failed",
+            level=logging.ERROR,
+            agent_id="a",
+            error_detail="provider said: internal server error 500",
+        )
+    assert "provider said: internal server error 500" in caplog.text
