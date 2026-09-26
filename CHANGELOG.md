@@ -22,9 +22,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   - An agent imported in spawn mode keeps starting LingTai when the check
     cannot run (for example an older kernel without `acp-socket-path`), as it
     did before.
-  - Only `lingtai run` serves the socket. The `lingtai acp` process Puffo
-    starts does not, so a copy Puffo started earlier is never mistaken for a
-    running Agent.
+  - Only `lingtai run --acp-socket` (or `run` with
+    `LINGTAI_ACP_SOCKET_AGENT_DIR` set to the Agent directory) serves the
+    socket; plain `lingtai run` does not, so an Agent started that way is not
+    attached to and Puffo's own start is refused by the directory lock. The
+    `lingtai acp` process Puffo starts never serves it, so a copy Puffo
+    started earlier is never mistaken for a running Agent.
   - Not covered here: if Puffo has started LingTai and the user then starts
     the same Agent from the LingTai app, LingTai's directory lock refuses the
     second one. Letting the app recognise and connect to Puffo's copy is

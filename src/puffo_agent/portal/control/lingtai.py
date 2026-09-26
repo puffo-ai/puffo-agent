@@ -118,8 +118,9 @@ async def running_lingtai_target(harness_command: list[str]) -> AttachTarget | N
 
     Asked on every start, so an Agent the user opened after import is picked
     up and one they closed is started by Puffo instead. Only ``lingtai run``
-    serves this socket; the ``lingtai acp`` child Puffo starts does not, so a
-    previous Puffo-started copy is never mistaken for a running Agent.
+    with ``--acp-socket`` (or its environment marker) serves this socket; the
+    ``lingtai acp`` child Puffo starts does not, so a previous Puffo-started
+    copy is never mistaken for a running Agent.
     """
     target = await resolve_attach_target(harness_command)
     listening = await _resident_socket_listening(target.socket_path, "restart this agent")
