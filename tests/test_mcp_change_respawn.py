@@ -1,7 +1,12 @@
 """Codex snapshots MCP at session start; when the puffo tool surface
 changes, CLI Codex agents must drop their session on daemon boot
 so they reload the tools (openai/codex#7767)."""
-from puffo_agent.mcp.puffo_core_server import mcp_tool_fingerprint
+from puffo_agent.mcp.config import MONID_TOOL_NAMES
+from puffo_agent.mcp.puffo_core_server import (
+    _capture_tool_surface,
+    _captured_tool_schema,
+    mcp_tool_fingerprint,
+)
 from puffo_agent.portal.daemon import (
     _mcp_fingerprint_path,
     _respawn_codex_on_mcp_change_at_startup,
@@ -35,6 +40,47 @@ def test_fingerprint_is_stable_and_hex():
     a = mcp_tool_fingerprint()
     assert a == mcp_tool_fingerprint()
     assert len(a) == 64 and all(c in "0123456789abcdef" for c in a)
+
+
+def test_monid_gate_moves_fingerprint_and_toggles_exactly_monid(monkeypatch):
+    # The bug: enabling monid left the fingerprint unchanged (it was computed
+    # under a dummy, always-monid-disabled config), so cached codex sessions
+    # never reloaded and the model kept a monid-less tool list.
+    monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "false")
+    off_fp, off_surface = mcp_tool_fingerprint(), set(_capture_tool_surface())
+    monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "true")
+    on_fp, on_surface = mcp_tool_fingerprint(), set(_capture_tool_surface())
+
+    assert on_fp != off_fp
+    assert on_surface - off_surface == set(MONID_TOOL_NAMES)
+
+
+def test_fingerprint_surface_covers_memory_family(monkeypatch):
+    # The memory tools were never registered into the fingerprint, so a memory
+    # tool change was invisible. Guard that the family is now covered.
+    monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "true")
+    surface = set(_capture_tool_surface())
+    assert {"create_note", "read_memory_file", "search_memory"} <= surface
+
+
+def test_captured_tool_schema_is_address_free_and_captures_doc():
+    # Docstring + param schema (name/required) feed the hash; default *values*
+    # must not — a sentinel default would leak a process address and make the
+    # fingerprint differ every restart, spuriously rotating every session.
+    sentinel = object()
+
+    def sample(a: str, b: int = 5, c=sentinel):
+        """sample doc"""
+
+    schema = _captured_tool_schema(sample)
+    by_name = {p["name"]: p for p in schema["params"]}
+
+    assert schema["doc"] == "sample doc"
+    assert by_name["a"]["required"] is True
+    assert by_name["b"]["required"] is False and by_name["c"]["required"] is False
+    import json
+
+    assert "0x" not in json.dumps(schema)
 
 
 def test_first_run_records_fingerprint_no_respawn(tmp_path, monkeypatch):
