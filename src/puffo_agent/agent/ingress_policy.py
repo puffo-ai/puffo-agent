@@ -44,8 +44,15 @@ no-operator behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
+from .invite_link_redeem import (
+    extract_invite_short_code,
+    handle_redeem_reply,
+    is_bare_invite_link,
+    request_link_redeem_approval,
+)
 from .message_store import ReceiptDisposition
 
 BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
@@ -167,6 +174,7 @@ async def operator_control_gate(
         (client._maybe_handle_leave_reply, "handled leave reply"),
         (client._maybe_handle_permission_reply, "handled permission reply"),
         (client._maybe_handle_dm_approval_reply, "handled dm approval reply"),
+        (partial(handle_redeem_reply, client), "handled invite-link redeem reply"),
     )
     for handler, reason in controls:
         if await handler(thread_root_id=thread_root_id, text=text):
@@ -176,6 +184,38 @@ async def operator_control_gate(
                 reason=reason,
             )
     return None
+
+
+async def invite_link_gate(
+    client: Any,
+    payload: Any,
+    text: str,
+) -> GateVerdict | None:
+    """Route an invite link handed to the agent into operator approval.
+
+    A ``/i/<code>`` link in an inbound DM never auto-joins; it becomes an
+    operator y/n prompt (same authz as a non-operator direct invite). Runs
+    before ``foreign_dm_gate`` so a stranger's link is a join request, not a
+    trust-this-contact prompt. Only a *bare* link is consumed here; a message
+    that also carries a real request is left to reach the model as well, so the
+    request isn't silently swallowed. Keyed/signed transport only — redeem
+    needs subkey-signed HTTP, so the keyless lane does not wire this gate.
+    """
+    if payload.envelope_kind != "dm":
+        return None
+    short_code = extract_invite_short_code(text)
+    if not short_code:
+        return None
+    await request_link_redeem_approval(
+        client, short_code=short_code, source_slug=payload.sender_slug
+    )
+    if not is_bare_invite_link(text):
+        return None
+    return GateVerdict(
+        gate="invite_link_redeem",
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="invite link routed to operator approval",
+    )
 
 
 async def foreign_dm_gate(
