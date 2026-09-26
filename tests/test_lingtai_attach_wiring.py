@@ -59,6 +59,8 @@ def lingtai_install(tmp_path):
         "    print('/tmp/a.sock'); print('/tmp/b.sock'); sys.exit(0)\n"
         "if mode == 'relative':\n"
         "    print('a.sock'); sys.exit(0)\n"
+        "if mode.startswith('path:'):\n"
+        "    print(mode[5:]); sys.exit(0)\n"
         "print('/tmp/lingtai-acp-test/' + sys.argv[2].replace('/', '_') + '.sock')\n"
     )
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
@@ -258,25 +260,67 @@ def adapter_capture(monkeypatch):
     return seen
 
 
+@pytest.fixture
+def resident_socket(lingtai_install):
+    """Point the fake LingTai at a short socket path (AF_UNIX caps its length)
+    and hand the test a way to make a running Agent listen there."""
+    import os
+    import socket
+    import tempfile
+
+    directory = tempfile.mkdtemp(prefix="lt-", dir="/tmp")
+    path = Path(directory) / "acp.sock"
+    lingtai_install.mode("path:" + str(path))
+    servers: list = []
+
+    def listen() -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        servers.append(server)
+
+    def stale() -> None:
+        # A socket file left behind with nobody accepting on it.
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.close()
+
+    yield SimpleNamespace(path=path, listen=listen, stale=stale)
+    for server in servers:
+        server.close()
+    if path.exists():
+        path.unlink()
+    os.rmdir(directory)
+
+
 @pytest.mark.asyncio
-async def test_an_attach_agent_gets_the_attach_driver(puffo_home, lingtai_install, adapter_capture):
-    _write_agent("a1", _lingtai_runtime(lingtai_install, lingtai_attach=True))
+@pytest.mark.parametrize("imported_attach", [True, False], ids=["imported-attach", "imported-spawn"])
+async def test_a_running_lingtai_is_attached_whatever_the_import_chose(
+    puffo_home, lingtai_install, resident_socket, adapter_capture, imported_attach,
+):
+    # The mode is decided at each start: a LingTai the user opened after an
+    # import that chose spawn is attached to all the same.
+    _write_agent("a1", _lingtai_runtime(lingtai_install, lingtai_attach=imported_attach))
+    resident_socket.listen()
     worker, bind = _bind(state.AgentConfig.load("a1"))
 
     await bind
 
     driver = adapter_capture["driver"]
     assert isinstance(driver, AcpAttachDriver)
-    assert driver.target.socket_path == _expected_socket(lingtai_install.agent_dir)
+    assert driver.target.socket_path == resident_socket.path
     assert driver.target.runtime_id == RUNTIME_ID
     assert worker._adapter == "adapter"
 
 
 @pytest.mark.asyncio
-async def test_a_spawn_agent_keeps_the_default_driver(puffo_home, lingtai_install, adapter_capture):
-    # Positive control for the test above: the same agent without the setting
+@pytest.mark.parametrize("imported_attach", [True, False], ids=["imported-attach", "imported-spawn"])
+async def test_no_running_lingtai_starts_one_whatever_the_import_chose(
+    puffo_home, lingtai_install, resident_socket, adapter_capture, imported_attach,
+):
+    # Negative control for the test above: the same agent with no socket
     # leaves driver construction to the adapter, which spawns.
-    _write_agent("a1", _lingtai_runtime(lingtai_install))
+    _write_agent("a1", _lingtai_runtime(lingtai_install, lingtai_attach=imported_attach))
     _, bind = _bind(state.AgentConfig.load("a1"))
 
     await bind
@@ -285,9 +329,23 @@ async def test_a_spawn_agent_keeps_the_default_driver(puffo_home, lingtai_instal
 
 
 @pytest.mark.asyncio
-async def test_attach_never_falls_back_to_starting_lingtai(puffo_home, lingtai_install, adapter_capture):
-    # If the Agent cannot be found, the worker fails to bind. Starting a
-    # second LingTai on the same directory is what attach exists to prevent.
+async def test_attach_import_refuses_a_socket_nobody_answers(
+    puffo_home, lingtai_install, resident_socket, adapter_capture,
+):
+    # A socket file with no listener may still belong to an Agent holding the
+    # directory; starting a second LingTai there is what attach prevents.
+    _write_agent("a1", _lingtai_runtime(lingtai_install, lingtai_attach=True))
+    resident_socket.stale()
+    _, bind = _bind(state.AgentConfig.load("a1"))
+
+    with pytest.raises(ValueError, match="socket is unavailable"):
+        await bind
+
+    assert "driver" not in adapter_capture
+
+
+@pytest.mark.asyncio
+async def test_attach_import_refuses_an_unplaceable_runtime(puffo_home, lingtai_install, adapter_capture):
     _write_agent("a1", _lingtai_runtime(lingtai_install, lingtai_attach=True))
     cfg = state.AgentConfig.load("a1")
     lingtai_install.registry.unlink()
@@ -297,6 +355,42 @@ async def test_attach_never_falls_back_to_starting_lingtai(puffo_home, lingtai_i
         await bind
 
     assert "driver" not in adapter_capture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("break_probe", ["old-kernel", "no-registry"])
+async def test_spawn_import_keeps_spawning_when_the_probe_cannot_run(
+    puffo_home, lingtai_install, adapter_capture, break_probe,
+):
+    # Agents imported before attach existed, or on an older kernel, start
+    # exactly as they did.
+    _write_agent("a1", _lingtai_runtime(lingtai_install))
+    if break_probe == "old-kernel":
+        lingtai_install.mode("old")
+    else:
+        lingtai_install.registry.unlink()
+    _, bind = _bind(state.AgentConfig.load("a1"))
+
+    await bind
+
+    assert adapter_capture["driver"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_non_lingtai_acp_agent_is_never_probed(puffo_home, adapter_capture, monkeypatch):
+    from puffo_agent.portal.control import lingtai as lingtai_control
+
+    async def probe(_command):
+        raise AssertionError("probed a non-LingTai agent")
+
+    monkeypatch.setattr(lingtai_control, "running_lingtai_target", probe)
+    _write_agent("a1", {"kind": "cli-local", "harness": "acp",
+                        "harness_command": ["/usr/bin/some-acp-agent"]})
+    _, bind = _bind(state.AgentConfig.load("a1"))
+
+    await bind
+
+    assert adapter_capture["driver"] is None
 
 
 @pytest.mark.asyncio

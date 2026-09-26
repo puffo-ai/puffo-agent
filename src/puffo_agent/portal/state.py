@@ -631,9 +631,11 @@ class RuntimeConfig:
     # agent can be selected without adding a provider-specific Driver. The
     # first item is the executable and remaining items are literal arguments.
     harness_command: list[str] = field(default_factory=list)
-    # cli-local LingTai (``harness_command`` selects ``puffo-v1``): connect to
-    # the Agent LingTai already runs instead of starting one. The process, its
-    # lock and its directory stay LingTai's; Puffo opens and closes only the
+    # cli-local LingTai (``harness_command`` selects ``puffo-v1``): the import
+    # found LingTai running. Every start re-checks and attaches only while it
+    # still runs (worker_run._lingtai_driver); this flag keeps the stricter
+    # failure handling for such agents. When attached, the process, its lock
+    # and its directory stay LingTai's; Puffo opens and closes only the
     # connection. See agent/harness/drivers/acp_attach.py.
     lingtai_attach: bool = False
     # Retained only so older agent.yml files round-trip without losing data.

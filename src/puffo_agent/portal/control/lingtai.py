@@ -88,7 +88,11 @@ async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
     lines = output.decode("utf-8", errors="strict").splitlines()
     if len(lines) != 1 or not Path(lines[0]).is_absolute():
         raise ValueError("LingTai acp-socket-path did not print one absolute path")
-    path = Path(lines[0])
+    return await _resident_socket_listening(Path(lines[0]), "retry import")
+
+
+async def _resident_socket_listening(path: Path, retry: str) -> bool:
+    """False only when no socket exists; a socket nobody answers is an error."""
     try:
         mode = os.lstat(path).st_mode
     except FileNotFoundError:
@@ -102,11 +106,24 @@ async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
     except (OSError, TimeoutError) as exc:
         raise ValueError(
             "LingTai resident ACP socket is unavailable; start or restart "
-            "the LingTai Agent, then retry import"
+            f"the LingTai Agent, then {retry}"
         ) from exc
     writer.close()
     await writer.wait_closed()
     return True
+
+
+async def running_lingtai_target(harness_command: list[str]) -> AttachTarget | None:
+    """The running LingTai Agent to attach to, or None when none is running.
+
+    Asked on every start, so an Agent the user opened after import is picked
+    up and one they closed is started by Puffo instead. Only ``lingtai run``
+    serves this socket; the ``lingtai acp`` child Puffo starts does not, so a
+    previous Puffo-started copy is never mistaken for a running Agent.
+    """
+    target = await resolve_attach_target(harness_command)
+    listening = await _resident_socket_listening(target.socket_path, "restart this agent")
+    return target if listening else None
 
 
 async def revoke_lingtai(launch: LingtaiLaunch) -> None:
