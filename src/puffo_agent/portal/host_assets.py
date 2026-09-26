@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -304,29 +305,140 @@ def sync_host_codex_auth_view(
     return "view (migrated-from-symlink)" if migrated else "view"
 
 
+_PI_CODEX_PROVIDER = "openai-codex"
+
+
+def _jwt_expiry_ms(token: str) -> int | None:
+    """``exp`` of a JWT access token in ms; ``None`` when absent."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    padded = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    exp = claims.get("exp")
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        return None
+    return exp * 1000
+
+
+def derive_pi_codex_entry(codex_blob: str) -> dict[str, Any] | None:
+    """Pi ``openai-codex`` oauth entry from a Codex ``auth.json`` blob.
+
+    ``refresh`` blanked, not carried: the daemon is the single writer of the
+    rotating RT (see :func:`sanitize_codex_auth_blob`).  ``None`` when the blob
+    is unparseable or carries no OAuth access token.
+    """
+    try:
+        data = json.loads(codex_blob)
+    except (TypeError, ValueError):
+        return None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    access = tokens.get("access_token")
+    if not isinstance(access, str) or not access:
+        return None
+    entry: dict[str, Any] = {"type": "oauth", "access": access, "refresh": ""}
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id:
+        entry["accountId"] = account_id
+    expires = _jwt_expiry_ms(access)
+    if expires is not None:
+        entry["expires"] = expires
+    return entry
+
+
+def build_pi_auth_view(host_home: Path) -> tuple[str, bytes | None]:
+    """``(status, blob)`` for the agent's Pi ``auth.json``.
+
+    The host Pi file is a snapshot: Codex CLI rotates its refresh token
+    independently, so a byte copy hands the agent a consumed token.  The
+    ``openai-codex`` entry is therefore re-derived from the live
+    ``~/.codex/auth.json`` and overlaid on the host payload, leaving every
+    other provider untouched.  Without a usable Codex file the host bytes pass
+    through unchanged.  Status is ``"ok"``, ``"no-host-file"``, or
+    ``"unparseable-host-file"``.
+    """
+    try:
+        raw: bytes | None = (host_home / ".pi" / "agent" / "auth.json").read_bytes()
+    except OSError:
+        raw = None
+    payload: dict[str, Any] = {}
+    if raw is not None:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return "unparseable-host-file", None
+        if not isinstance(parsed, dict):
+            return "unparseable-host-file", None
+        payload = parsed
+    try:
+        codex_blob = (host_home / ".codex" / "auth.json").read_text(encoding="utf-8")
+    except OSError:
+        codex_blob = ""
+    entry = derive_pi_codex_entry(codex_blob) if codex_blob else None
+    if entry is None:
+        if raw is None:
+            return "no-host-file", None
+        return "ok", raw
+    payload[_PI_CODEX_PROVIDER] = entry
+    return "ok", json.dumps(payload).encode("utf-8")
+
+
+def pi_auth_projection_state(agent_pi_home: Path) -> str:
+    """Read-only ownership of the agent's Pi ``auth.json``.
+
+    ``"not-projected"`` when no target exists, ``"view"`` while the digest
+    marker still matches the target, ``"operator-owned"`` once Pi or an
+    operator has rewritten it.  Shared by :func:`sync_host_pi_auth_view` and
+    the ops surface so both read the same marker rule.
+    """
+    target = agent_pi_home / "auth.json"
+    if not target.exists():
+        return "not-projected"
+    try:
+        previous_digest = (
+            (agent_pi_home / ".puffo-host-auth.sha256")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+        target_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return "operator-owned"
+    return "view" if previous_digest == target_digest else "operator-owned"
+
+
+def pi_auth_expiry_ms(agent_pi_home: Path) -> int | None:
+    """``expires`` of the projected ``openai-codex`` entry; no secret returned."""
+    try:
+        parsed = json.loads((agent_pi_home / "auth.json").read_bytes())
+    except (OSError, TypeError, ValueError):
+        return None
+    entry = parsed.get(_PI_CODEX_PROVIDER) if isinstance(parsed, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    expires = entry.get("expires")
+    if not isinstance(expires, int) or isinstance(expires, bool):
+        return None
+    return expires
+
+
 def select_pi_auth_home(host_home: Path, agent_pi_home: Path) -> Path:
     """Return the credential directory the next Pi launch will effectively use.
 
-    This is the read-only counterpart to :func:`sync_host_pi_auth_view`, used
-    by create preflight before any agent files may be written.
+    Read-only counterpart to :func:`sync_host_pi_auth_view`, used by create
+    preflight before any agent files may be written.  A materialised target
+    always wins: the projected view is derived, not a byte copy of the host
+    file, so the two are no longer interchangeable.
     """
-    host_pi_home = host_home / ".pi" / "agent"
-    host_auth = host_pi_home / "auth.json"
-    target = agent_pi_home / "auth.json"
-    marker = agent_pi_home / ".puffo-host-auth.sha256"
-    try:
-        host_blob = host_auth.read_bytes()
-        host_payload = json.loads(host_blob)
-    except (OSError, TypeError, ValueError):
-        return agent_pi_home if target.exists() else host_pi_home
-    if not isinstance(host_payload, dict) or not target.exists():
-        return host_pi_home
-    try:
-        previous_digest = marker.read_text(encoding="ascii").strip()
-        target_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-    except OSError:
+    if (agent_pi_home / "auth.json").exists():
         return agent_pi_home
-    return host_pi_home if previous_digest == target_digest else agent_pi_home
+    return host_home / ".pi" / "agent"
 
 
 def sync_host_pi_auth_view(host_home: Path, agent_pi_home: Path) -> str:
@@ -336,39 +448,27 @@ def sync_host_pi_auth_view(host_home: Path, agent_pi_home: Path) -> str:
     digest marker records only files this function last wrote; once Pi or an
     operator changes the target, that file becomes operator-owned and is left
     alone.  This avoids turning every worker refresh into a credential rollback.
+    The projected blob comes from :func:`build_pi_auth_view`, so the marker is
+    computed over the derived bytes rather than the host snapshot.
     """
-    host_auth = host_home / ".pi" / "agent" / "auth.json"
     target = agent_pi_home / "auth.json"
     marker = agent_pi_home / ".puffo-host-auth.sha256"
-    try:
-        host_blob = host_auth.read_bytes()
-    except OSError:
-        return "no-host-file"
-    try:
-        parsed = json.loads(host_blob)
-    except (TypeError, ValueError):
-        return "unparseable-host-file"
-    if not isinstance(parsed, dict):
-        return "unparseable-host-file"
+    status, view_blob = build_pi_auth_view(host_home)
+    if view_blob is None:
+        return status
 
-    if target.exists():
-        try:
-            previous_digest = marker.read_text(encoding="ascii").strip()
-            target_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-        except OSError:
-            return "operator-owned"
-        if previous_digest != target_digest:
-            return "operator-owned"
+    if pi_auth_projection_state(agent_pi_home) == "operator-owned":
+        return "operator-owned"
 
-    digest = hashlib.sha256(host_blob).hexdigest()
+    digest = hashlib.sha256(view_blob).hexdigest()
     try:
         _ensure_private_directory(agent_pi_home.parent)
         _ensure_private_directory(agent_pi_home)
-        if target.exists() and target.read_bytes() == host_blob:
+        if target.exists() and target.read_bytes() == view_blob:
             _set_private_file_mode(target)
             _atomic_write_private(marker, digest + "\n")
             return "view (fresh)"
-        _atomic_write_private(target, host_blob)
+        _atomic_write_private(target, view_blob)
         _atomic_write_private(marker, digest + "\n")
     except OSError:
         return "write-failed"
