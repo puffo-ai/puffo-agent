@@ -97,33 +97,22 @@ def register_monid_tools(mcp: FastMCP, cfg: Any) -> None:
 def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def monid_prepare(query: str, limit: int = 5) -> str:
-        """Find a Monid capability for the data you want, and see how to call it.
+        """Look up how to buy live or paywalled data through Monid — FREE; call this BEFORE `monid_spend`.
 
-        FREE — this only looks things up, it does not fetch data or spend any
-        money. Always call this BEFORE `monid_spend`: it tells you which
-        capability to run and exactly how to shape its `input`.
-
-        Say what you want in `query` (natural language). The result gives you:
-
-        - `provider` and `endpoint` — pass these straight to `monid_spend`.
-        - `price` — the price model and quoted amount (in micro-dollars).
-        - `input` — the run-input schema. Monid wraps a run's input in one or
-          more named envelopes: `body`, `queryParams`, and/or `pathParams`.
-          Whichever the capability declares is here, each a JSON schema with a
-          `description` per field (and sometimes a filled-in example). Build
-          your `input` by filling those exact envelope(s) — e.g. if the schema
-          is under `queryParams`, send `{"queryParams": { ...your values... }}`.
-        - `description` — extra guidance on what a field expects.
+        Use it for data free search can't reliably get: social posts, live
+        prices, company/people records, anything login/paywalled. Say what you
+        want in `query`; the result gives `provider` and `endpoint` (pass
+        straight to `monid_spend`), a `price` quote (in micro-dollars), and the
+        `input` schema — build your `input` by filling the exact envelope(s) it
+        declares (`body` / `queryParams` / `pathParams`).
 
         Args:
             query: What data you want, in natural language.
             limit: How many candidate capabilities to consider (1-25).
 
-        Returns the prepared capability as JSON. If nothing matches, this
-        errors — the data is not available through Monid (the capability may
-        not exist, or is not one Puffo allows). You may still answer the user
-        from your own knowledge or the web, but you MUST clearly label that as
-        NOT a Monid result; never imply non-Monid data came from Monid.
+        If nothing matches, the data isn't available through Monid. You may
+        answer from your own knowledge or the web, but you MUST label it as NOT
+        a Monid result — never imply non-Monid data came from Monid.
         """
         if not query.strip():
             raise RuntimeError("query is required")
@@ -169,46 +158,34 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
         max_cost_micro: int,
         idempotency_key: str = "",
     ) -> str:
-        """Run a Monid capability you prepared, and pay for the data — PAID.
+        """Run a capability from `monid_prepare` and pay for the data — PAID; prepare FIRST.
 
-        Puffo is the middle layer: it holds the Monid key, checks your spend
-        budget, pays Monid, and returns the result. You never see the key and
-        never hold money. The spend comes out of the shared Monid balance, and
-        your operator must have enabled Monid for you and set a cap first.
-
-        This tool is the ONLY way to reach Monid: never install or run a Monid
-        CLI, and never ask for or hold your own Monid key (the server holds it).
-
-        Call `monid_prepare` FIRST to get `provider`, `endpoint`, and the input
-        schema. Then:
+        Puffo is the middle layer: it holds the Monid key, checks your budget,
+        pays, and returns the result — you never see the key or hold money. This
+        is the ONLY way to reach Monid: never install or run a Monid CLI, and
+        never hold your own Monid key.
 
         Args:
-            provider: From `monid_prepare` — the capability's provider.
-            endpoint: From `monid_prepare` — the capability's endpoint.
-            input: The run payload you built from the prepared schema, in Monid's
-                envelope shape: fill the envelope(s) the schema declared, i.e.
-                `{"body": {...}}` and/or `{"queryParams": {...}}` and/or
-                `{"pathParams": {...}}`. If the shape does not match, the error
-                returns that schema — rebuild `input` to match it and call again.
-            max_cost_micro: Your hard ceiling for THIS one call, in
-                micro-dollars (1_000_000 = $1). Must be positive. If the quoted
-                price is above it, the call is rejected before any money is spent.
-            idempotency_key: Optional. Pass a stable value to control
-                deduplication yourself — reuse it to make a retry idempotent, or
-                pass a new one to deliberately buy the same data again. If
-                omitted, this tool derives a retry-safe key for THIS request from
-                the single message you are handling, so a provider-timeout resume
-                or a message re-delivery of the SAME spend settles as ONE charge
-                while a genuinely new request in a later turn is charged normally.
-                In a turn that handles several inbound messages the automatic key
-                cannot be pinned to one request safely, so the spend is refused
-                unless you pass an explicit idempotency_key.
+            provider: From `monid_prepare`.
+            endpoint: From `monid_prepare`.
+            input: The payload built to the prepared schema's envelope(s):
+                `{"body": {...}}` / `{"queryParams": {...}}` /
+                `{"pathParams": {...}}`. On a shape mismatch the error returns
+                the schema — rebuild `input` and call again.
+            max_cost_micro: Hard ceiling for THIS call, in micro-dollars
+                (1_000_000 = $1); a quote above it is rejected before any money
+                is spent.
+            idempotency_key: Optional. Omit it and this tool derives a retry-safe
+                key from the message you're handling: a timeout-resume or
+                re-delivery of the SAME spend settles as ONE charge, while a new
+                request in a later turn is charged normally. When one turn handles
+                several messages the auto key can't be pinned safely, so the spend
+                is refused unless you pass an explicit key. Pass a stable key to
+                control dedup yourself.
 
-        Returns the provider's result and what the call cost, stamped
-        `via Monid · <provider>/<endpoint> · <cost>` — mark data you got this
-        way as Monid-sourced. Anything you instead answer from your own
-        knowledge or the web MUST be labeled as NOT a Monid result; never
-        present non-Monid data as a Monid result.
+        Returns the result and its cost, stamped
+        `via Monid · <provider>/<endpoint> · <cost>` — mark it Monid-sourced;
+        label anything you answer from elsewhere as NOT a Monid result.
         """
         if not provider.strip() or not endpoint.strip():
             raise RuntimeError(

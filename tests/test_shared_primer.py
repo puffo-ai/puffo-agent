@@ -218,7 +218,7 @@ def test_harnesses_discover_managed_skills_with_correct_tool_names():
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
     ensure_shared_primer(root / "shared")
-    for skill_id in ("read-messages", "send-message"):
+    for skill_id in ("read-messages", "send-message", "paid-data"):
         claude_skill = root / "workspace" / ".claude" / "skills" / skill_id / "SKILL.md"
         codex_skill = root / "workspace" / ".agents" / "skills" / skill_id / "SKILL.md"
         for skill in (claude_skill, codex_skill):
