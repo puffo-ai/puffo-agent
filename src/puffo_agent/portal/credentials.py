@@ -24,12 +24,14 @@ Refresh is not here yet: its server contract lands with the server's step 5.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from ..crypto.credential_keys import (
+    CredentialKeyError,
     compute_credential_wrap_aad,
+    credential_id,
     create_credential_key_cert,
     derive_credential_kem_keypair,
     open_credential,
@@ -53,14 +55,21 @@ class HeldCredential:
     version: int
     expire_at: datetime | None
     # The secret itself, or the S2 share for a split type; which one is a
-    # function of ``type`` and is the caller's business.
-    value: bytes
+    # function of ``type`` and is the caller's business. Kept out of repr so a
+    # log line or traceback that prints one does not print the secret.
+    value: bytes = field(repr=False)
 
 
 class AgentCredentials:
-    def __init__(self, http: Any, slug: str, root_secret: bytes) -> None:
+    def __init__(self, http: Any, slug: str, owner_slug: str, root_secret: bytes) -> None:
+        if not owner_slug:
+            # Without it the id a response must carry cannot be derived, and
+            # then nothing stops a response for one credential being served as
+            # another.
+            raise ValueError("owner_slug is required")
         self._http = http
         self._slug = slug
+        self._owner = owner_slug
         self._root = Ed25519KeyPair.from_secret_bytes(root_secret)
         self._kem = derive_credential_kem_keypair(root_secret, KEY_VERSION)
         self._held: dict[str, HeldCredential] = {}
@@ -96,7 +105,7 @@ class AgentCredentials:
                 self._invalidate(lambda c: c.type == credential_type and c.index == index)
                 return None
             raise
-        held = self._open(data)
+        held = self._open(data, credential_type, index)
         if generation != self._generation:
             return None
         self._held[held.id] = held
@@ -115,20 +124,31 @@ class AgentCredentials:
         }
         self._invalidate(lambda c: current.get(c.id) != (c.version, "ACTIVATED"))
 
-    def _open(self, data: dict) -> HeldCredential:
+    def _open(self, data: dict, credential_type: str, index: int) -> HeldCredential:
+        """Open the response as the credential that was asked for, or refuse.
+
+        The AAD stops a blob moving between rows or recipients, but it is built
+        from whatever id the response names. A server that answered a request
+        for A with B's genuine row would pass it, and B's secret would come back
+        as A's (Boris 226286). So the id is derived here and the response must
+        match it; the AAD is then built from what was asked, not what came back.
+        """
+        expected_id = credential_id(self._owner, credential_type, index)
+        if (data["id"], data["type"], data["index"]) != (expected_id, credential_type, index):
+            raise CredentialKeyError("server answered with a different credential")
         aad = compute_credential_wrap_aad(
-            credential_id=data["id"],
+            credential_id=expected_id,
             version=data["version"],
             recipient_slug=self._slug,
-            credential_type=data["type"],
+            credential_type=credential_type,
             key_version=KEY_VERSION,
         )
         value = open_credential(self._kem, aad, base64url_decode(data["blob"]))
         expire_at = data.get("expire_at")
         return HeldCredential(
-            id=data["id"],
-            type=data["type"],
-            index=data["index"],
+            id=expected_id,
+            type=credential_type,
+            index=index,
             version=data["version"],
             expire_at=datetime.fromisoformat(expire_at) if expire_at else None,
             value=value,

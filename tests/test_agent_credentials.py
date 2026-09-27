@@ -7,13 +7,13 @@ the bytes: what is cached, what is dropped, and what a race may not undo.
 
 import asyncio
 import hashlib
-import uuid
 
 import pytest
 
 from puffo_agent.crypto.credential_keys import (
     CredentialKeyError,
     compute_credential_wrap_aad,
+    credential_id,
     derive_credential_kem_keypair,
     seal_credential,
     verify_credential_key_cert,
@@ -24,12 +24,9 @@ from puffo_agent.crypto.primitives import Ed25519KeyPair
 from puffo_agent.portal.credentials import AgentCredentials
 
 SLUG = "agt-daemon-0001"
+OWNER = "alice"
 ROOT = hashlib.sha256(b"agent credentials test root").digest()
 TYPE = "CUSTOMIZED"
-
-
-def _id(index: int, generation: int = 0) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cred/{index}/{generation}"))
 
 
 class FakeServer:
@@ -42,9 +39,9 @@ class FakeServer:
         self.put_body = None
         self.hold = None  # an Event that GET one waits on, to open a race
 
-    def row(self, index, value, *, version=1, state="ACTIVATED", generation=0):
+    def row(self, index, value, *, version=1, state="ACTIVATED"):
         self.rows[index] = dict(
-            id=_id(index, generation), version=version, state=state, value=value
+            id=credential_id(OWNER, TYPE, index), version=version, state=state, value=value
         )
 
     async def put(self, path, body):
@@ -85,7 +82,7 @@ def server():
 
 @pytest.fixture
 def agent(server):
-    return AgentCredentials(server, SLUG, ROOT)
+    return AgentCredentials(server, SLUG, OWNER, ROOT)
 
 
 @pytest.mark.asyncio
@@ -159,7 +156,7 @@ async def test_offline_across_delete_and_recreate_the_old_secret_is_not_served(s
     server.row(0, b"old-secret")
     await agent.get(TYPE, 0)
     del server.rows[0]
-    server.row(1, b"new-secret", generation=1)
+    server.row(1, b"new-secret")
     await agent.reconcile()
     assert await agent.get(TYPE, 0) is None
     assert (await agent.get(TYPE, 1)).value == b"new-secret"
@@ -197,3 +194,31 @@ async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent
     assert await fetch is None
     server.hold = None
     assert await agent.get(TYPE, 0) is None       # and nothing was left behind
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_row_for_another_credential_is_not_served_as_the_one_asked_for(
+    server, agent
+):
+    """Boris 226286. B's row is real and sealed to this agent, so it opens
+    under its own AAD; only the requested id tells it is not A."""
+    server.row(0, b"secret-A")
+    server.row(1, b"secret-B")
+    real_get = server.get
+
+    async def relabelling_get(path):
+        return await real_get(path.replace("/0", "/1") if path.endswith("/0") else path)
+
+    server.get = relabelling_get
+    with pytest.raises(CredentialKeyError, match="different credential"):
+        await agent.get(TYPE, 0)
+    server.get = real_get
+    assert (await agent.get(TYPE, 0)).value == b"secret-A"
+
+
+@pytest.mark.asyncio
+async def test_a_held_credential_does_not_print_its_value(server, agent):
+    server.row(0, b"do-not-log-me")
+    held = await agent.get(TYPE, 0)
+    assert "do-not-log-me" not in repr(held)
+    assert "do-not-log-me" not in repr({held.id: held})

@@ -123,6 +123,19 @@ def verify_credential_key_cert(
     return kem_public_key
 
 
+_CREDENTIAL_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "puffo:credentials")
+
+
+def credential_id(owner_slug: str, credential_type: str, index: int) -> str:
+    """The id the server assigns to ``(owner, type, index)``.
+
+    Server-pinned (puffo-server ``types.rs::credential_id``). A reader derives
+    it too, so that a response naming some other credential is caught before
+    its value is handed back as the one that was asked for.
+    """
+    return str(uuid.uuid5(_CREDENTIAL_ID_NAMESPACE, f"{owner_slug}/{credential_type}/{index}"))
+
+
 def compute_credential_wrap_aad(
     *,
     credential_id: str,
