@@ -31,7 +31,7 @@ from .context_controller import (
     ToolResultAdmission,
 )
 from .errors import AgentAPIError, ProviderFailureError
-from .turn_recovery import read_recovery, recovery_required
+from .turn_recovery import read_recovery, recovery_required, write_recovery
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
@@ -456,8 +456,9 @@ class GlobalInboxRuntime(
     async def recover_orphaned_turns(self) -> int:
         """Requeue active DB Turns left without a resumable crash join."""
         if recovery_required(self.workspace):
-            self._report_recovery_required()
-            return 0
+            if not await self._resolve_effectless_recovery():
+                self._report_recovery_required()
+                return 0
         recovered = 0
         for run in await self.store.get_active_turn_runs():
             if run.message_ids:
@@ -490,6 +491,44 @@ class GlobalInboxRuntime(
             )
             recovered += 1
         return recovered
+
+    async def _resolve_effectless_recovery(self) -> bool:
+        """Resolve a quarantine whose retry cannot replay anything.
+
+        The operator gate protects against redelivering admitted rows to a
+        fresh turn. A confirmed-stopped record bound to a row-free turn has
+        nothing to redeliver, so parking the agent only prolongs the outage.
+        """
+        record = read_recovery(self.workspace)
+        if record is None or record.resolved:
+            return True
+        if not record.stopped or record.retry_requested:
+            return False
+        turn_id = record.durable_turn_id
+        if not turn_id:
+            candidates = [
+                run
+                for run in await self.store.get_active_turn_runs()
+                if (run.provider_session_id or "") == record.provider_session_id
+            ]
+            if len(candidates) != 1:
+                return False
+            turn_id = candidates[0].turn_id
+        run = await self.store.get_turn_run(turn_id)
+        if run is not None and run.message_ids:
+            return False
+        write_recovery(self.workspace, replace(record, resolved=True))
+        log_runtime_event(
+            logger,
+            "turn.recovery_resolved",
+            agent_id=self.agent_id,
+            turn_id=turn_id,
+            provider_session_id=record.provider_session_id,
+            reason=record.reason,
+            mode="startup_effectless_recovery",
+            outcome="resolved",
+        )
+        return True
 
     def stop(self) -> None:
         self._stopping = True

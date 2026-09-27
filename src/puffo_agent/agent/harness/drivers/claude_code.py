@@ -920,6 +920,13 @@ class ClaudeCodeCliDriver(Driver):
         if self._message_lifecycle_v1:
             command_id = str(frame.get("user_message_uuid") or "")
             if command_id not in self._owned_commands:
+                # An autonomous turn's command was queued by the CLI itself:
+                # never owned, no terminal record, so its result frame is the
+                # only completion authority.
+                if self._autonomous:
+                    self._record_result(frame, subtype)
+                    await self._finish_turn(frame)
+                    return
                 await self._emit(
                     HarnessEventType.SESSION_UPDATED,
                     data={"record_type": "result"},

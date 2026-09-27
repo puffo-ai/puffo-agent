@@ -908,3 +908,135 @@ async def test_terminal_callback_failure_is_not_silently_dropped(tmp_path):
     assert record.reason == "autonomous terminal delivery failed"
     assert notifications == ["turn.recovery_required"]
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_effectless_quarantine_resolves_at_startup(tmp_path, monkeypatch):
+    """An idle-timeout quarantine whose provider stop is confirmed and whose
+    durable turn admitted no rows has nothing an operator retry could replay:
+    restart must lift it instead of parking the agent forever."""
+    import asyncio
+    from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec
+    from puffo_agent.agent.harness.runtime.runtime_manager import (
+        RuntimeManager,
+        RuntimeManagerAdapter,
+    )
+    from puffo_agent.agent.turn_recovery import read_recovery
+    from tests.test_runtime_manager_failures import _ControllableDriver
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    manager = RuntimeManager(
+        _ControllableDriver(),
+        RuntimeSpec(str(tmp_path), task_timeout_seconds=5),
+        native_session_id="provider-session",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=lambda _: None, workspace=tmp_path,
+    )
+    runtime.register_autonomous_adoption()
+    runtime._autonomous_ready = True
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_started", driver="claude-code",
+        session_ref="provider-session", turn_ref="provider-turn",
+        native_turn_id="native-turn", native_session_id="provider-session",
+    ))
+    orphan_id = runtime.active.turn_id
+    assert orphan_id
+    await asyncio.sleep(0)
+    now[0] += 6
+    await manager._autonomous_watchdog
+    record = read_recovery(tmp_path)
+    assert record is not None and record.stopped and not record.resolved
+    await manager.close()
+
+    restarted = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _: None, workspace=tmp_path,
+    )
+    assert await restarted.recover_orphaned_turns() == 1
+    assert read_recovery(tmp_path).resolved
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
+
+    # The agent is functional again: a fresh autonomous turn adopts cleanly.
+    restarted.register_autonomous_adoption()
+    restarted._autonomous_ready = True
+    assert await restarted.adopt_autonomous_turn(
+        provider_session_id="provider-2", provider_turn_id="native-2",
+    )
+    await restarted.finish_autonomous_turn()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_effectless_resolution_refuses_ambiguous_or_replayable_records(tmp_path):
+    """Only a confirmed-stopped record bound to a row-free turn may self-heal;
+    anything replayable or ambiguous keeps the operator gate."""
+    from dataclasses import replace
+    from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
+
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _: None, workspace=tmp_path,
+    )
+    record = TurnRecovery(
+        session_ref="session-ref", turn_ref="turn-ref",
+        provider_session_id="provider-session", provider_turn_id="native-turn",
+        owner="owner", reason="autonomous idle timeout",
+        stop_attempted=True, stopped=True,
+    )
+
+    # Provider stop unconfirmed: parked.
+    write_recovery(tmp_path, replace(record, stopped=False, stop_attempted=False))
+    assert await runtime._resolve_effectless_recovery() is False
+    # An operator already authorized a retry: that flow owns resolution.
+    write_recovery(tmp_path, replace(record, retry_requested=True))
+    assert await runtime._resolve_effectless_recovery() is False
+    # No durable binding and no unique candidate turn: parked.
+    write_recovery(tmp_path, record)
+    assert await runtime._resolve_effectless_recovery() is False
+    assert read_recovery(tmp_path).resolved is False
+
+    # A named turn that no longer exists durably has nothing to replay.
+    write_recovery(tmp_path, replace(record, durable_turn_id="turn_gone"))
+    assert await runtime._resolve_effectless_recovery() is True
+    assert read_recovery(tmp_path).resolved is True
+
+    # Already resolved: nothing left to do.
+    assert await runtime._resolve_effectless_recovery() is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_effectless_resolution_binds_unique_candidate_turn(tmp_path):
+    """A record written before its durable binding still resolves when exactly
+    one active turn matches the quarantined provider session."""
+    from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
+
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _: None, workspace=tmp_path,
+    )
+    runtime.register_autonomous_adoption()
+    runtime._autonomous_ready = True
+    assert await runtime.adopt_autonomous_turn(
+        provider_session_id="provider-session", provider_turn_id="native-turn",
+    )
+    orphan_id = runtime.active.turn_id
+    write_recovery(tmp_path, TurnRecovery(
+        session_ref="session-ref", turn_ref="turn-ref",
+        provider_session_id="provider-session", provider_turn_id="native-turn",
+        owner="owner", reason="autonomous idle timeout",
+        stop_attempted=True, stopped=True,
+    ))
+    fresh = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _: None, workspace=tmp_path,
+    )
+    assert await fresh.recover_orphaned_turns() == 1
+    assert read_recovery(tmp_path).resolved is True
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
+    await store.close()

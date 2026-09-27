@@ -124,3 +124,61 @@ async def test_completed_assistant_identity_is_scoped_to_native_session():
     await driver._handle(frame)
     assert driver._active.value
     await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_v1_autonomous_run_completes_on_result():
+    """Under message-lifecycle v1 an autonomous turn's command is queued by
+    the CLI itself, so it is never daemon-owned and gets no daemon-visible
+    terminal record: its result frame is the only completion authority. If it
+    were dropped the idle watchdog would later declare a spurious crash."""
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    driver._message_lifecycle_v1 = True
+
+    await driver._handle({"type": "assistant", "uuid": "auto-1", "message": {
+        "content": [{"type": "text", "text": "daily report already posted"}],
+    }})
+    autonomous_turn = driver._active
+    assert autonomous_turn.value
+    await driver._handle({
+        "type": "result", "subtype": "success",
+        "user_message_uuid": "cli-queued-command", "message": {},
+    })
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    kinds = [getattr(event.type, "value", event.type) for event in events]
+    assert kinds[0] == "turn.autonomous_started"
+    assert kinds[-1] == "turn.autonomous_completed"
+    assert driver._active.value == ""
+    assert driver._autonomous is False
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_v1_foreign_result_still_ignored_on_daemon_turn():
+    """A daemon turn under lifecycle v1 keeps the terminal record as its sole
+    completion authority: a result for a command it does not own must not
+    close it."""
+    from puffo_agent.agent.harness.driver import TurnRef
+
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    driver._message_lifecycle_v1 = True
+    driver._active = TurnRef("turn_daemon")
+    driver._owned_commands = {"daemon-command"}
+
+    await driver._handle({
+        "type": "result", "subtype": "success",
+        "user_message_uuid": "someone-else", "message": {},
+    })
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    kinds = [getattr(event.type, "value", event.type) for event in events]
+    assert kinds == ["session.updated"]
+    assert driver._active.value == "turn_daemon"
