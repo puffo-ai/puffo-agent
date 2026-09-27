@@ -322,9 +322,8 @@ def _tool_result_text(content: Any) -> str:
 
 
 def _monid_price_of(entry: Any) -> tuple[int, str | None] | None:
-    """Read ``(unit_price_micro, price_type)`` from one capability projection (a prepare candidate
-    or the top-level object), or ``None`` when the price shape doesn't match. Strictly fail-safe:
-    a missing/non-int/bool/negative micro yields ``None`` (never a fake 0)."""
+    """``(unit_price_micro, price_type)`` from one capability projection, or ``None``. Fail-safe:
+    a missing/non-int/bool/negative micro yields ``None``, never a fake 0."""
     if not isinstance(entry, dict):
         return None
     price = entry.get("price")
@@ -341,10 +340,9 @@ def _extract_monid_candidate_prices(
     content: Any,
 ) -> dict[tuple[str, str], tuple[int, str | None]]:
     """Map ``(provider, endpoint) -> (unit_price_micro, price_type)`` from a monid_prepare result's
-    ``candidates`` shortlist, so the price of whichever candidate the model later spends on can be
-    emitted. The top-level object is included too — it mirrors ``candidates[0]`` and is the whole
-    payload for an older single-quote response. Read-only; an entry with an unusable price/shape is
-    skipped. Never reflects a settled charge (that is monid_spend's cost)."""
+    ``candidates`` (plus the top-level object, for an older single-quote response), so whichever
+    candidate the model later spends on can have its price emitted. Read-only; bad-shape entries
+    skipped."""
     text = _tool_result_text(content)
     if not text:
         return {}
@@ -437,9 +435,8 @@ class ClaudeSession:
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
         # monid_prepare tool_use ids awaiting their result (to read the candidate prices).
         self._pending_monid_prepare_ids: set[str] = set()
-        # (provider, endpoint) -> (unit_price_micro, price_type) from this turn's monid_prepare
-        # candidate shortlist(s); read when the model spends, to emit the SELECTED capability's
-        # price for the working-row estimate (not the top-ranked one).
+        # This turn's monid_prepare candidate prices; read at spend to emit the SELECTED
+        # capability's price (not the top-ranked one) for the working-row estimate.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
         self._active_provider_turn_id: str | None = None
 
@@ -1417,11 +1414,9 @@ class ClaudeSession:
         return False
 
     def _capture_monid_candidate_prices(self, event: dict[str, Any]) -> None:
-        """On a tracked monid_prepare result, remember each candidate's quoted price keyed by
-        (provider, endpoint). Nothing is emitted here: the price is emitted later, when the model
-        spends on the capability it chose (:meth:`_emit_monid_spend_price`), so the working-row
-        estimate reflects the SELECTED candidate rather than the top-ranked one. Read-only — never
-        the spend/charge path."""
+        """Remember a tracked monid_prepare result's candidate prices. Emitting is deferred to
+        :meth:`_emit_monid_spend_price` so the estimate reflects the SELECTED candidate, not the
+        top-ranked one. Read-only."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
@@ -1437,10 +1432,8 @@ class ClaudeSession:
             )
 
     def _emit_monid_spend_price(self, tool_input: dict, reporter: Any) -> None:
-        """When the model spends, emit the SELECTED capability's quoted price (remembered from this
-        turn's monid_prepare candidates) as a second monid_spend tool_use, so the working-row
-        estimate shows what THIS fetch will cost. Read-only status echo — the authoritative charge
-        is billing's monid_spend result, never this."""
+        """Emit the SELECTED capability's quoted price (from this turn's remembered candidates) as a
+        second monid_spend tool_use for the estimate. Read-only echo — the real charge is billing's."""
         provider = tool_input.get("provider")
         endpoint = tool_input.get("endpoint")
         if not isinstance(provider, str) or not isinstance(endpoint, str):

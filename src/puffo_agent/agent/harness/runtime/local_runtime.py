@@ -1045,9 +1045,8 @@ def _codex_result_text(result: Any) -> str:
 
 
 def _monid_result_data(native: Any) -> dict | None:
-    """Decode a codex TOOL_COMPLETED native payload to the tool result as a dict, or ``None``.
-    Codex hands back an already-parsed dict or JSON text; fail-safe on an error result, a missing
-    result, or a non-object shape. Read-only."""
+    """A codex TOOL_COMPLETED native's tool result as a dict (parsed dict or JSON text), or
+    ``None``. Fail-safe on an error/missing result or non-object shape. Read-only."""
     if not isinstance(native, dict) or native.get("is_error") is True:
         return None
     result = native.get("result")
@@ -1067,10 +1066,8 @@ def _monid_candidate_prices_from_native(
     native: Any,
 ) -> dict[tuple[str, str], tuple[int, str | None]]:
     """Map ``(provider, endpoint) -> (unit_price_micro, price_type)`` from a monid_prepare result's
-    ``candidates`` shortlist (+ the top-level object, which mirrors ``candidates[0]`` / is the whole
-    payload for an older single-quote response). STRICTLY fail-safe since the codex result shape is
-    not empirically pinned: an entry without a clean int price is skipped — never a 0 or a guess.
-    Read-only; a quote, never a settled charge (that is monid_spend's cost). Parallel to
+    ``candidates`` (plus the top-level object, for an older single-quote response). Fail-safe: an
+    entry without a clean int price is skipped — never a 0 or a guess. Read-only. Parallel to
     cli_session's reader; the codex result shape differs."""
     data = _monid_result_data(native)
     if data is None:
@@ -1100,9 +1097,8 @@ def _monid_candidate_prices_from_native(
 
 
 def _monid_spend_target(native: Any) -> tuple[str, str] | None:
-    """The ``(provider, endpoint)`` a monid_spend call targeted, read from the codex TOOL_COMPLETED
-    native's echoed ``arguments`` — used to look up the SELECTED capability's quoted price. ``None``
-    when the arguments don't carry a clean string pair."""
+    """The ``(provider, endpoint)`` a monid_spend targeted, from the codex native's echoed
+    ``arguments`` — to look up the selected candidate's price. ``None`` if not a clean string pair."""
     if not isinstance(native, dict):
         return None
     args = native.get("arguments")
@@ -1135,9 +1131,8 @@ class _LegacyStatusProjector:
         self._emitted_blocks: set[str] = set()
         self._emitted_tools: set[str] = set()
         self._priced_tools: set[str] = set()
-        # (provider, endpoint) -> (unit_price_micro, price_type) from this turn's monid_prepare
-        # candidate shortlist(s); read when the model spends, to emit the SELECTED capability's
-        # price for the working-row estimate.
+        # This turn's monid_prepare candidate prices; read at spend to emit the SELECTED
+        # capability's price for the working-row estimate.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
 
     def project(self, event: HarnessEvent) -> None:
@@ -1184,20 +1179,17 @@ class _LegacyStatusProjector:
         if kind == "turn.tool_completed":
             label = _normalized_tool_label(str(data.get("label") or ""))
             if label == "monid_prepare":
-                # Remember each candidate's quoted price. Nothing is emitted here — the price is
-                # emitted when the model spends on the one it chose, so the estimate reflects the
-                # SELECTED candidate rather than the top-ranked one. Read-only; never the spend path.
+                # Remember candidate prices; emit is deferred to the spend below so the estimate is
+                # the SELECTED candidate, not the top-ranked one. Read-only; never the spend path.
                 self._monid_candidate_prices.update(
                     _monid_candidate_prices_from_native(event.native_diagnostic)
                 )
                 return
             if label != "monid_spend":
                 return
-            # The model spent: emit the SELECTED capability's quoted price (from the remembered
-            # prepare candidates) as a second tool_use for the working row's estimate. Read-only;
-            # never the spend/charge path. Codex exposes tool arguments only on completion, so this
-            # rides the completed event; the FE anchors its timer to the first event, so a later
-            # emit cannot disturb the row.
+            # Emit the selected candidate's price as a second tool_use for the estimate. Read-only;
+            # never the spend/charge path. Codex exposes tool args only on completion, so this rides
+            # the completed event.
             ref = str(data.get("tool_call_ref") or "")
             if ref and ref in self._priced_tools:
                 return
