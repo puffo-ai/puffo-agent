@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex agents keep their conversation across daemon upgrades.** Since
+  July the daemon rotated every cli-local Codex session at startup whenever
+  the puffo MCP tool surface had changed — in practice on every release —
+  and did so without logging, so agents silently forgot their standing
+  instructions after each upgrade. Codex loads MCP servers per process and
+  every worker starts a fresh process at boot, so the rotation only
+  discarded context; the daemon now records the fingerprint change and
+  resumes the saved session. A session refresh that does drop a native
+  session, and the session each worker selects at start, are now logged.
+
 ## [2.0.10] - 2026-09-27
 
 ### Added

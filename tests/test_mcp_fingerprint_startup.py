@@ -1,6 +1,8 @@
-"""Codex snapshots MCP at session start; when the puffo tool surface
-changes, CLI Codex agents must drop their session on daemon boot
-so they reload the tools (openai/codex#7767)."""
+"""The daemon records the puffo MCP tool fingerprint at startup. A change is
+informational: codex loads MCP per process (openai/codex#7767) and every
+worker spawns a fresh process at boot, so native sessions are preserved."""
+import logging
+
 from puffo_agent.mcp.config import MONID_TOOL_NAMES
 from puffo_agent.mcp.puffo_core_server import (
     _capture_tool_surface,
@@ -9,7 +11,7 @@ from puffo_agent.mcp.puffo_core_server import (
 )
 from puffo_agent.portal.daemon import (
     _mcp_fingerprint_path,
-    _respawn_codex_on_mcp_change_at_startup,
+    _record_mcp_fingerprint_at_startup,
 )
 from puffo_agent.portal.state import (
     AgentConfig,
@@ -43,9 +45,6 @@ def test_fingerprint_is_stable_and_hex():
 
 
 def test_monid_gate_moves_fingerprint_and_toggles_exactly_monid(monkeypatch):
-    # The bug: enabling monid left the fingerprint unchanged (it was computed
-    # under a dummy, always-monid-disabled config), so cached codex sessions
-    # never reloaded and the model kept a monid-less tool list.
     monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "false")
     off_fp, off_surface = mcp_tool_fingerprint(), set(_capture_tool_surface())
     monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "true")
@@ -56,17 +55,14 @@ def test_monid_gate_moves_fingerprint_and_toggles_exactly_monid(monkeypatch):
 
 
 def test_fingerprint_surface_covers_memory_family(monkeypatch):
-    # The memory tools were never registered into the fingerprint, so a memory
-    # tool change was invisible. Guard that the family is now covered.
     monkeypatch.setenv("PUFFO_MONID_TOOLS_ENABLED", "true")
     surface = set(_capture_tool_surface())
     assert {"create_note", "read_memory_file", "search_memory"} <= surface
 
 
 def test_captured_tool_schema_is_address_free_and_captures_doc():
-    # Docstring + param schema (name/required) feed the hash; default *values*
-    # must not — a sentinel default would leak a process address and make the
-    # fingerprint differ every restart, spuriously rotating every session.
+    # default *values* must not feed the hash: a sentinel default would leak a
+    # process address and move the fingerprint every restart
     sentinel = object()
 
     def sample(a: str, b: int = 5, c=sentinel):
@@ -83,59 +79,45 @@ def test_captured_tool_schema_is_address_free_and_captures_doc():
     assert "0x" not in json.dumps(schema)
 
 
-def test_first_run_records_fingerprint_no_respawn(tmp_path, monkeypatch):
+def test_first_run_records_fingerprint(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     c = _agent("codex-1", kind="cli-local", harness="codex")
     assert not _mcp_fingerprint_path().exists()
-    _respawn_codex_on_mcp_change_at_startup()
+    _record_mcp_fingerprint_at_startup()
     assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()
     assert not _has_session_flag(c)
 
 
-def test_unchanged_fingerprint_no_respawn(tmp_path, monkeypatch):
+def test_unchanged_fingerprint_is_quiet(tmp_path, monkeypatch, caplog):
     _home(tmp_path, monkeypatch)
     c = _agent("codex-1", kind="cli-local", harness="codex")
     _mcp_fingerprint_path().write_text(mcp_tool_fingerprint() + "\n", encoding="utf-8")
-    _respawn_codex_on_mcp_change_at_startup()
+    with caplog.at_level(logging.INFO, logger="puffo_agent.portal.daemon"):
+        _record_mcp_fingerprint_at_startup()
     assert not _has_session_flag(c)
+    assert "mcp tool surface changed" not in caplog.text
 
 
-def test_changed_fingerprint_respawns_only_supported_codex_runtime(
-    tmp_path, monkeypatch,
-):
+def test_changed_fingerprint_preserves_every_session(tmp_path, monkeypatch, caplog):
+    """A tool-surface change used to rotate every cli-local codex session,
+    silently discarding agent context on each release; it must only log."""
     _home(tmp_path, monkeypatch)
-    codex_local = _agent("codex-local", kind="cli-local", harness="codex")
-    codex_docker = _agent("codex-docker", kind="cli-docker", harness="codex")
-    claude_local = _agent("claude-local", kind="cli-local", harness="claude-code")
-    ws_agent = _agent("ws-agent", kind="ws-local", harness="codex")
+    agents = [
+        _agent("codex-local", kind="cli-local", harness="codex"),
+        _agent("codex-docker", kind="cli-docker", harness="codex"),
+        _agent("claude-local", kind="cli-local", harness="claude-code"),
+    ]
     _mcp_fingerprint_path().write_text("STALE\n", encoding="utf-8")
 
-    _respawn_codex_on_mcp_change_at_startup()
+    with caplog.at_level(logging.INFO, logger="puffo_agent.portal.daemon"):
+        _record_mcp_fingerprint_at_startup()
 
-    assert _has_session_flag(codex_local)
-    assert not _has_session_flag(codex_docker)
-    assert not _has_session_flag(claude_local)
-    assert not _has_session_flag(ws_agent)
+    assert not any(_has_session_flag(cfg) for cfg in agents)
     assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()
+    assert "native sessions preserved" in caplog.text
 
 
-def test_changed_fingerprint_skips_unloadable_agent(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    good = _agent("codex-good", kind="cli-local", harness="codex")
-    # A broken agent.yml must be skipped, not crash the sweep.
-    from puffo_agent.portal.state import agent_yml_path
-    bad = agent_yml_path("codex-bad")
-    bad.parent.mkdir(parents=True, exist_ok=True)
-    bad.write_text("::: not valid yaml :::", encoding="utf-8")
-    _mcp_fingerprint_path().write_text("STALE\n", encoding="utf-8")
-
-    _respawn_codex_on_mcp_change_at_startup()
-
-    assert _has_session_flag(good)
-    assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()
-
-
-def test_respawn_survives_fingerprint_failure(tmp_path, monkeypatch):
+def test_record_survives_fingerprint_failure(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     from puffo_agent.mcp import puffo_core_server as s
 
@@ -143,6 +125,12 @@ def test_respawn_survives_fingerprint_failure(tmp_path, monkeypatch):
         raise RuntimeError("fingerprint blew up")
 
     monkeypatch.setattr(s, "mcp_tool_fingerprint", _boom)
-    # Best-effort: return without raising and without recording a fingerprint.
-    _respawn_codex_on_mcp_change_at_startup()
+    _record_mcp_fingerprint_at_startup()
     assert not _mcp_fingerprint_path().exists()
+
+
+def test_unreadable_fingerprint_file_is_rewritten(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    _mcp_fingerprint_path().mkdir()
+    _record_mcp_fingerprint_at_startup()
+    assert _mcp_fingerprint_path().is_dir()

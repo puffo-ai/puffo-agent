@@ -419,6 +419,16 @@ class StandardWorkerRun:
                 "native_session_harness", ""
             ),
         )
+        logger.info(
+            "agent %s: native session selection: source=%s selected=%s "
+            "persisted=%s persisted_harness=%s harness=%s",
+            paths.agent_id,
+            prepared.migration_source,
+            prepared.native_session_id or "<fresh>",
+            persisted.get("native_session_id", "") or "<none>",
+            persisted.get("native_session_harness", "") or "<none>",
+            prepared.harness_name,
+        )
         try:
             return await self._bind_driver_runtime(
                 outbox, prepared, persisted

@@ -68,7 +68,6 @@ from .state import (
     refresh_model_flag_path,
     refresh_provider_auth_flag_path,
     refresh_runtime_flag_path,
-    refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
     shared_fs_dir,
@@ -1182,7 +1181,7 @@ async def _prepare_workers_at_startup() -> None:
     """Finish worker prerequisites without blocking control-plane readiness."""
     started = time.perf_counter()
     try:
-        await asyncio.to_thread(_respawn_codex_on_mcp_change_at_startup)
+        await asyncio.to_thread(_record_mcp_fingerprint_at_startup)
     except Exception:  # noqa: BLE001 - preparation is best-effort
         logger.exception("startup: worker preparation failed; continuing")
     logger.info(
@@ -1191,10 +1190,13 @@ async def _prepare_workers_at_startup() -> None:
     )
 
 
-def _respawn_codex_on_mcp_change_at_startup() -> None:
-    """Rotate Codex sessions when their cached MCP surface changed."""
-    import json
+def _record_mcp_fingerprint_at_startup() -> None:
+    """Persist the MCP tool fingerprint; a change is informational only.
 
+    Codex loads MCP servers per process (openai/codex#7767), and every worker
+    spawns a fresh process at daemon start, so a resumed thread already sees
+    the new surface. Rotating sessions here only discarded agent context.
+    """
     try:
         from ..mcp.puffo_core_server import mcp_tool_fingerprint
 
@@ -1211,26 +1213,12 @@ def _respawn_codex_on_mcp_change_at_startup() -> None:
         logger.warning("startup: couldn't read mcp fingerprint: %s", exc)
         previous = ""
     if previous and previous != current:
-        for agent_id in discover_agents():
-            try:
-                cfg = AgentConfig.load(agent_id)
-            except Exception:  # noqa: BLE001 - one broken config is isolated
-                continue
-            if cfg.runtime.kind != "cli-local" or cfg.runtime.harness != "codex":
-                continue
-            try:
-                flag = refresh_session_flag_path(cfg.resolve_workspace_dir())
-                flag.parent.mkdir(parents=True, exist_ok=True)
-                flag.write_text(
-                    json.dumps({"requested_at": int(time.time())}) + "\n",
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                logger.warning(
-                    "startup: couldn't rotate codex session for %s: %s",
-                    agent_id,
-                    exc,
-                )
+        logger.info(
+            "startup: mcp tool surface changed (%s -> %s); runtimes pick it "
+            "up on their fresh process, native sessions preserved",
+            previous[:12],
+            current[:12],
+        )
     try:
         path.write_text(current + "\n", encoding="utf-8")
     except OSError as exc:

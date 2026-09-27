@@ -1810,6 +1810,12 @@ async def _process_refresh_flags(
                 exc,
             )
 
+    if session_seen:
+        logger.warning(
+            "agent %s: session refresh requested; dropping the native "
+            "provider session and its context",
+            agent_id,
+        )
     try:
         await adapter.reload(
             new_prompt if new_prompt is not None else puffo.system_prompt,
