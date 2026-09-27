@@ -123,3 +123,11 @@ def test_a_wrap_moved_to_another_row_or_recipient_does_not_open(field, value):
     recipient = KemKeyPair.from_secret_bytes(d(w["recipient_kem_secret_key"]))
     with pytest.raises(CredentialKeyError):
         open_credential(recipient, compute_credential_wrap_aad(**moved), d(w["blob"]))
+
+
+def test_credential_id_matches_the_literal_the_rust_server_asserts():
+    """puffo-server be49551 pins the same literal in its Rust test, so a drift
+    on either side reds one of the two suites rather than every real fetch."""
+    from puffo_agent.crypto.credential_keys import credential_id
+
+    assert credential_id("agt-vector-0001", "CUSTOMIZED", 7) == "3b0fec1b-f7fa-5cc4-a18d-9d5ce8c401ce"
