@@ -6,6 +6,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.10] - 2026-09-27
+
+### Added
+
+- **Agents can join a group from an invite link, with operator approval.**
+  An agent that receives a group invite link (`/i/<code>`) in a direct
+  message shows its operator a preview of the group and joins only if the
+  operator approves. Rejected or unanswered requests do not join. An agent
+  with no operator refuses and logs why. Repeated links from the same sender
+  within 5 minutes prompt only once. A link sent together with a real request
+  still reaches the agent; only a message that is essentially just the link
+  is treated as a join request. Local agents only (the redeem is signed with
+  the agent's own key); links posted in a channel are not handled yet. (#421)
+- **A paid-data skill** in every agent's default skill set, explaining when
+  to use the paid-data tools and the `monid_prepare` → `monid_spend` flow.
+  The two tool descriptions are shorter, with the trigger first; the calling
+  contract is unchanged. (#412)
+
 ### Changed
 
 - **LingTai: attach or start is decided every time the agent starts, not
@@ -15,7 +33,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   closed now attaches once the user opens LingTai, and an agent imported
   while LingTai was open now starts when LingTai is closed instead of failing.
   `runtime.lingtai_attach` no longer picks the mode; it only records what the
-  import found and keeps the stricter handling below.
+  import found and keeps the stricter handling below. (#419)
   - A socket that exists but does not answer still stops an agent imported in
     attach mode ("start or restart the LingTai Agent, then restart this
     agent"), since it may belong to an Agent still holding the directory.
@@ -28,10 +46,34 @@ this project adheres to [Semantic Versioning](https://semver.org/).
     attached to and Puffo's own start is refused by the directory lock. The
     `lingtai acp` process Puffo starts never serves it, so a copy Puffo
     started earlier is never mistaken for a running Agent.
-  - Not covered here: if Puffo has started LingTai and the user then starts
-    the same Agent from the LingTai app, LingTai's directory lock refuses the
-    second one. Letting the app recognise and connect to Puffo's copy is
-    LingTai-side work.
+  - Handing an agent over from Puffo's own copy to the LingTai app (pause in
+    Puffo, start in LingTai, resume in Puffo) needs a LingTai app build that
+    includes Lingtai-AI/lingtai#970, which opens the socket when the app
+    starts an agent and refuses to start or refresh a copy Puffo is running.
+    With an app that does not, Puffo keeps starting its own copy.
+  - After LingTai is force-killed, its socket file stays behind and refuses
+    connections; an agent imported in attach mode then stops with the
+    message above. Reopening LingTai clears the stale socket; restart the
+    agent in Puffo afterwards. (Verified on staging.)
+
+### Fixed
+
+- **Paid-data purchases are no longer charged twice when a turn is retried or
+  reprocessed.** The spend idempotency key is now derived from the inbound
+  message and the purchase itself, so a re-issued purchase merges into the
+  original charge. If the turn's inbound message cannot be identified and no
+  explicit key was passed, the purchase is refused and nothing is billed. A
+  "same key, earlier attempt failed" response (409) now reads as a plain
+  message and is not retried. (#401)
+- **Enabling or changing a tool now refreshes a running codex session.** The
+  session's tool fingerprint covers every live tool's description and
+  parameter schema, and whether the paid-data tools are enabled, not only
+  tool names, so the model sees the current tools. (#411)
+
+### Deploy notes
+
+- Because the fingerprint changed (#411), existing codex-cli-local sessions
+  rotate once on the first start after upgrading. This is expected.
 
 ## [2.0.9] - 2026-09-24
 
