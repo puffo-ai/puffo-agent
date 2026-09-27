@@ -131,3 +131,48 @@ def test_credential_id_matches_the_literal_the_rust_server_asserts():
     from puffo_agent.crypto.credential_keys import credential_id
 
     assert credential_id("agt-vector-0001", "CUSTOMIZED", 7) == "3b0fec1b-f7fa-5cc4-a18d-9d5ce8c401ce"
+
+
+# Sealed by the Rust server (puffo-server cd067dc CI), to the recipient in
+# V["derivation"]. The file is kept byte-for-byte as delivered.
+_RUST_PATH = pathlib.Path(__file__).parent / "vectors/rust_credential_vector_cd067dc.json"
+R = json.loads(_RUST_PATH.read_text())
+
+
+def _rust_recipient():
+    recipient = KemKeyPair.from_secret_bytes(d(V["derivation"]["kem_secret_key"]))
+    assert recipient.public_key_bytes() == d(R["recipient_kem_public_key"])
+    return recipient
+
+
+def test_a_rust_sealed_wrap_opens_under_an_aad_the_daemon_computes_itself():
+    """The AAD comes from this module, not from the file's hex, so an AAD
+    layout that drifted on either side fails here rather than in production."""
+    assert hashlib.sha256(_RUST_PATH.read_bytes()).hexdigest() == (
+        "c9127965378ecfade172520cac240a68bd3a64317b7cef85a79c533f7396aa7a"
+    )
+    aad = compute_credential_wrap_aad(**R["aad_fields"])
+    assert aad.hex() == R["aad_hex"]
+    assert open_credential(_rust_recipient(), aad, d(R["blob"])).decode() == R["plaintext_utf8"]
+
+
+def _flip_last_aad_byte(aad, blob):
+    return aad[:-1] + bytes([aad[-1] ^ 1]), blob
+
+
+def _swap_enc_and_ct(aad, blob):
+    return aad, blob[32:] + blob[:32]
+
+
+@pytest.mark.parametrize("damage", [_flip_last_aad_byte, _swap_enc_and_ct])
+def test_the_rust_sealed_wrap_does_not_open_once_damaged(damage):
+    aad, blob = damage(compute_credential_wrap_aad(**R["aad_fields"]), d(R["blob"]))
+    with pytest.raises(CredentialKeyError):
+        open_credential(_rust_recipient(), aad, blob)
+
+
+def test_the_rust_id_vector_matches_the_daemons_derivation():
+    from puffo_agent.crypto.credential_keys import credential_id
+
+    v = R["id_vector"]
+    assert credential_id(v["owner_slug"], v["credential_type"], v["index"]) == v["id"]
