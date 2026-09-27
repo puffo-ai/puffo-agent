@@ -1051,8 +1051,15 @@ def _monid_result_data(native: Any) -> dict | None:
         return None
     result = native.get("result")
     if isinstance(result, dict):
-        return result
-    text = _codex_result_text(result)
+        # An MCP result envelope carries the monid JSON as text under content/contentItems — unwrap
+        # it (the codex analogue of claude's ``{"result": "<json>"}`` double-encoding). A dict that
+        # is already the monid object (no envelope) is used as-is.
+        if "content" in result or "contentItems" in result:
+            text = _codex_result_text(result)
+        else:
+            return result
+    else:
+        text = _codex_result_text(result)
     if not text:
         return None
     try:
