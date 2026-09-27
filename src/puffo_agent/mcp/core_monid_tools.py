@@ -101,16 +101,25 @@ def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
 
         Use it for data free search can't reliably get: social posts, live
         prices, company/people records, anything login/paywalled. Say what you
-        want in `query`; the result gives `provider` and `endpoint` (pass
-        straight to `monid_spend`), a `price` quote (in micro-dollars), and the
-        `input` schema — build your `input` by filling the exact envelope(s) it
-        declares (`body` / `queryParams` / `pathParams`).
+        want in `query`; the result is a ranked `candidates` list — each with a
+        `provider`, `endpoint`, a `price` quote (in micro-dollars), an `input`
+        schema, and a `description`.
+
+        Read the descriptions and pick the candidate that matches your INTENT,
+        not just the first one — e.g. for "a user's latest posts" prefer a
+        user-timeline / by-username endpoint over a single-item-by-id one. Then
+        pass THAT candidate's `provider`/`endpoint` to `monid_spend` and build
+        `input` by filling the exact envelope(s) its schema declares (`body` /
+        `queryParams` / `pathParams`). The top-level fields mirror the first
+        candidate for convenience.
 
         Args:
             query: What data you want, in natural language.
-            limit: How many candidate capabilities to consider (1-25).
+            limit: How many candidates to return (default 5; capped at 8).
 
-        If nothing matches, the data isn't available through Monid. You may
+        If none of the candidates fit, try rephrasing `query` once — a different
+        wording often surfaces a better-matching capability. Only if nothing
+        fits after that is the data unavailable through Monid; you may then
         answer from your own knowledge or the web, but you MUST label it as NOT
         a Monid result — never imply non-Monid data came from Monid.
         """
@@ -166,8 +175,8 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
         never hold your own Monid key.
 
         Args:
-            provider: From `monid_prepare`.
-            endpoint: From `monid_prepare`.
+            provider: From the `monid_prepare` candidate you chose.
+            endpoint: From the `monid_prepare` candidate you chose.
             input: The payload built to the prepared schema's envelope(s):
                 `{"body": {...}}` / `{"queryParams": {...}}` /
                 `{"pathParams": {...}}`. On a shape mismatch the error returns

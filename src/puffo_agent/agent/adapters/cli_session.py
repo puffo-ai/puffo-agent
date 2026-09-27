@@ -321,18 +321,13 @@ def _tool_result_text(content: Any) -> str:
     return ""
 
 
-def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
-    """Read monid_prepare's quoted unit price from its tool-result JSON, as
-    ``(unit_price_micro, price_type)``, or ``None`` if the shape doesn't match.
-    Read-only; never reflects a settled charge (that is monid_spend's cost)."""
-    text = _tool_result_text(content)
-    if not text:
+def _monid_price_of(entry: Any) -> tuple[int, str | None] | None:
+    """Read ``(unit_price_micro, price_type)`` from one capability projection (a prepare candidate
+    or the top-level object), or ``None`` when the price shape doesn't match. Strictly fail-safe:
+    a missing/non-int/bool/negative micro yields ``None`` (never a fake 0)."""
+    if not isinstance(entry, dict):
         return None
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    price = data.get("price") if isinstance(data, dict) else None
+    price = entry.get("price")
     if not isinstance(price, dict):
         return None
     micro = price.get("unit_price_micro")
@@ -340,6 +335,39 @@ def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
         return None
     price_type = price.get("price_type")
     return micro, price_type if isinstance(price_type, str) else None
+
+
+def _extract_monid_candidate_prices(
+    content: Any,
+) -> dict[tuple[str, str], tuple[int, str | None]]:
+    """Map ``(provider, endpoint) -> (unit_price_micro, price_type)`` from a monid_prepare result's
+    ``candidates`` shortlist, so the price of whichever candidate the model later spends on can be
+    emitted. The top-level object is included too — it mirrors ``candidates[0]`` and is the whole
+    payload for an older single-quote response. Read-only; an entry with an unusable price/shape is
+    skipped. Never reflects a settled charge (that is monid_spend's cost)."""
+    text = _tool_result_text(content)
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    candidates = data.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    prices: dict[tuple[str, str], tuple[int, str | None]] = {}
+    for entry in [data, *candidates]:
+        if not isinstance(entry, dict):
+            continue
+        provider = entry.get("provider")
+        endpoint = entry.get("endpoint")
+        if not isinstance(provider, str) or not isinstance(endpoint, str):
+            continue
+        price = _monid_price_of(entry)
+        if price is not None:
+            prices.setdefault((provider, endpoint), price)
+    return prices
 
 
 class ClaudeSession:
@@ -407,8 +435,12 @@ class ClaudeSession:
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
-        # monid_prepare tool_use ids awaiting their result (to read the price).
+        # monid_prepare tool_use ids awaiting their result (to read the candidate prices).
         self._pending_monid_prepare_ids: set[str] = set()
+        # (provider, endpoint) -> (unit_price_micro, price_type) from this turn's monid_prepare
+        # candidate shortlist(s); read when the model spends, to emit the SELECTED capability's
+        # price for the working-row estimate (not the top-ranked one).
+        self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
         self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -1219,6 +1251,7 @@ class ClaudeSession:
         self._active_provider_turn_id = provider_turn_id
         self._active_puffo_tool_calls.clear()
         self._pending_monid_prepare_ids.clear()
+        self._monid_candidate_prices.clear()
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
@@ -1231,6 +1264,7 @@ class ClaudeSession:
             ]
             self._active_puffo_tool_calls.clear()
             self._pending_monid_prepare_ids.clear()
+            self._monid_candidate_prices.clear()
 
     async def _one_turn_inner(
         self,
@@ -1375,17 +1409,19 @@ class ClaudeSession:
         elif event_type == "system":
             self._update_session_from_event(event)
         elif event_type == "user":
-            self._project_monid_price(event, reporter)
+            self._capture_monid_candidate_prices(event)
         elif event_type == "result":
             self._update_session_from_event(event)
             self._project_result_event(event, state)
             return True
         return False
 
-    def _project_monid_price(self, event: dict[str, Any], reporter: Any) -> None:
-        """Emit monid_prepare's quoted price as a second tool_use for the
-        working row's estimate. Read-only — never the spend path. A later
-        recorded_at keeps it distinct from the prepare call."""
+    def _capture_monid_candidate_prices(self, event: dict[str, Any]) -> None:
+        """On a tracked monid_prepare result, remember each candidate's quoted price keyed by
+        (provider, endpoint). Nothing is emitted here: the price is emitted later, when the model
+        spends on the capability it chose (:meth:`_emit_monid_spend_price`), so the working-row
+        estimate reflects the SELECTED candidate rather than the top-ranked one. Read-only — never
+        the spend/charge path."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
@@ -1396,19 +1432,29 @@ class ClaudeSession:
             self._pending_monid_prepare_ids.discard(tool_use_id)
             if block.get("is_error") is True:
                 continue
-            price = _extract_monid_unit_price(block.get("content"))
-            if price is None:
-                continue
-            payload: dict[str, Any] = {
-                "tool": "monid_prepare",
-                "unit_price_micro": price[0],
-            }
-            if price[1]:
-                payload["price_type"] = price[1]
-            spawn(
-                reporter.emit(self.agent_id, "tool_use", payload),
-                name="reporter.emit:monid_price",
+            self._monid_candidate_prices.update(
+                _extract_monid_candidate_prices(block.get("content"))
             )
+
+    def _emit_monid_spend_price(self, tool_input: dict, reporter: Any) -> None:
+        """When the model spends, emit the SELECTED capability's quoted price (remembered from this
+        turn's monid_prepare candidates) as a second monid_spend tool_use, so the working-row
+        estimate shows what THIS fetch will cost. Read-only status echo — the authoritative charge
+        is billing's monid_spend result, never this."""
+        provider = tool_input.get("provider")
+        endpoint = tool_input.get("endpoint")
+        if not isinstance(provider, str) or not isinstance(endpoint, str):
+            return
+        price = self._monid_candidate_prices.get((provider, endpoint))
+        if price is None:
+            return
+        payload: dict[str, Any] = {"tool": "monid_spend", "unit_price_micro": price[0]}
+        if price[1]:
+            payload["price_type"] = price[1]
+        spawn(
+            reporter.emit(self.agent_id, "tool_use", payload),
+            name="reporter.emit:monid_price",
+        )
 
     async def _project_assistant_block(
         self,
@@ -1453,6 +1499,8 @@ class ClaudeSession:
                     "root_id": str(tool_input.get("root_id", "")),
                 }
             )
+        if name == "mcp__puffo__monid_spend":
+            self._emit_monid_spend_price(tool_input, reporter)
         self._track_puffo_tool(block, name, tool_input)
         if self.audit is not None:
             self.audit.write(
