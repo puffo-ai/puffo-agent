@@ -1096,6 +1096,23 @@ def _monid_candidate_prices_from_native(
     return prices
 
 
+def _monid_estimate_price_from_native(native: Any) -> tuple[int, str | None] | None:
+    """The top-match capability's price from a monid_prepare result (top-level == candidates[0]) —
+    the wait-time estimate. Fail-safe → ``None`` on bad shape / missing / non-int·bool·negative
+    micro. Read-only. Codex result shape."""
+    data = _monid_result_data(native)
+    if data is None:
+        return None
+    price = data.get("price")
+    if not isinstance(price, dict):
+        return None
+    micro = price.get("unit_price_micro")
+    if not isinstance(micro, int) or isinstance(micro, bool) or micro < 0:
+        return None
+    price_type = price.get("price_type")
+    return micro, price_type if isinstance(price_type, str) else None
+
+
 def _monid_spend_target(native: Any) -> tuple[str, str] | None:
     """The ``(provider, endpoint)`` a monid_spend targeted, from the codex native's echoed
     ``arguments`` — to look up the selected candidate's price. ``None`` if not a clean string pair."""
@@ -1179,11 +1196,28 @@ class _LegacyStatusProjector:
         if kind == "turn.tool_completed":
             label = _normalized_tool_label(str(data.get("label") or ""))
             if label == "monid_prepare":
-                # Remember candidate prices; emit is deferred to the spend below so the estimate is
-                # the SELECTED candidate, not the top-ranked one. Read-only; never the spend path.
+                # Remember candidate prices, and emit the top-match price as a wait-time estimate so
+                # the working row shows a cost while the model is still deciding (or never spends).
+                # The spend below re-emits the SELECTED candidate's price to refresh it. Read-only;
+                # never the spend path.
                 self._monid_candidate_prices.update(
                     _monid_candidate_prices_from_native(event.native_diagnostic)
                 )
+                ref = str(data.get("tool_call_ref") or "")
+                if ref and ref in self._priced_tools:
+                    return
+                estimate = _monid_estimate_price_from_native(event.native_diagnostic)
+                if estimate is None:
+                    return
+                if ref:
+                    self._priced_tools.add(ref)
+                estimate_payload: dict[str, Any] = {
+                    "tool": "monid_prepare",
+                    "unit_price_micro": estimate[0],
+                }
+                if estimate[1]:
+                    estimate_payload["price_type"] = estimate[1]
+                _emit_status(self._agent_id, "tool_use", estimate_payload)
                 return
             if label != "monid_spend":
                 return

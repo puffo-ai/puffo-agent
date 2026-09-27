@@ -368,6 +368,21 @@ def _extract_monid_candidate_prices(
     return prices
 
 
+def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None:
+    """The top-match capability's price from a monid_prepare result — the estimate to show during
+    the wait, before the model picks a candidate (top-level == candidates[0]). Bad shape → ``None``."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _monid_price_of(data)
+
+
 class ClaudeSession:
     def __init__(
         self,
@@ -1406,17 +1421,18 @@ class ClaudeSession:
         elif event_type == "system":
             self._update_session_from_event(event)
         elif event_type == "user":
-            self._capture_monid_candidate_prices(event)
+            self._capture_monid_candidate_prices(event, reporter)
         elif event_type == "result":
             self._update_session_from_event(event)
             self._project_result_event(event, state)
             return True
         return False
 
-    def _capture_monid_candidate_prices(self, event: dict[str, Any]) -> None:
-        """Remember a tracked monid_prepare result's candidate prices. Emitting is deferred to
-        :meth:`_emit_monid_spend_price` so the estimate reflects the SELECTED candidate, not the
-        top-ranked one. Read-only."""
+    def _capture_monid_candidate_prices(self, event: dict[str, Any], reporter: Any) -> None:
+        """Remember a tracked monid_prepare result's candidate prices AND emit the top-match price as
+        a wait-time estimate, so the working row shows a cost while the model is still deciding (or
+        even if it never spends). A later :meth:`_emit_monid_spend_price` re-emits the SELECTED
+        candidate's price to refresh it. Read-only — the real charge is billing's."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
@@ -1430,6 +1446,22 @@ class ClaudeSession:
             self._monid_candidate_prices.update(
                 _extract_monid_candidate_prices(block.get("content"))
             )
+            self._emit_monid_estimate_price(block.get("content"), reporter)
+
+    def _emit_monid_estimate_price(self, content: Any, reporter: Any) -> None:
+        """Emit the top-match capability's price from a monid_prepare result as a monid_prepare
+        ``tool_use``, so the working row shows an estimate during the wait. The FE keeps the latest
+        price, so a subsequent spend refreshes it to the selected candidate. Read-only echo."""
+        estimate = _extract_monid_estimate_price(content)
+        if estimate is None:
+            return
+        payload: dict[str, Any] = {"tool": "monid_prepare", "unit_price_micro": estimate[0]}
+        if estimate[1]:
+            payload["price_type"] = estimate[1]
+        spawn(
+            reporter.emit(self.agent_id, "tool_use", payload),
+            name="reporter.emit:monid_estimate",
+        )
 
     def _emit_monid_spend_price(self, tool_input: dict, reporter: Any) -> None:
         """Emit the SELECTED capability's quoted price (from this turn's remembered candidates) as a

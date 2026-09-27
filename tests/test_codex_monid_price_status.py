@@ -1,9 +1,9 @@
-"""The codex path of the estimated-monid-cost surface: the legacy status
-projector remembers each monid_prepare candidate's quoted price off a
-TOOL_COMPLETED event, then when the model spends it emits the SELECTED
-capability's price as a second ``tool_use`` on the same status stream the
-working row reads. Parallel to the Claude side (cli_session); read-only, never
-the spend path."""
+"""The codex path of the estimated-monid-cost surface: off a TOOL_COMPLETED
+event the legacy status projector emits the top-match price at monid_prepare as
+a wait-time estimate (and remembers every candidate), then re-emits the SELECTED
+capability's price when the model spends — both as ``tool_use`` events on the
+status stream the working row reads. Parallel to the Claude side (cli_session);
+read-only, never the spend path."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from puffo_agent.agent.harness.runtime.local_runtime import (
     _LegacyStatusProjector,
     _codex_result_text,
     _monid_candidate_prices_from_native,
+    _monid_estimate_price_from_native,
     _monid_spend_target,
 )
 
@@ -103,6 +104,17 @@ def test_candidate_prices_from_native_is_fail_safe_across_shapes() -> None:
     assert _monid_candidate_prices_from_native({"result": bad}) == {}
 
 
+def test_estimate_price_from_native_reads_top_match() -> None:
+    # The wait-time estimate is the top-level (best-match == candidates[0]) price.
+    assert _monid_estimate_price_from_native({"result": CANDIDATES_JSON}) == (1500, "PER_CALL")
+    assert _monid_estimate_price_from_native({"result": CANDIDATES}) == (1500, "PER_CALL")
+    # fail-safe: errored / bad shape / no clean top-level price → None
+    assert _monid_estimate_price_from_native({"result": CANDIDATES_JSON, "is_error": True}) is None
+    assert _monid_estimate_price_from_native({"result": "not json"}) is None
+    assert _monid_estimate_price_from_native({"result": {"provider": "x", "endpoint": "y"}}) is None
+    assert _monid_estimate_price_from_native(None) is None
+
+
 def test_spend_target_reads_arguments() -> None:
     assert _monid_spend_target({"arguments": {"provider": "p", "endpoint": "/e"}}) == ("p", "/e")
     assert _monid_spend_target({"arguments": {"provider": "p"}}) is None  # endpoint missing
@@ -153,13 +165,15 @@ def test_projector_emits_selected_candidate_price_on_spend(monkeypatch) -> None:
             ref="s1",
         ),
     )
+    # prepare emits the top-match wait-time estimate; the spend then refreshes to the selected one.
     assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
         ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 3000, "price_type": "PER_RESULT"}),
     ]
 
 
-def test_projector_prepare_alone_emits_nothing(monkeypatch) -> None:
-    # prepare only remembers prices; without a spend nothing is emitted (no purchase = no cost).
+def test_projector_prepare_emits_top_match_estimate(monkeypatch) -> None:
+    # prepare alone emits the top-match price as the wait-time estimate (shown even if no spend).
     calls: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
         local_runtime,
@@ -168,10 +182,12 @@ def test_projector_prepare_alone_emits_nothing(monkeypatch) -> None:
     )
     projector = _LegacyStatusProjector("a1")
     _drive(projector, _completed("monid_prepare", {"result": CANDIDATES_JSON}, ref="p1"))
-    assert calls == []
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+    ]
 
 
-def test_projector_spend_price_is_idempotent_per_tool_ref(monkeypatch) -> None:
+def test_projector_price_emits_are_idempotent_per_tool_ref(monkeypatch) -> None:
     calls: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
         local_runtime,
@@ -185,9 +201,12 @@ def test_projector_spend_price_is_idempotent_per_tool_ref(monkeypatch) -> None:
         {"arguments": {"provider": "tikhub", "endpoint": "/fetch_tweet_detail"}},
         ref="s1",
     )
-    # A re-delivered spend frame for the same tool ref must not re-emit.
-    _drive(projector, prepare, spend, spend)
-    assert len(calls) == 1
+    # Re-delivered prepare/spend frames for the same tool ref must not re-emit.
+    _drive(projector, prepare, prepare, spend, spend)
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+    ]
 
 
 def test_projector_ignores_errored_prepare_and_unknown_spend_target(monkeypatch) -> None:

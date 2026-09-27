@@ -1,8 +1,8 @@
-"""The inline working row shows an estimated monid lookup cost, fed by a
-status-stream emit of the SELECTED capability's quoted unit price. monid_prepare
-now returns a ranked candidate shortlist, so the price is remembered per
-candidate at prepare time and emitted when the model spends on the one it chose
-(read-only; never the spend/charge path)."""
+"""The inline working row shows an estimated monid lookup cost, fed by
+status-stream price emits. monid_prepare returns a ranked candidate shortlist:
+at prepare time the top-match price is emitted as a wait-time estimate (and every
+candidate is remembered); when the model spends, the SELECTED candidate's price is
+re-emitted to refresh the row. Read-only throughout; never the spend/charge path."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from puffo_agent.agent.adapters.cli_session import (
     ClaudeSession,
     _extract_monid_candidate_prices,
+    _extract_monid_estimate_price,
     _monid_price_of,
 )
 
@@ -114,28 +115,66 @@ def test_extract_candidate_prices_rejects_bad_shapes() -> None:
     assert _extract_monid_candidate_prices(bad) == {}
 
 
-def test_capture_populates_map_for_tracked_prepare(tmp_path: Path) -> None:
+def test_extract_estimate_price_reads_top_match() -> None:
+    # The wait-time estimate is the top-level (best-match == candidates[0]) price.
+    assert _extract_monid_estimate_price([{"type": "text", "text": CANDIDATES_JSON}]) == (
+        1500,
+        "PER_CALL",
+    )
+    assert _extract_monid_estimate_price(CANDIDATES_JSON) == (1500, "PER_CALL")
+
+
+def test_extract_estimate_price_rejects_bad_shapes() -> None:
+    assert _extract_monid_estimate_price("") is None
+    assert _extract_monid_estimate_price("not json") is None
+    assert _extract_monid_estimate_price(json.dumps({"provider": "x", "endpoint": "y"})) is None
+    assert (
+        _extract_monid_estimate_price(json.dumps({"price": {"unit_price_micro": "10000"}})) is None
+    )
+
+
+def test_capture_populates_map_and_emits_estimate_for_tracked_prepare(tmp_path: Path) -> None:
     session = _session(tmp_path)
+    reporter = _RecordingReporter()
     session._pending_monid_prepare_ids.add("tu-1")
-    session._capture_monid_candidate_prices(_tool_result_event("tu-1", CANDIDATES_JSON))
+
+    async def drive() -> None:
+        session._capture_monid_candidate_prices(_tool_result_event("tu-1", CANDIDATES_JSON), reporter)
+        await asyncio.sleep(0)  # let the spawned estimate emit run
+
+    asyncio.run(drive())
+    # every candidate remembered for the eventual spend...
     assert session._monid_candidate_prices == {
         ("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL"),
         ("tikhub", "/fetch_user_tweet_replies"): (3000, "PER_RESULT"),
     }
-    # one-shot: the id is consumed so a later result can't re-capture it
+    # ...and the top-match price emitted now as the wait-time estimate
+    assert reporter.calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+    ]
+    # one-shot: the id is consumed so a later result can't re-capture/re-emit it
     assert "tu-1" not in session._pending_monid_prepare_ids
 
 
 def test_capture_ignores_untracked_and_error_results(tmp_path: Path) -> None:
     session = _session(tmp_path)
+    reporter = _RecordingReporter()
     session._pending_monid_prepare_ids.add("tu-err")
-    # Not a tracked monid_prepare id → nothing captured.
-    session._capture_monid_candidate_prices(_tool_result_event("tu-other", CANDIDATES_JSON))
-    # Tracked, but the prepare errored → nothing captured, id still consumed.
-    session._capture_monid_candidate_prices(
-        _tool_result_event("tu-err", CANDIDATES_JSON, is_error=True)
-    )
+
+    async def drive() -> None:
+        # Not a tracked monid_prepare id → nothing captured, nothing emitted.
+        session._capture_monid_candidate_prices(
+            _tool_result_event("tu-other", CANDIDATES_JSON), reporter
+        )
+        # Tracked, but the prepare errored → nothing captured/emitted, id still consumed.
+        session._capture_monid_candidate_prices(
+            _tool_result_event("tu-err", CANDIDATES_JSON, is_error=True), reporter
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
     assert session._monid_candidate_prices == {}
+    assert reporter.calls == []
     assert "tu-err" not in session._pending_monid_prepare_ids
 
 
