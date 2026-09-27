@@ -336,6 +336,31 @@ def _monid_price_of(entry: Any) -> tuple[int, str | None] | None:
     return micro, price_type if isinstance(price_type, str) else None
 
 
+def _monid_result_data(content: Any) -> dict[str, Any] | None:
+    """The monid capability object from a tool_result. Claude Code wraps an MCP result in a
+    ``{"result": "<stringified json>"}`` envelope, so the real provider/price/candidates live in
+    that inner string, not at the top level — unwrap it. An already-flat object (older single-quote
+    response) is used as-is. Bad shape → ``None``."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "result" in data:
+        inner = data["result"]
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except (ValueError, TypeError):
+                return None
+        return inner if isinstance(inner, dict) else None
+    return data
+
+
 def _extract_monid_candidate_prices(
     content: Any,
 ) -> dict[tuple[str, str], tuple[int, str | None]]:
@@ -343,14 +368,8 @@ def _extract_monid_candidate_prices(
     ``candidates`` (plus the top-level object, for an older single-quote response), so whichever
     candidate the model later spends on can have its price emitted. Read-only; bad-shape entries
     skipped."""
-    text = _tool_result_text(content)
-    if not text:
-        return {}
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(data, dict):
+    data = _monid_result_data(content)
+    if data is None:
         return {}
     candidates = data.get("candidates")
     candidates = candidates if isinstance(candidates, list) else []
@@ -371,14 +390,8 @@ def _extract_monid_candidate_prices(
 def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None:
     """The top-match capability's price from a monid_prepare result — the estimate to show during
     the wait, before the model picks a candidate (top-level == candidates[0]). Bad shape → ``None``."""
-    text = _tool_result_text(content)
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(data, dict):
+    data = _monid_result_data(content)
+    if data is None:
         return None
     return _monid_price_of(data)
 

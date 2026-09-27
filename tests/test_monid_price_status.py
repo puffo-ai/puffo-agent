@@ -15,29 +15,34 @@ from puffo_agent.agent.adapters.cli_session import (
     _extract_monid_candidate_prices,
     _extract_monid_estimate_price,
     _monid_price_of,
+    _monid_result_data,
 )
 
 # A candidate shortlist: the by-id endpoint ranks first, the user-timeline one second and dearer.
-CANDIDATES_JSON = json.dumps(
-    {
-        "provider": "tikhub",
-        "endpoint": "/fetch_tweet_detail",
-        "category": "general",
-        "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
-        "candidates": [
-            {
-                "provider": "tikhub",
-                "endpoint": "/fetch_tweet_detail",
-                "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
-            },
-            {
-                "provider": "tikhub",
-                "endpoint": "/fetch_user_tweet_replies",
-                "price": {"price_type": "PER_RESULT", "unit_price_micro": 3000},
-            },
-        ],
-    }
-)
+CANDIDATES = {
+    "provider": "tikhub",
+    "endpoint": "/fetch_tweet_detail",
+    "category": "general",
+    "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
+    "candidates": [
+        {
+            "provider": "tikhub",
+            "endpoint": "/fetch_tweet_detail",
+            "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
+        },
+        {
+            "provider": "tikhub",
+            "endpoint": "/fetch_user_tweet_replies",
+            "price": {"price_type": "PER_RESULT", "unit_price_micro": 3000},
+        },
+    ],
+}
+# The already-flat shape (older single-quote response).
+CANDIDATES_JSON = json.dumps(CANDIDATES)
+# The REAL shape Claude Code delivers: the monid JSON is double-encoded inside a
+# ``{"result": "<stringified json>"}`` envelope. Feeding the flat object instead of this is what
+# let the wrong-layer read ship green — the working row never emitted on live data.
+WRAPPED_JSON = json.dumps({"result": CANDIDATES_JSON})
 
 
 def _session(tmp_path: Path) -> ClaudeSession:
@@ -82,12 +87,14 @@ def test_price_of_reads_and_rejects_bad_shapes() -> None:
 
 
 def test_extract_candidate_prices_maps_every_candidate() -> None:
-    # Both content forms Claude Code emits: a list of text parts, or a bare string.
     expected = {
         ("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL"),
         ("tikhub", "/fetch_user_tweet_replies"): (3000, "PER_RESULT"),
     }
-    assert _extract_monid_candidate_prices([{"type": "text", "text": CANDIDATES_JSON}]) == expected
+    # The REAL double-encoded shape, in both content forms (text-parts list and bare string).
+    assert _extract_monid_candidate_prices([{"type": "text", "text": WRAPPED_JSON}]) == expected
+    assert _extract_monid_candidate_prices(WRAPPED_JSON) == expected
+    # The already-flat shape stays supported (defensive: both eaten).
     assert _extract_monid_candidate_prices(CANDIDATES_JSON) == expected
 
 
@@ -102,31 +109,52 @@ def test_extract_candidate_prices_falls_back_to_top_level_only() -> None:
 def test_extract_candidate_prices_rejects_bad_shapes() -> None:
     assert _extract_monid_candidate_prices("") == {}
     assert _extract_monid_candidate_prices("not json") == {}
-    # a candidate with an unusable price is skipped, not guessed
-    bad = json.dumps(
-        {
-            "candidates": [
-                {"provider": "a", "endpoint": "/1", "price": {"unit_price_micro": "10000"}},
-                {"provider": "b", "endpoint": "/2", "price": {"unit_price_micro": -1}},
-                {"provider": "c", "endpoint": "/3", "price": {}},
-            ]
-        }
-    )
-    assert _extract_monid_candidate_prices(bad) == {}
+    # a broken envelope (result not parseable to a dict) → {}
+    assert _extract_monid_candidate_prices(json.dumps({"result": "not json"})) == {}
+    # a candidate with an unusable price is skipped, not guessed — even through the real envelope
+    bad = {
+        "candidates": [
+            {"provider": "a", "endpoint": "/1", "price": {"unit_price_micro": "10000"}},
+            {"provider": "b", "endpoint": "/2", "price": {"unit_price_micro": -1}},
+            {"provider": "c", "endpoint": "/3", "price": {}},
+        ]
+    }
+    assert _extract_monid_candidate_prices(json.dumps(bad)) == {}
+    assert _extract_monid_candidate_prices(json.dumps({"result": json.dumps(bad)})) == {}
+
+
+def test_monid_result_data_unwraps_the_result_envelope() -> None:
+    # The real Claude Code envelope: the monid object is a JSON string under "result".
+    assert _monid_result_data(WRAPPED_JSON) == CANDIDATES
+    assert _monid_result_data([{"type": "text", "text": WRAPPED_JSON}]) == CANDIDATES
+    # An already-flat object (older shape) is used as-is.
+    assert _monid_result_data(CANDIDATES_JSON) == CANDIDATES
+    # A broken envelope (result present but not parseable to a dict) → None, never a wrong-layer read.
+    assert _monid_result_data(json.dumps({"result": "not json"})) is None
+    assert _monid_result_data(json.dumps({"result": 42})) is None
+    assert _monid_result_data("") is None
+    assert _monid_result_data("not json") is None
 
 
 def test_extract_estimate_price_reads_top_match() -> None:
-    # The wait-time estimate is the top-level (best-match == candidates[0]) price.
-    assert _extract_monid_estimate_price([{"type": "text", "text": CANDIDATES_JSON}]) == (
+    # The wait-time estimate is the top-level (best-match == candidates[0]) price — read through the
+    # real double-encoded envelope, in both content forms.
+    assert _extract_monid_estimate_price([{"type": "text", "text": WRAPPED_JSON}]) == (
         1500,
         "PER_CALL",
     )
+    assert _extract_monid_estimate_price(WRAPPED_JSON) == (1500, "PER_CALL")
+    # already-flat shape still works
     assert _extract_monid_estimate_price(CANDIDATES_JSON) == (1500, "PER_CALL")
 
 
 def test_extract_estimate_price_rejects_bad_shapes() -> None:
     assert _extract_monid_estimate_price("") is None
     assert _extract_monid_estimate_price("not json") is None
+    # a well-formed envelope whose inner json carries no price → None
+    assert (
+        _extract_monid_estimate_price(json.dumps({"result": json.dumps({"provider": "x"})})) is None
+    )
     assert _extract_monid_estimate_price(json.dumps({"provider": "x", "endpoint": "y"})) is None
     assert (
         _extract_monid_estimate_price(json.dumps({"price": {"unit_price_micro": "10000"}})) is None
@@ -139,7 +167,8 @@ def test_capture_populates_map_and_emits_estimate_for_tracked_prepare(tmp_path: 
     session._pending_monid_prepare_ids.add("tu-1")
 
     async def drive() -> None:
-        session._capture_monid_candidate_prices(_tool_result_event("tu-1", CANDIDATES_JSON), reporter)
+        # The real double-encoded shape the live harness receives.
+        session._capture_monid_candidate_prices(_tool_result_event("tu-1", WRAPPED_JSON), reporter)
         await asyncio.sleep(0)  # let the spawned estimate emit run
 
     asyncio.run(drive())
@@ -164,11 +193,11 @@ def test_capture_ignores_untracked_and_error_results(tmp_path: Path) -> None:
     async def drive() -> None:
         # Not a tracked monid_prepare id → nothing captured, nothing emitted.
         session._capture_monid_candidate_prices(
-            _tool_result_event("tu-other", CANDIDATES_JSON), reporter
+            _tool_result_event("tu-other", WRAPPED_JSON), reporter
         )
         # Tracked, but the prepare errored → nothing captured/emitted, id still consumed.
         session._capture_monid_candidate_prices(
-            _tool_result_event("tu-err", CANDIDATES_JSON, is_error=True), reporter
+            _tool_result_event("tu-err", WRAPPED_JSON, is_error=True), reporter
         )
         await asyncio.sleep(0)
 
