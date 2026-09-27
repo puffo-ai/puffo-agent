@@ -912,9 +912,7 @@ async def test_terminal_callback_failure_is_not_silently_dropped(tmp_path):
 
 @pytest.mark.asyncio
 async def test_effectless_quarantine_resolves_at_startup(tmp_path, monkeypatch):
-    """An idle-timeout quarantine whose provider stop is confirmed and whose
-    durable turn admitted no rows has nothing an operator retry could replay:
-    restart must lift it instead of parking the agent forever."""
+    """Idle-timeout quarantine, stopped + row-free: restart self-heals."""
     import asyncio
     from puffo_agent.agent.harness.driver import HarnessEvent, RuntimeSpec
     from puffo_agent.agent.harness.runtime.runtime_manager import (
@@ -961,7 +959,6 @@ async def test_effectless_quarantine_resolves_at_startup(tmp_path, monkeypatch):
     run = await store.get_turn_run(orphan_id)
     assert run is not None and run.state == "requeued"
 
-    # The agent is functional again: a fresh autonomous turn adopts cleanly.
     restarted.register_autonomous_adoption()
     restarted._autonomous_ready = True
     assert await restarted.adopt_autonomous_turn(
@@ -973,8 +970,7 @@ async def test_effectless_quarantine_resolves_at_startup(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_effectless_resolution_refuses_ambiguous_or_replayable_records(tmp_path):
-    """Only a confirmed-stopped record bound to a row-free turn may self-heal;
-    anything replayable or ambiguous keeps the operator gate."""
+    """Replayable or ambiguous records keep the operator gate."""
     from dataclasses import replace
     from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
 
@@ -989,31 +985,30 @@ async def test_effectless_resolution_refuses_ambiguous_or_replayable_records(tmp
         stop_attempted=True, stopped=True,
     )
 
-    # Provider stop unconfirmed: parked.
+    # stop unconfirmed
     write_recovery(tmp_path, replace(record, stopped=False, stop_attempted=False))
     assert await runtime._resolve_effectless_recovery() is False
-    # An operator already authorized a retry: that flow owns resolution.
+    # operator retry pending
     write_recovery(tmp_path, replace(record, retry_requested=True))
     assert await runtime._resolve_effectless_recovery() is False
-    # No durable binding and no unique candidate turn: parked.
+    # no durable binding, no unique candidate
     write_recovery(tmp_path, record)
     assert await runtime._resolve_effectless_recovery() is False
     assert read_recovery(tmp_path).resolved is False
 
-    # A named turn that no longer exists durably has nothing to replay.
+    # named turn gone durably
     write_recovery(tmp_path, replace(record, durable_turn_id="turn_gone"))
     assert await runtime._resolve_effectless_recovery() is True
     assert read_recovery(tmp_path).resolved is True
 
-    # Already resolved: nothing left to do.
+    # already resolved
     assert await runtime._resolve_effectless_recovery() is True
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_effectless_resolution_binds_unique_candidate_turn(tmp_path):
-    """A record written before its durable binding still resolves when exactly
-    one active turn matches the quarantined provider session."""
+    """No durable binding: a unique matching active turn still resolves."""
     from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
 
     store = await make_store(tmp_path)

@@ -128,10 +128,8 @@ async def test_completed_assistant_identity_is_scoped_to_native_session():
 
 @pytest.mark.asyncio
 async def test_lifecycle_v1_autonomous_run_completes_on_result():
-    """Under message-lifecycle v1 an autonomous turn's command is queued by
-    the CLI itself, so it is never daemon-owned and gets no daemon-visible
-    terminal record: its result frame is the only completion authority. If it
-    were dropped the idle watchdog would later declare a spurious crash."""
+    """Lifecycle v1: an autonomous turn's CLI-queued command is never owned,
+    so its result frame must complete the turn."""
     driver = ClaudeCodeCliDriver()
     driver._session_ref = SessionRef("native")
     driver._native_session_id = "native-session"
@@ -159,9 +157,7 @@ async def test_lifecycle_v1_autonomous_run_completes_on_result():
 
 @pytest.mark.asyncio
 async def test_lifecycle_v1_foreign_result_still_ignored_on_daemon_turn():
-    """A daemon turn under lifecycle v1 keeps the terminal record as its sole
-    completion authority: a result for a command it does not own must not
-    close it."""
+    """Lifecycle v1 daemon turn: a foreign result must not close it."""
     from puffo_agent.agent.harness.driver import TurnRef
 
     driver = ClaudeCodeCliDriver()

@@ -493,12 +493,7 @@ class GlobalInboxRuntime(
         return recovered
 
     async def _resolve_effectless_recovery(self) -> bool:
-        """Resolve a quarantine whose retry cannot replay anything.
-
-        The operator gate protects against redelivering admitted rows to a
-        fresh turn. A confirmed-stopped record bound to a row-free turn has
-        nothing to redeliver, so parking the agent only prolongs the outage.
-        """
+        """Resolve a quarantine with nothing to replay: stopped + row-free."""
         record = read_recovery(self.workspace)
         if record is None or record.resolved:
             return True
