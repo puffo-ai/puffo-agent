@@ -1720,6 +1720,12 @@ class RuntimeManagerAdapter(Adapter):
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False
     ) -> None:
+        if with_session:
+            logger.warning(
+                "%s: session refresh drops native session %s and its context",
+                self.manager.agent_id or self.manager.driver_name,
+                self.manager.native_session_id or "<none>",
+            )
         spec = (
             await self.spec_reloader(new_system_prompt)
             if self.spec_reloader is not None else None
