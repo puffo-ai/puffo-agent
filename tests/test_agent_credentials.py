@@ -18,7 +18,7 @@ from puffo_agent.crypto.credential_keys import (
     seal_credential,
     verify_credential_key_cert,
 )
-from puffo_agent.crypto.encoding import base64url_encode
+from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
 from puffo_agent.crypto.http_client import HttpError
 from puffo_agent.crypto.primitives import Ed25519KeyPair
 from puffo_agent.portal.credentials import AgentCredentials
@@ -27,39 +27,61 @@ SLUG = "agt-daemon-0001"
 OWNER = "alice"
 ROOT = hashlib.sha256(b"agent credentials test root").digest()
 TYPE = "CUSTOMIZED"
+RT = "PUFFO_GOOGLE_OAUTH_v1"
+RT_AT = "PUFFO_GOOGLE_OAUTH_AT_v1"
 
 
 class FakeServer:
-    """What the daemon can see of the server: GET one, GET list, PUT key."""
+    """What the daemon can see of the server: GET one, GET list, PUT key, refresh."""
 
     def __init__(self):
         self.recipient = derive_credential_kem_keypair(ROOT, 1).public_key_bytes()
-        self.rows = {}  # index -> dict(id, version, state, value)
+        self.rows = {}  # (type, index) -> dict(id, version, state, value)
         self.gets = 0
         self.put_body = None
         self.hold = None  # an Event that GET one waits on, to open a race
+        self.refreshes = []  # (path, body) of every refresh call
+        self.refresh_error = None  # an HttpError the next refresh raises
+        self.rotate = False
 
-    def row(self, index, value, *, version=1, state="ACTIVATED"):
-        self.rows[index] = dict(
-            id=credential_id(OWNER, TYPE, index), version=version, state=state, value=value
+    def row(self, index, value, *, version=1, state="ACTIVATED", type=TYPE):
+        self.rows[type, index] = dict(
+            id=credential_id(OWNER, type, index), version=version, state=state, value=value
         )
 
     async def put(self, path, body):
         assert path == "/v2/identities/me/credential-key"
         self.put_body = body
 
+    async def post(self, path, body):
+        """Share-based refresh, as puffo-server refresh.rs answers it."""
+        self.refreshes.append((path, body))
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        _, _, _, rt_type, index, _ = path.split("/")
+        rt, at = self.rows[rt_type, int(index)], self.rows[RT_AT, int(index)]
+        assert (body["version"], base64url_decode(body["share"])) == (rt["version"], rt["value"])
+        at["version"] += 1
+        at["value"] = f"access-{at['version']}".encode()
+        if self.rotate:
+            rt["version"] += 1
+            rt["value"] = f"share-{rt['version']}".encode()
+        return {"access_token": at["value"].decode(), "expires_at": None, "scope": "gmail.send",
+                "at_version": at["version"], "rt_version": rt["version"], "rotated": self.rotate}
+
     async def get(self, path):
         if path == "/v2/credentials":
             return {"credentials": [
-                {"id": r["id"], "type": TYPE, "index": i, "version": r["version"],
+                {"id": r["id"], "type": t, "index": i, "version": r["version"],
                  "state": r["state"]}
-                for i, r in self.rows.items()
+                for (t, i), r in self.rows.items()
             ]}
-        index = int(path.rsplit("/", 1)[1])
+        _, _, _, credential_type, index = path.split("/")
+        index = int(index)
         self.gets += 1
         # Read the row as the server would at request time, then let a test
         # change the world before the response arrives.
-        row = self.rows.get(index)
+        row = self.rows.get((credential_type, index))
         if self.hold is not None:
             await self.hold.wait()
         if row is None:
@@ -68,10 +90,10 @@ class FakeServer:
             raise HttpError(410, "{}")
         aad = compute_credential_wrap_aad(
             credential_id=row["id"], version=row["version"], recipient_slug=SLUG,
-            credential_type=TYPE, key_version=1,
+            credential_type=credential_type, key_version=1,
         )
-        return {"id": row["id"], "type": TYPE, "index": index, "version": row["version"],
-                "state": row["state"], "expire_at": None,
+        return {"id": row["id"], "type": credential_type, "index": index,
+                "version": row["version"], "state": row["state"], "expire_at": None,
                 "blob": base64url_encode(seal_credential(self.recipient, aad, row["value"]))}
 
 
@@ -138,9 +160,9 @@ async def test_reconcile_drops_the_absent_the_stale_and_the_inactivated(server, 
     for i in range(4):
         server.row(i, f"secret-{i}".encode())
         await agent.get(TYPE, i)
-    del server.rows[0]                            # revoked
-    server.rows[1]["version"] = 2                 # value updated
-    server.rows[2]["state"] = "INACTIVATED"       # kill switch
+    del server.rows[TYPE, 0]                      # revoked
+    server.rows[TYPE, 1]["version"] = 2           # value updated
+    server.rows[TYPE, 2]["state"] = "INACTIVATED" # kill switch
     await agent.reconcile()
     gets = server.gets
     assert (await agent.get(TYPE, 3)).value == b"secret-3"
@@ -155,7 +177,7 @@ async def test_offline_across_delete_and_recreate_the_old_secret_is_not_served(s
     credential has a new id, and the old one is simply absent from the list."""
     server.row(0, b"old-secret")
     await agent.get(TYPE, 0)
-    del server.rows[0]
+    del server.rows[TYPE, 0]
     server.row(1, b"new-secret")
     await agent.reconcile()
     assert await agent.get(TYPE, 0) is None
@@ -188,7 +210,7 @@ async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent
     server.hold = asyncio.Event()
     fetch = asyncio.create_task(agent.get(TYPE, 0))
     await asyncio.sleep(0)                        # the GET has read the row
-    del server.rows[0]
+    del server.rows[TYPE, 0]
     await agent.reconcile()
     server.hold.set()
     assert await fetch is None
@@ -222,3 +244,57 @@ async def test_a_held_credential_does_not_print_its_value(server, agent):
     held = await agent.get(TYPE, 0)
     assert "do-not-log-me" not in repr(held)
     assert "do-not-log-me" not in repr({held.id: held})
+
+
+def _oauth_pair(server, index=0):
+    server.row(index, b"share-1", type=RT)
+    server.row(index, b"access-1", type=RT_AT)
+
+
+@pytest.mark.asyncio
+async def test_refresh_spends_the_held_share_and_drops_only_the_access_token(server, agent):
+    _oauth_pair(server)
+    assert (await agent.get(RT_AT, 0)).value == b"access-1"
+    token = await agent.refresh(RT, 0)
+    assert (token.type, token.version, token.value) == (RT_AT, 2, b"access-2")
+    gets = server.gets
+    assert (await agent.get(RT_AT, 0)).value == b"access-2"   # re-fetched, not the old one
+    await agent.get(RT, 0)
+    assert server.gets == gets + 1                            # the share was kept
+
+
+@pytest.mark.asyncio
+async def test_after_a_rotation_the_next_refresh_uses_the_new_share(server, agent):
+    """The server's fake asserts the share matches the RT's current version,
+    so a daemon that kept the rotated-away share fails the second refresh."""
+    _oauth_pair(server)
+    server.rotate = True
+    await agent.refresh(RT, 0)
+    assert (await agent.refresh(RT, 0)).value == b"access-3"
+    assert base64url_decode(server.refreshes[1][1]["share"]) == b"share-2"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_share_refusal_drops_it_so_asking_again_can_succeed(server, agent):
+    """Another holder rotated first: this share is dead, and the 409 says so."""
+    _oauth_pair(server)
+    await agent.get(RT, 0)
+    server.rows[RT, 0].update(version=2, value=b"share-2")
+    server.refresh_error = HttpError(409, "{}")
+    with pytest.raises(HttpError):
+        await agent.refresh(RT, 0)
+    server.refresh_error = None
+    assert (await agent.refresh(RT, 0)).value == b"access-2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 404, 410])
+async def test_a_refresh_refused_as_not_held_drops_the_pair(server, agent, status):
+    _oauth_pair(server)
+    await agent.get(RT_AT, 0)
+    server.refresh_error = HttpError(status, "{}")
+    assert await agent.refresh(RT, 0) is None
+    gets = server.gets
+    await agent.get(RT, 0)
+    await agent.get(RT_AT, 0)
+    assert server.gets == gets + 2

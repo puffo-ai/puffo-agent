@@ -18,7 +18,9 @@ order of three rules:
   was moved, or a version the server misreports, fails to open and the fetch
   fails with it.
 
-Refresh is not here yet: its server contract lands with the server's step 5.
+Refresh (§5.5) trades this agent's S2 share for a fresh access token. The
+server recomposes the refresh token, calls the provider and bumps versions;
+the daemon only has to forget whatever those bumps made stale.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from ..crypto.credential_keys import (
     derive_credential_kem_keypair,
     open_credential,
 )
-from ..crypto.encoding import base64url_decode
+from ..crypto.encoding import base64url_decode, base64url_encode
 from ..crypto.http_client import HttpError
 from ..crypto.primitives import Ed25519KeyPair
 
@@ -124,6 +126,48 @@ class AgentCredentials:
         }
         self._invalidate(lambda c: current.get(c.id) != (c.version, "ACTIVATED"))
 
+    async def refresh(self, rt_type: str, index: int) -> HeldCredential | None:
+        """A fresh access token for the OAuth credential at ``rt_type/index``.
+
+        ``None`` means the same as for ``get``: this agent may not use it now.
+        The returned token is for this call only and is not cached: it came
+        back in plaintext, not as a wrap the AAD ties to this agent, so a
+        later ``get`` of the access token fetches its wrap like any other.
+        """
+        at_type = _access_token_type(rt_type)
+        rt = await self.get(rt_type, index)
+        if rt is None:
+            return None
+        try:
+            data = await self._http.post(
+                f"/v2/credentials/{rt_type}/{index}/refresh",
+                {"version": rt.version, "share": base64url_encode(rt.value)},
+            )
+        except HttpError as exc:
+            if exc.status in _GONE:
+                self._invalidate(lambda c: c.index == index and c.type in (rt_type, at_type))
+                return None
+            if exc.status == 409:
+                # Most often another holder rotated first and this share is
+                # dead. Dropping it makes the next call fetch the current one.
+                self._invalidate(lambda c: c.id == rt.id)
+            raise
+        # Every refresh bumps the access token's version; a rotation bumps
+        # the refresh token's too, and the old share will never work again.
+        self._invalidate(
+            lambda c: c.index == index
+            and (c.type == at_type or (data["rotated"] and c.type == rt_type))
+        )
+        expire_at = data.get("expires_at")
+        return HeldCredential(
+            id=credential_id(self._owner, at_type, index),
+            type=at_type,
+            index=index,
+            version=data["at_version"],
+            expire_at=datetime.fromisoformat(expire_at) if expire_at else None,
+            value=data["access_token"].encode(),
+        )
+
     def _open(self, data: dict, credential_type: str, index: int) -> HeldCredential:
         """Open the response as the credential that was asked for, or refuse.
 
@@ -169,6 +213,13 @@ class AgentCredentials:
         for key in [key for key, held in self._held.items() if drop(held)]:
             del self._held[key]
         self._generation += 1
+
+
+def _access_token_type(rt_type: str) -> str:
+    """``PUFFO_<P>_OAUTH_v1`` -> ``PUFFO_<P>_OAUTH_AT_v1`` (server ``types.rs``)."""
+    if not rt_type.endswith("_OAUTH_v1") or rt_type.endswith("_OAUTH_AT_v1"):
+        raise ValueError(f"{rt_type} is not a refreshable credential type")
+    return rt_type.removesuffix("_OAUTH_v1") + "_OAUTH_AT_v1"
 
 
 def _expired(held: HeldCredential) -> bool:
