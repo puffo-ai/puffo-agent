@@ -332,10 +332,13 @@ def test_an_agent_without_an_owner_or_keys_holds_no_credentials(server, owner, k
 
 
 @pytest.mark.asyncio
-async def test_registration_retries_a_failure_but_takes_404_as_no_v2(server, agent):
+async def test_registration_retries_failures_and_waits_out_a_server_without_v2(server, agent):
+    """Boris 227783: an agent already running when v2 is deployed must pick it
+    up without a restart, so a 404 is polled (hourly), not given up on."""
     from puffo_agent.portal.credentials import keep_registering
 
-    answers = [HttpError(503, "{}"), OSError("reset"), None]
+    answers = [HttpError(404, "{}"), HttpError(404, "{}"), HttpError(503, "{}"),
+               OSError("reset"), None]
     naps = []
 
     async def put(path, body):
@@ -348,12 +351,22 @@ async def test_registration_retries_a_failure_but_takes_404_as_no_v2(server, age
 
     server.put = put
     assert await keep_registering(agent, sleep=sleep)
-    assert (answers, naps) == ([], [5.0, 20.0])
+    assert (answers, naps) == ([], [3600.0, 3600.0, 5.0, 20.0])
 
-    async def no_v2(path, body):
+
+@pytest.mark.asyncio
+async def test_a_rejected_cert_is_not_retried(server, agent):
+    from puffo_agent.portal.credentials import keep_registering
+
+    naps = []
+
+    async def rejected(path, body):
         naps.append("put")
-        raise HttpError(404, "{}")
+        raise HttpError(400, "{}")
 
-    server.put, naps[:] = no_v2, []
+    async def sleep(seconds):
+        raise AssertionError("a rejected cert was retried")
+
+    server.put = rejected
     assert not await keep_registering(agent, sleep=sleep)
     assert naps == ["put"]

@@ -223,19 +223,27 @@ async def keep_registering(credentials: AgentCredentials, *, sleep=asyncio.sleep
     """Register this agent's key, retrying until the server has it.
 
     The owner can only share a credential with an agent whose key is
-    published, so a transient failure at start must not leave it
-    unpublished until the next restart. A 404 means the server has no v2
-    endpoint yet; that is an answer, not a failure, and is not retried.
-    Returns whether the key was registered.
+    published, so nothing here may leave it unpublished until a restart:
+    a transient failure is retried with backoff, and a 404 (the server has
+    no v2 endpoint yet) is polled hourly, so a running agent picks v2 up
+    when it is deployed. Any other 4xx is a rejection of the cert itself,
+    which asking again will not change. Returns whether it was registered.
     """
     delay = 5.0
+    waiting_for_v2 = False
     while True:
         try:
             await credentials.register()
             return True
         except HttpError as exc:
             if exc.status == 404:
-                logger.info("credential key not registered: server has no v2 endpoint")
+                if not waiting_for_v2:
+                    logger.info("credential key: server has no v2 endpoint yet; checking hourly")
+                    waiting_for_v2 = True
+                await sleep(3600.0)
+                continue
+            if 400 <= exc.status < 500 and exc.status not in (408, 429):
+                logger.warning("credential key rejected (%s); not retrying", exc.status)
                 return False
             logger.warning("credential key registration failed (%s); retrying", exc.status)
         except Exception as exc:  # noqa: BLE001 - a background task must not die of it
