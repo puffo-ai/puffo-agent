@@ -397,10 +397,14 @@ def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None
 
 
 _MONID_SETTLED_COST_RE = re.compile(r"via Monid\b.*?cost (\d+) micro-dollars")
-# Claude Code offloads an oversized tool result to a file, replacing the content with an
-# ``Output has been saved to <path>`` placeholder. The path is space-free and ends the sentence, so
-# capture the rest of that line (a trailing sentence period is stripped below).
-_MONID_OFFLOAD_PATH_RE = re.compile(r"Output has been saved to (\S.*)")
+# Claude Code's offload placeholder for an oversized result is
+# ``… exceeds maximum allowed tokens. Output has been saved to <path>.``. Since this parses a
+# filesystem path out of tool output (near money/untrusted data), anchor on both phrases before
+# trusting the path, then capture the rest of that line (a trailing sentence period is stripped
+# below). The path is space-free.
+_MONID_OFFLOAD_PATH_RE = re.compile(
+    r"exceeds maximum allowed tokens\b.*?Output has been saved to (\S.*)"
+)
 # The offloaded file is our own single-line ``{"result": "via Monid · … · cost <N> …\n<payload>"}``
 # envelope, so a small byte-prefix read recovers the settled header (at the very start) without ever
 # loading the untrusted provider payload that follows it.

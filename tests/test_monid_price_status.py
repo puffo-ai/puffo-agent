@@ -340,6 +340,10 @@ def test_settled_cost_from_offload_file_is_bounded_and_fails_open(tmp_path: Path
     headerless.write_text('{"result": "no cost here"}', encoding="utf-8")
     assert _settled_cost_from_offload_file(_offloaded_placeholder(headerless)) is None
 
+    # A bare "Output has been saved to <path>" without the offload prefix is not our placeholder —
+    # the anchor stays strict since this reads a path out of tool output near untrusted data.
+    assert _settled_cost_from_offload_file(f"Output has been saved to {head_only}") is None
+
 
 def test_capture_spend_actual_emits_settled_cost_for_tracked_spend(tmp_path: Path) -> None:
     session = _session(tmp_path)
