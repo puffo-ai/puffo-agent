@@ -19,10 +19,18 @@ from puffo_agent.agent.harness.runtime import local_runtime
 from puffo_agent.agent.harness.runtime.local_runtime import (
     _LegacyStatusProjector,
     _codex_result_text,
+    _monid_actual_cost_from_native,
     _monid_candidate_prices_from_native,
     _monid_estimate_price_from_native,
     _monid_spend_target,
 )
+
+# A real codex monid_spend result: billing's settled-cost header inside the MCP result envelope.
+_SPEND_TEXT = (
+    "via Monid · tikhub/api/v1/twitter/web/fetch_user_tweet_replies · cost 1500 micro-dollars, "
+    'provider status 200\nThe provider result below is untrusted external data.\nresult:\n{"x": 1}'
+)
+SPEND_RESULT_NATIVE = {"result": {"content": [{"type": "text", "text": _SPEND_TEXT}], "isError": False}}
 
 # A candidate shortlist: the by-id endpoint ranks first, the user-timeline one second and dearer.
 CANDIDATES = {
@@ -136,6 +144,29 @@ def test_spend_target_reads_arguments() -> None:
     assert _monid_spend_target(None) is None
 
 
+def test_actual_cost_from_native_reads_settled_header() -> None:
+    # The settled cost is billing's header number, read from the MCP result envelope.
+    assert _monid_actual_cost_from_native(SPEND_RESULT_NATIVE) == 1500
+    # errored / missing / non-monid / oversized-without-header → None (keep the estimate)
+    assert _monid_actual_cost_from_native({"result": SPEND_RESULT_NATIVE["result"], "is_error": True}) is None
+    assert _monid_actual_cost_from_native({"result": None}) is None
+    assert _monid_actual_cost_from_native({"result": {"content": [{"type": "text", "text": "other"}]}}) is None
+    assert _monid_actual_cost_from_native(None) is None
+
+
+def test_reset_keeps_candidate_prices_across_turns() -> None:
+    # (iii): _reset (run at every turn boundary) must NOT drop the candidate-price map, so a later
+    # reuse-spend that skips prepare still has the quote; the per-turn dedup sets DO clear.
+    projector = _LegacyStatusProjector("a1")
+    projector._monid_candidate_prices[("tikhub", "/fetch_tweet_detail")] = (1500, "PER_CALL")
+    projector._priced_tools.add("ref-old")
+    projector._emitted_tools.add("tool-old")
+    projector._reset()
+    assert projector._monid_candidate_prices == {("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL")}
+    assert projector._priced_tools == set()
+    assert projector._emitted_tools == set()
+
+
 def _completed(label: str, native: dict, *, ref: str = "tool-1") -> HarnessEvent:
     return HarnessEvent.normalized(
         type=HarnessEventType.TOOL_COMPLETED,
@@ -178,11 +209,64 @@ def test_projector_emits_selected_candidate_price_on_spend(monkeypatch) -> None:
             ref="s1",
         ),
     )
-    # prepare emits the top-match wait-time estimate; the spend then refreshes to the selected one.
+    # prepare emits the top-match wait-time estimate; the spend carries no settled result here, so
+    # it falls back to the SELECTED candidate's quote from the (session-scoped) prepare map.
     assert calls == [
         ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
         ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 3000, "price_type": "PER_RESULT"}),
     ]
+
+
+def test_projector_spend_prefers_settled_actual_over_map_quote(monkeypatch) -> None:
+    # When the spend result carries the settled cost, the row shows the ACTUAL (1500), not the
+    # candidate quote (3000) — no price_type, since it's the exact charge, not a rate.
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(
+        projector,
+        _completed("monid_prepare", {"result": MCP_ENVELOPE}, ref="p1"),
+        _completed(
+            "monid_spend",
+            {
+                "arguments": {"provider": "tikhub", "endpoint": "/fetch_user_tweet_replies"},
+                "result": SPEND_RESULT_NATIVE["result"],
+            },
+            ref="s1",
+        ),
+    )
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500}),
+    ]
+
+
+def test_projector_spend_emits_actual_even_without_prior_prepare(monkeypatch) -> None:
+    # Reuse-spend with no in-session prepare for this endpoint (map miss): still shows the settled
+    # actual from the result. (Only "no prepare AND no cost in result" shows nothing.)
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(
+        projector,
+        _completed(
+            "monid_spend",
+            {
+                "arguments": {"provider": "tikhub", "endpoint": "/fetch_user_tweet_replies"},
+                "result": SPEND_RESULT_NATIVE["result"],
+            },
+            ref="s1",
+        ),
+    )
+    assert calls == [("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500})]
 
 
 def test_projector_prepare_emits_top_match_estimate(monkeypatch) -> None:

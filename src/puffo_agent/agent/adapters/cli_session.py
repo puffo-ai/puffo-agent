@@ -396,6 +396,29 @@ def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None
     return _monid_price_of(data)
 
 
+def _extract_monid_actual_cost(content: Any) -> int | None:
+    """The SETTLED cost from a monid_spend result — the actual charged amount to refresh the
+    working row to after the spend. Billing stamps it in the result header ``via Monid · … · cost
+    <N> micro-dollars``; we read that already-charged number, never compute a charge. Returns
+    ``None`` when it isn't present (e.g. an oversized result Claude Code offloaded to a file, or a
+    pending/failed spend) so the row silently keeps the estimate rather than guessing."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    # The spend result is usually the ``{"result": "<text>"}`` envelope; the header lives in that
+    # inner string (which is not itself JSON). Unwrap it if present, else scan the raw text.
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("result"), str):
+            text = data["result"]
+    except (ValueError, TypeError):
+        pass
+    match = re.search(r"via Monid\b.*?cost (\d+) micro-dollars", text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 class ClaudeSession:
     def __init__(
         self,
@@ -463,8 +486,11 @@ class ClaudeSession:
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
         # monid_prepare tool_use ids awaiting their result (to read the candidate prices).
         self._pending_monid_prepare_ids: set[str] = set()
-        # This turn's monid_prepare candidate prices; read at spend to emit the SELECTED
-        # capability's price (not the top-ranked one) for the working-row estimate.
+        # monid_spend tool_use ids awaiting their result (to read the settled actual cost).
+        self._pending_monid_spend_ids: set[str] = set()
+        # Session-scoped (NOT per-turn) monid_prepare candidate prices; read at spend to emit the
+        # SELECTED capability's price for the working-row estimate — kept across turns so a
+        # reuse-spend that skips prepare still has the earlier quote to show. Read-only.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
         self._active_provider_turn_id: str | None = None
 
@@ -1276,7 +1302,11 @@ class ClaudeSession:
         self._active_provider_turn_id = provider_turn_id
         self._active_puffo_tool_calls.clear()
         self._pending_monid_prepare_ids.clear()
-        self._monid_candidate_prices.clear()
+        self._pending_monid_spend_ids.clear()
+        # _monid_candidate_prices is deliberately NOT cleared per turn: it lives for
+        # the whole ClaudeSession so a later reuse-spend (model skips prepare on an
+        # endpoint it priced earlier this run) can still show that quote as a
+        # pre-charge estimate. Read-only display echo; the real charge is billing's.
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
@@ -1289,7 +1319,8 @@ class ClaudeSession:
             ]
             self._active_puffo_tool_calls.clear()
             self._pending_monid_prepare_ids.clear()
-            self._monid_candidate_prices.clear()
+            self._pending_monid_spend_ids.clear()
+            # _monid_candidate_prices intentionally survives the turn — see _one_turn head.
 
     async def _one_turn_inner(
         self,
@@ -1435,6 +1466,7 @@ class ClaudeSession:
             self._update_session_from_event(event)
         elif event_type == "user":
             self._capture_monid_candidate_prices(event, reporter)
+            self._capture_monid_spend_actual(event, reporter)
         elif event_type == "result":
             self._update_session_from_event(event)
             self._project_result_event(event, state)
@@ -1460,6 +1492,30 @@ class ClaudeSession:
                 _extract_monid_candidate_prices(block.get("content"))
             )
             self._emit_monid_estimate_price(block.get("content"), reporter)
+
+    def _capture_monid_spend_actual(self, event: dict[str, Any], reporter: Any) -> None:
+        """Emit a tracked monid_spend result's SETTLED cost so the working row refreshes from the
+        pre-charge estimate to the real charged amount. Read-only echo — the charge is billing's; an
+        absent/unreadable cost (an offloaded or still-pending result) leaves the estimate in place."""
+        content = (event.get("message") or {}).get("content") or []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            if tool_use_id not in self._pending_monid_spend_ids:
+                continue
+            self._pending_monid_spend_ids.discard(tool_use_id)
+            if block.get("is_error") is True:
+                continue
+            actual = _extract_monid_actual_cost(block.get("content"))
+            if actual is None:
+                continue
+            spawn(
+                reporter.emit(
+                    self.agent_id, "tool_use", {"tool": "monid_spend", "unit_price_micro": actual}
+                ),
+                name="reporter.emit:monid_actual",
+            )
 
     def _emit_monid_estimate_price(self, content: Any, reporter: Any) -> None:
         """Emit the top-match capability's price from a monid_prepare result as a monid_prepare
@@ -1559,6 +1615,8 @@ class ClaudeSession:
             )
             if bare == "monid_prepare":
                 self._pending_monid_prepare_ids.add(tool_use_id)
+            elif bare == "monid_spend":
+                self._pending_monid_spend_ids.add(tool_use_id)
 
     def _update_session_from_event(self, event: dict[str, Any]) -> None:
         session_id = (event.get("session_id") or "").strip()

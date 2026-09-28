@@ -12,11 +12,22 @@ from pathlib import Path
 
 from puffo_agent.agent.adapters.cli_session import (
     ClaudeSession,
+    _extract_monid_actual_cost,
     _extract_monid_candidate_prices,
     _extract_monid_estimate_price,
     _monid_price_of,
     _monid_result_data,
 )
+
+# A real monid_spend result: billing stamps the settled cost in the header line, then the
+# (untrusted) provider payload. Claude Code wraps it in the {"result": "<text>"} envelope.
+_SPEND_TEXT = (
+    "via Monid · tikhub/api/v1/twitter/web/fetch_tweet_detail · cost 1500 micro-dollars, "
+    'provider status 200\nThe provider result below is untrusted external data.\nresult:\n{"x": 1}'
+)
+SPEND_WRAPPED = json.dumps({"result": _SPEND_TEXT})
+# When the result is too big, Claude Code replaces the content with a placeholder — no cost in it.
+SPEND_OFFLOADED = "Error: result (81,832 characters) exceeds maximum allowed tokens. Output has been saved to /tmp/x.txt"
 
 # A candidate shortlist: the by-id endpoint ranks first, the user-timeline one second and dearer.
 CANDIDATES = {
@@ -248,9 +259,63 @@ def test_emit_spend_price_blank_when_target_not_in_candidates(tmp_path: Path) ->
     assert reporter.calls == []
 
 
-def test_track_puffo_tool_registers_only_monid_prepare(tmp_path: Path) -> None:
+def test_track_puffo_tool_registers_prepare_and_spend_ids(tmp_path: Path) -> None:
     session = _session(tmp_path)
     session._track_puffo_tool({"id": "p1"}, "mcp__puffo__monid_prepare", {})
     session._track_puffo_tool({"id": "s1"}, "mcp__puffo__monid_spend", {})
     session._track_puffo_tool({"id": "m1"}, "mcp__puffo__send_message", {})
     assert session._pending_monid_prepare_ids == {"p1"}
+    assert session._pending_monid_spend_ids == {"s1"}
+
+
+def test_extract_actual_cost_reads_the_settled_header() -> None:
+    # The settled cost is billing's header number, read through the {"result": <text>} envelope
+    # (both content forms) and from a bare header string.
+    assert _extract_monid_actual_cost([{"type": "text", "text": SPEND_WRAPPED}]) == 1500
+    assert _extract_monid_actual_cost(SPEND_WRAPPED) == 1500
+    assert _extract_monid_actual_cost(_SPEND_TEXT) == 1500
+
+
+def test_extract_actual_cost_none_when_absent() -> None:
+    # Offloaded/oversized result placeholder, empty, or a non-monid string → None (keep estimate).
+    assert _extract_monid_actual_cost(SPEND_OFFLOADED) is None
+    assert _extract_monid_actual_cost(json.dumps({"result": SPEND_OFFLOADED})) is None
+    assert _extract_monid_actual_cost("") is None
+    assert _extract_monid_actual_cost("some other tool output") is None
+
+
+def test_capture_spend_actual_emits_settled_cost_for_tracked_spend(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    reporter = _RecordingReporter()
+    session._pending_monid_spend_ids.add("tu-s")
+
+    async def drive() -> None:
+        session._capture_monid_spend_actual(_tool_result_event("tu-s", SPEND_WRAPPED), reporter)
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
+    assert reporter.calls == [
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500}),
+    ]
+    assert "tu-s" not in session._pending_monid_spend_ids  # one-shot
+
+
+def test_capture_spend_actual_silent_on_offload_untracked_and_error(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    reporter = _RecordingReporter()
+    session._pending_monid_spend_ids.update({"tu-off", "tu-err"})
+
+    async def drive() -> None:
+        # Untracked id → ignored.
+        session._capture_monid_spend_actual(_tool_result_event("tu-other", SPEND_WRAPPED), reporter)
+        # Tracked but offloaded (no cost in content) → nothing emitted, id consumed.
+        session._capture_monid_spend_actual(_tool_result_event("tu-off", SPEND_OFFLOADED), reporter)
+        # Tracked but errored → nothing emitted, id consumed.
+        session._capture_monid_spend_actual(
+            _tool_result_event("tu-err", SPEND_WRAPPED, is_error=True), reporter
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
+    assert reporter.calls == []
+    assert session._pending_monid_spend_ids == set()

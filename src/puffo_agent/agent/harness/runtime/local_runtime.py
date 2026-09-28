@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -1135,6 +1136,17 @@ def _monid_spend_target(native: Any) -> tuple[str, str] | None:
     return None
 
 
+def _monid_actual_cost_from_native(native: Any) -> int | None:
+    """The SETTLED cost from a codex monid_spend result — billing stamps it in the result header
+    ``via Monid · … · cost <N> micro-dollars``. Read-only (never computes a charge); ``None`` when
+    it isn't present (an oversized/offloaded or still-pending result) so the row keeps the estimate.
+    """
+    if not isinstance(native, dict) or native.get("is_error") is True:
+        return None
+    match = re.search(r"via Monid\b.*?cost (\d+) micro-dollars", _codex_result_text(native.get("result")))
+    return int(match.group(1)) if match else None
+
+
 class _LegacyStatusProjector:
     """Turn-scoped pre-2.0 status projection from normalized Driver events.
 
@@ -1155,8 +1167,9 @@ class _LegacyStatusProjector:
         self._emitted_blocks: set[str] = set()
         self._emitted_tools: set[str] = set()
         self._priced_tools: set[str] = set()
-        # This turn's monid_prepare candidate prices; read at spend to emit the SELECTED
-        # capability's price for the working-row estimate.
+        # Session-scoped (NOT per-turn — survives _reset) monid_prepare candidate prices; read at
+        # spend to emit the SELECTED capability's price, kept across turns so a reuse-spend that
+        # skips prepare still has the earlier quote to show as an estimate. Read-only.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
 
     def project(self, event: HarnessEvent) -> None:
@@ -1228,26 +1241,27 @@ class _LegacyStatusProjector:
                 return
             if label != "monid_spend":
                 return
-            # Emit the selected candidate's price as a second tool_use for the estimate. Read-only;
-            # never the spend/charge path. Codex exposes tool args only on completion, so this rides
-            # the completed event.
+            # Emit this spend's working-row cost: prefer the SETTLED actual from the result, else the
+            # selected candidate's quote from this session's prepares (reuse-spend estimate). Both are
+            # read-only echoes — never the spend/charge path. Codex exposes args + result on
+            # completion, so this rides the completed event.
             ref = str(data.get("tool_call_ref") or "")
             if ref and ref in self._priced_tools:
                 return
+            actual = _monid_actual_cost_from_native(event.native_diagnostic)
             target = _monid_spend_target(event.native_diagnostic)
-            if target is None:
-                return
-            price = self._monid_candidate_prices.get(target)
-            if price is None:
+            quote = self._monid_candidate_prices.get(target) if target is not None else None
+            if actual is None and quote is None:
                 return
             if ref:
                 self._priced_tools.add(ref)
-            payload: dict[str, Any] = {
-                "tool": "monid_spend",
-                "unit_price_micro": price[0],
-            }
-            if price[1]:
-                payload["price_type"] = price[1]
+            payload: dict[str, Any] = {"tool": "monid_spend"}
+            if actual is not None:
+                payload["unit_price_micro"] = actual
+            else:
+                payload["unit_price_micro"] = quote[0]
+                if quote[1]:
+                    payload["price_type"] = quote[1]
             _emit_status(self._agent_id, "tool_use", payload)
 
     def _reset(self) -> None:
@@ -1255,7 +1269,8 @@ class _LegacyStatusProjector:
         self._emitted_blocks.clear()
         self._emitted_tools.clear()
         self._priced_tools.clear()
-        self._monid_candidate_prices.clear()
+        # _monid_candidate_prices is deliberately NOT cleared here: it lives for the projector so a
+        # later reuse-spend that skips prepare can still show the earlier quote. Read-only display.
 
 
 async def _observe_compaction_activity(
