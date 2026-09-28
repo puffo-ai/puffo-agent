@@ -1,6 +1,4 @@
-"""The daemon records the puffo MCP tool fingerprint at startup. A change is
-informational: codex loads MCP per process (openai/codex#7767) and every
-worker spawns a fresh process at boot, so native sessions are preserved."""
+"""Startup MCP fingerprint: record + log only, sessions preserved."""
 import logging
 
 from puffo_agent.mcp.config import MONID_TOOL_NAMES
@@ -61,8 +59,7 @@ def test_fingerprint_surface_covers_memory_family(monkeypatch):
 
 
 def test_captured_tool_schema_is_address_free_and_captures_doc():
-    # default *values* must not feed the hash: a sentinel default would leak a
-    # process address and move the fingerprint every restart
+    # defaults excluded: sentinel would leak a process address
     sentinel = object()
 
     def sample(a: str, b: int = 5, c=sentinel):
@@ -99,8 +96,7 @@ def test_unchanged_fingerprint_is_quiet(tmp_path, monkeypatch, caplog):
 
 
 def test_changed_fingerprint_preserves_every_session(tmp_path, monkeypatch, caplog):
-    """A tool-surface change used to rotate every cli-local codex session,
-    silently discarding agent context on each release; it must only log."""
+    """Fingerprint change: log only, no session flags."""
     _home(tmp_path, monkeypatch)
     agents = [
         _agent("codex-local", kind="cli-local", harness="codex"),

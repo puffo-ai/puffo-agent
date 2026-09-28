@@ -1191,12 +1191,8 @@ async def _prepare_workers_at_startup() -> None:
 
 
 def _record_mcp_fingerprint_at_startup() -> None:
-    """Persist the MCP tool fingerprint; a change is informational only.
-
-    Codex loads MCP servers per process (openai/codex#7767), and every worker
-    spawns a fresh process at daemon start, so a resumed thread already sees
-    the new surface. Rotating sessions here only discarded agent context.
-    """
+    """Record the MCP fingerprint; a change only logs -- codex loads MCP per
+    process (openai/codex#7767) and every worker starts a fresh one."""
     try:
         from ..mcp.puffo_core_server import mcp_tool_fingerprint
 

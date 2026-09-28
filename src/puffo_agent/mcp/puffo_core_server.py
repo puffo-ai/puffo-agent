@@ -141,11 +141,8 @@ def _capture_tool_surface() -> dict[str, dict[str, object]]:
 
 
 def mcp_tool_fingerprint() -> str:
-    """Hash of the tool surface the model is offered (see
-    ``_capture_tool_surface``); the daemon records it at startup
-    (``_record_mcp_fingerprint_at_startup``). Hashes docstrings and param
-    names/required-ness only: default values could leak process addresses
-    and move the hash every restart."""
+    """Tool-surface hash: docstrings + param names/required only (defaults
+    could leak process addresses)."""
     import hashlib
     import json
 
