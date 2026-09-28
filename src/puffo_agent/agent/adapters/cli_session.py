@@ -321,18 +321,12 @@ def _tool_result_text(content: Any) -> str:
     return ""
 
 
-def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
-    """Read monid_prepare's quoted unit price from its tool-result JSON, as
-    ``(unit_price_micro, price_type)``, or ``None`` if the shape doesn't match.
-    Read-only; never reflects a settled charge (that is monid_spend's cost)."""
-    text = _tool_result_text(content)
-    if not text:
+def _monid_price_of(entry: Any) -> tuple[int, str | None] | None:
+    """``(unit_price_micro, price_type)`` from one capability projection, or ``None``. Fail-safe:
+    a missing/non-int/bool/negative micro yields ``None``, never a fake 0."""
+    if not isinstance(entry, dict):
         return None
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    price = data.get("price") if isinstance(data, dict) else None
+    price = entry.get("price")
     if not isinstance(price, dict):
         return None
     micro = price.get("unit_price_micro")
@@ -340,6 +334,122 @@ def _extract_monid_unit_price(content: Any) -> tuple[int, str | None] | None:
         return None
     price_type = price.get("price_type")
     return micro, price_type if isinstance(price_type, str) else None
+
+
+def _monid_result_data(content: Any) -> dict[str, Any] | None:
+    """The monid capability object from a tool_result. Claude Code wraps an MCP result in a
+    ``{"result": "<stringified json>"}`` envelope, so the real provider/price/candidates live in
+    that inner string, not at the top level — unwrap it. An already-flat object (older single-quote
+    response) is used as-is. Bad shape → ``None``."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "result" in data:
+        inner = data["result"]
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except (ValueError, TypeError):
+                return None
+        return inner if isinstance(inner, dict) else None
+    return data
+
+
+def _extract_monid_candidate_prices(
+    content: Any,
+) -> dict[tuple[str, str], tuple[int, str | None]]:
+    """Map ``(provider, endpoint) -> (unit_price_micro, price_type)`` from a monid_prepare result's
+    ``candidates`` (plus the top-level object, for an older single-quote response), so whichever
+    candidate the model later spends on can have its price emitted. Read-only; bad-shape entries
+    skipped."""
+    data = _monid_result_data(content)
+    if data is None:
+        return {}
+    candidates = data.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    prices: dict[tuple[str, str], tuple[int, str | None]] = {}
+    for entry in [data, *candidates]:
+        if not isinstance(entry, dict):
+            continue
+        provider = entry.get("provider")
+        endpoint = entry.get("endpoint")
+        if not isinstance(provider, str) or not isinstance(endpoint, str):
+            continue
+        price = _monid_price_of(entry)
+        if price is not None:
+            prices.setdefault((provider, endpoint), price)
+    return prices
+
+
+def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None:
+    """The top-match capability's price from a monid_prepare result — the estimate to show during
+    the wait, before the model picks a candidate (top-level == candidates[0]). Bad shape → ``None``."""
+    data = _monid_result_data(content)
+    if data is None:
+        return None
+    return _monid_price_of(data)
+
+
+_MONID_SETTLED_COST_RE = re.compile(r"via Monid\b.*?cost (\d+) micro-dollars")
+# Anchor on Claude Code's full oversized-result phrasing before trusting a path parsed out of tool
+# output (near money/untrusted data): ``… exceeds maximum allowed tokens. Output has been saved to
+# <path>.``.
+_MONID_OFFLOAD_PATH_RE = re.compile(
+    r"exceeds maximum allowed tokens\b.*?Output has been saved to (\S.*)"
+)
+# The offloaded file is our own ``{"result": "<header>\n<payload>"}`` envelope with the settled
+# header at the start, so a small byte prefix recovers it without loading the untrusted payload.
+_MONID_OFFLOAD_HEAD_BYTES = 4096
+
+
+def _settled_cost_from_offload_file(text: str) -> int | None:
+    """Recover a settled monid_spend cost when Claude Code offloaded the oversized result to a file
+    and left only an ``Output has been saved to <path>`` placeholder in the content. We read the
+    path Claude Code itself wrote (never model input), bounded-read only the head of that file, and
+    require our own ``via Monid · … · cost <N> micro-dollars`` header to match before taking <N> —
+    so we only ever read the billing-stamped settled amount, not the untrusted payload after it. Any
+    missing/unreadable path or absent header returns ``None`` (fail-open, keeps the estimate)."""
+    match = _MONID_OFFLOAD_PATH_RE.search(text)
+    if not match:
+        return None
+    path = match.group(1).rstrip().rstrip(".")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(_MONID_OFFLOAD_HEAD_BYTES)
+    except OSError:
+        return None
+    cost = _MONID_SETTLED_COST_RE.search(head)
+    return int(cost.group(1)) if cost else None
+
+
+def _extract_monid_actual_cost(content: Any) -> int | None:
+    """The SETTLED cost from a monid_spend result — the actual charged amount to refresh the
+    working row to after the spend. Billing stamps it in the result header ``via Monid · … · cost
+    <N> micro-dollars``; we read that already-charged number, never compute a charge. When the result
+    was too large and Claude Code offloaded it to a file, the header is recovered from that file's
+    head instead. Returns ``None`` for a pending/failed/sourceless spend so the row silently keeps
+    the estimate rather than guessing."""
+    text = _tool_result_text(content)
+    if not text:
+        return None
+    # The header lives inside the ``{"result": "<text>"}`` envelope's inner string; unwrap it first.
+    inner = text
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("result"), str):
+            inner = data["result"]
+    except (ValueError, TypeError):
+        pass
+    match = _MONID_SETTLED_COST_RE.search(inner)
+    if match:
+        return int(match.group(1))
+    return _settled_cost_from_offload_file(text)
 
 
 class ClaudeSession:
@@ -407,8 +517,11 @@ class ClaudeSession:
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
-        # monid_prepare tool_use ids awaiting their result (to read the price).
         self._pending_monid_prepare_ids: set[str] = set()
+        self._pending_monid_spend_ids: set[str] = set()
+        # Session-scoped, NOT per-turn: kept across turns so a reuse-spend that skips prepare can
+        # still show the earlier candidate quote as the working-row estimate. Read-only.
+        self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
         self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -1214,11 +1327,19 @@ class ClaudeSession:
             )
         return drained
 
+    def _clear_per_turn_monid_state(self) -> None:
+        """Reset the per-turn monid bookkeeping at a turn boundary. Deliberately leaves
+        ``_monid_candidate_prices`` intact: it lives for the whole ClaudeSession so a later
+        reuse-spend (model skips prepare on an endpoint it priced earlier this run) can still show
+        that quote as a pre-charge estimate. Read-only display echo; the real charge is billing's."""
+        self._active_puffo_tool_calls.clear()
+        self._pending_monid_prepare_ids.clear()
+        self._pending_monid_spend_ids.clear()
+
     async def _one_turn(self, user_message: str) -> TurnResult:
         provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
         self._active_provider_turn_id = provider_turn_id
-        self._active_puffo_tool_calls.clear()
-        self._pending_monid_prepare_ids.clear()
+        self._clear_per_turn_monid_state()
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
@@ -1229,8 +1350,7 @@ class ClaudeSession:
                 for admission in self._continuation_admissions
                 if admission.provider_turn_id != provider_turn_id
             ]
-            self._active_puffo_tool_calls.clear()
-            self._pending_monid_prepare_ids.clear()
+            self._clear_per_turn_monid_state()
 
     async def _one_turn_inner(
         self,
@@ -1375,17 +1495,19 @@ class ClaudeSession:
         elif event_type == "system":
             self._update_session_from_event(event)
         elif event_type == "user":
-            self._project_monid_price(event, reporter)
+            self._capture_monid_candidate_prices(event, reporter)
+            self._capture_monid_spend_actual(event, reporter)
         elif event_type == "result":
             self._update_session_from_event(event)
             self._project_result_event(event, state)
             return True
         return False
 
-    def _project_monid_price(self, event: dict[str, Any], reporter: Any) -> None:
-        """Emit monid_prepare's quoted price as a second tool_use for the
-        working row's estimate. Read-only — never the spend path. A later
-        recorded_at keeps it distinct from the prepare call."""
+    def _capture_monid_candidate_prices(self, event: dict[str, Any], reporter: Any) -> None:
+        """Remember a tracked monid_prepare result's candidate prices AND emit the top-match price as
+        a wait-time estimate, so the working row shows a cost while the model is still deciding (or
+        even if it never spends). A later :meth:`_emit_monid_spend_price` re-emits the SELECTED
+        candidate's price to refresh it. Read-only — the real charge is billing's."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
@@ -1396,19 +1518,68 @@ class ClaudeSession:
             self._pending_monid_prepare_ids.discard(tool_use_id)
             if block.get("is_error") is True:
                 continue
-            price = _extract_monid_unit_price(block.get("content"))
-            if price is None:
-                continue
-            payload: dict[str, Any] = {
-                "tool": "monid_prepare",
-                "unit_price_micro": price[0],
-            }
-            if price[1]:
-                payload["price_type"] = price[1]
-            spawn(
-                reporter.emit(self.agent_id, "tool_use", payload),
-                name="reporter.emit:monid_price",
+            self._monid_candidate_prices.update(
+                _extract_monid_candidate_prices(block.get("content"))
             )
+            self._emit_monid_estimate_price(block.get("content"), reporter)
+
+    def _capture_monid_spend_actual(self, event: dict[str, Any], reporter: Any) -> None:
+        """Emit a tracked monid_spend result's SETTLED cost so the working row refreshes from the
+        pre-charge estimate to the real charged amount, whether the header is inline or in an
+        offloaded result file. Read-only echo — the charge is billing's; an absent/unreadable cost (a
+        still-pending or sourceless result) leaves the estimate in place."""
+        content = (event.get("message") or {}).get("content") or []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            if tool_use_id not in self._pending_monid_spend_ids:
+                continue
+            self._pending_monid_spend_ids.discard(tool_use_id)
+            if block.get("is_error") is True:
+                continue
+            actual = _extract_monid_actual_cost(block.get("content"))
+            if actual is None:
+                continue
+            spawn(
+                reporter.emit(
+                    self.agent_id, "tool_use", {"tool": "monid_spend", "unit_price_micro": actual}
+                ),
+                name="reporter.emit:monid_actual",
+            )
+
+    def _emit_monid_estimate_price(self, content: Any, reporter: Any) -> None:
+        """Emit the top-match capability's price from a monid_prepare result as a monid_prepare
+        ``tool_use``, so the working row shows an estimate during the wait. The FE keeps the latest
+        price, so a subsequent spend refreshes it to the selected candidate. Read-only echo."""
+        estimate = _extract_monid_estimate_price(content)
+        if estimate is None:
+            return
+        payload: dict[str, Any] = {"tool": "monid_prepare", "unit_price_micro": estimate[0]}
+        if estimate[1]:
+            payload["price_type"] = estimate[1]
+        spawn(
+            reporter.emit(self.agent_id, "tool_use", payload),
+            name="reporter.emit:monid_estimate",
+        )
+
+    def _emit_monid_spend_price(self, tool_input: dict, reporter: Any) -> None:
+        """Emit the SELECTED capability's quoted price (from this turn's remembered candidates) as a
+        second monid_spend tool_use for the estimate. Read-only echo — the real charge is billing's."""
+        provider = tool_input.get("provider")
+        endpoint = tool_input.get("endpoint")
+        if not isinstance(provider, str) or not isinstance(endpoint, str):
+            return
+        price = self._monid_candidate_prices.get((provider, endpoint))
+        if price is None:
+            return
+        payload: dict[str, Any] = {"tool": "monid_spend", "unit_price_micro": price[0]}
+        if price[1]:
+            payload["price_type"] = price[1]
+        spawn(
+            reporter.emit(self.agent_id, "tool_use", payload),
+            name="reporter.emit:monid_price",
+        )
 
     async def _project_assistant_block(
         self,
@@ -1453,6 +1624,8 @@ class ClaudeSession:
                     "root_id": str(tool_input.get("root_id", "")),
                 }
             )
+        if name == "mcp__puffo__monid_spend":
+            self._emit_monid_spend_price(tool_input, reporter)
         self._track_puffo_tool(block, name, tool_input)
         if self.audit is not None:
             self.audit.write(
@@ -1473,6 +1646,8 @@ class ClaudeSession:
             )
             if bare == "monid_prepare":
                 self._pending_monid_prepare_ids.add(tool_use_id)
+            elif bare == "monid_spend":
+                self._pending_monid_spend_ids.add(tool_use_id)
 
     def _update_session_from_event(self, event: dict[str, Any]) -> None:
         session_id = (event.get("session_id") or "").strip()

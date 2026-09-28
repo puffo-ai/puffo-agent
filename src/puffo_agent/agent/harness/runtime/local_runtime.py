@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -1044,30 +1045,72 @@ def _codex_result_text(result: Any) -> str:
     return ""
 
 
-def _monid_price_from_native(native: Any) -> tuple[int, str | None] | None:
-    """Read monid_prepare's quoted unit price from a codex TOOL_COMPLETED
-    native payload, as ``(unit_price_micro, price_type)``. STRICTLY fail-safe
-    since the codex result shape is not empirically pinned: any shape without a
-    clean price returns ``None`` → nothing emitted, blank row — never 0 or a
-    guess. This is a quote, never a settled charge (that is monid_spend's cost),
-    and this path is read-only — it never touches spend/budget/ceiling. Parallel
-    to cli_session's reader; the codex result shape differs."""
+def _monid_result_data(native: Any) -> dict | None:
+    """A codex TOOL_COMPLETED native's tool result as a dict (parsed dict or JSON text), or
+    ``None``. Fail-safe on an error/missing result or non-object shape. Read-only."""
     if not isinstance(native, dict) or native.get("is_error") is True:
         return None
     result = native.get("result")
-    # Codex may hand back an already-parsed dict or JSON text; try structured
-    # first, else flatten to text and parse.
-    if isinstance(result, dict) and isinstance(result.get("price"), dict):
-        data: Any = result
+    if isinstance(result, dict):
+        # An MCP result envelope carries the monid JSON as text under content/contentItems — unwrap
+        # it (the codex analogue of claude's ``{"result": "<json>"}`` double-encoding).
+        if "content" in result or "contentItems" in result:
+            text = _codex_result_text(result)
+        else:
+            return result
     else:
         text = _codex_result_text(result)
-        if not text:
-            return None
-        try:
-            data = json.loads(text)
-        except (ValueError, TypeError):
-            return None
-    price = data.get("price") if isinstance(data, dict) else None
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _monid_candidate_prices_from_native(
+    native: Any,
+) -> dict[tuple[str, str], tuple[int, str | None]]:
+    """Map ``(provider, endpoint) -> (unit_price_micro, price_type)`` from a monid_prepare result's
+    ``candidates`` (plus the top-level object, for an older single-quote response). Fail-safe: an
+    entry without a clean int price is skipped — never a 0 or a guess. Read-only. Parallel to
+    cli_session's reader; the codex result shape differs."""
+    data = _monid_result_data(native)
+    if data is None:
+        return {}
+    candidates = data.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    prices: dict[tuple[str, str], tuple[int, str | None]] = {}
+    for entry in [data, *candidates]:
+        if not isinstance(entry, dict):
+            continue
+        provider = entry.get("provider")
+        endpoint = entry.get("endpoint")
+        if not isinstance(provider, str) or not isinstance(endpoint, str):
+            continue
+        price = entry.get("price")
+        if not isinstance(price, dict):
+            continue
+        micro = price.get("unit_price_micro")
+        if not isinstance(micro, int) or isinstance(micro, bool) or micro < 0:
+            continue
+        price_type = price.get("price_type")
+        prices.setdefault(
+            (provider, endpoint),
+            (micro, price_type if isinstance(price_type, str) else None),
+        )
+    return prices
+
+
+def _monid_estimate_price_from_native(native: Any) -> tuple[int, str | None] | None:
+    """The top-match capability's price from a monid_prepare result (top-level == candidates[0]) —
+    the wait-time estimate. Fail-safe → ``None`` on bad shape / missing / non-int·bool·negative
+    micro. Read-only. Codex result shape."""
+    data = _monid_result_data(native)
+    if data is None:
+        return None
+    price = data.get("price")
     if not isinstance(price, dict):
         return None
     micro = price.get("unit_price_micro")
@@ -1077,16 +1120,44 @@ def _monid_price_from_native(native: Any) -> tuple[int, str | None] | None:
     return micro, price_type if isinstance(price_type, str) else None
 
 
+def _monid_spend_target(native: Any) -> tuple[str, str] | None:
+    """The ``(provider, endpoint)`` a monid_spend targeted, from the codex native's echoed
+    ``arguments`` — to look up the selected candidate's price. ``None`` if not a clean string pair."""
+    if not isinstance(native, dict):
+        return None
+    args = native.get("arguments")
+    if not isinstance(args, dict):
+        return None
+    provider = args.get("provider")
+    endpoint = args.get("endpoint")
+    if isinstance(provider, str) and isinstance(endpoint, str):
+        return provider, endpoint
+    return None
+
+
+def _monid_actual_cost_from_native(native: Any) -> int | None:
+    """The SETTLED cost from a codex monid_spend result — billing stamps it in the result header
+    ``via Monid · … · cost <N> micro-dollars``, and codex passes results inline (header at the very
+    start), so a large result keeps the header and needs no file recovery — unlike Claude Code, codex
+    was not observed to offload results to a file. Read-only (never computes a charge); ``None`` when
+    the header isn't present (a still-pending/failed spend) so the row keeps the estimate."""
+    if not isinstance(native, dict) or native.get("is_error") is True:
+        return None
+    match = re.search(r"via Monid\b.*?cost (\d+) micro-dollars", _codex_result_text(native.get("result")))
+    return int(match.group(1)) if match else None
+
+
 class _LegacyStatusProjector:
     """Turn-scoped pre-2.0 status projection from normalized Driver events.
 
     Emits only the safe legacy surface: one bounded ``assistant_text`` per
     completed assistant block unless silent, and one label-only ``tool_use``
     per normalized tool start. The sole exception to "never read results":
-    monid_prepare's completed result is read for its quoted unit price, emitted
-    as a second ``tool_use`` (read-only; never the spend path). Duplicate
-    lifecycle events and post-terminal fragments are ignored; buffers are
-    discarded at terminal, abandonment, or runtime teardown.
+    monid_prepare's completed result is read for its candidate quotes, and when
+    the model then spends, the SELECTED capability's quoted price is emitted as a
+    second ``tool_use`` (read-only; never the spend path). Duplicate lifecycle
+    events and post-terminal fragments are ignored; buffers are discarded at
+    terminal, abandonment, or runtime teardown.
     """
 
     def __init__(self, agent_id: str) -> None:
@@ -1096,6 +1167,9 @@ class _LegacyStatusProjector:
         self._emitted_blocks: set[str] = set()
         self._emitted_tools: set[str] = set()
         self._priced_tools: set[str] = set()
+        # Session-scoped, NOT per-turn (survives _reset): kept across turns so a reuse-spend that
+        # skips prepare can still show the earlier candidate quote as an estimate. Read-only.
+        self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
 
     def project(self, event: HarnessEvent) -> None:
         kind = _event_kind(event)
@@ -1139,25 +1213,50 @@ class _LegacyStatusProjector:
                 _emit_status(self._agent_id, "tool_use", {"tool": label})
             return
         if kind == "turn.tool_completed":
-            # monid_prepare only: emit its quoted price as a second tool_use for
-            # the working row's estimate. The FE anchors its timer to the first
-            # event, so this later one cannot disturb the row.
-            if _normalized_tool_label(str(data.get("label") or "")) != "monid_prepare":
+            label = _normalized_tool_label(str(data.get("label") or ""))
+            if label == "monid_prepare":
+                # Emit the top-match price as a wait-time estimate so the row shows a cost while the
+                # model is still deciding (or never spends); the spend refreshes it. Read-only.
+                self._monid_candidate_prices.update(
+                    _monid_candidate_prices_from_native(event.native_diagnostic)
+                )
+                ref = str(data.get("tool_call_ref") or "")
+                if ref and ref in self._priced_tools:
+                    return
+                estimate = _monid_estimate_price_from_native(event.native_diagnostic)
+                if estimate is None:
+                    return
+                if ref:
+                    self._priced_tools.add(ref)
+                estimate_payload: dict[str, Any] = {
+                    "tool": "monid_prepare",
+                    "unit_price_micro": estimate[0],
+                }
+                if estimate[1]:
+                    estimate_payload["price_type"] = estimate[1]
+                _emit_status(self._agent_id, "tool_use", estimate_payload)
                 return
+            if label != "monid_spend":
+                return
+            # Emit this spend's cost: prefer the SETTLED actual, else the selected candidate's quote
+            # from this session's prepares (reuse-spend estimate). Read-only echo — never the charge.
             ref = str(data.get("tool_call_ref") or "")
             if ref and ref in self._priced_tools:
                 return
-            price = _monid_price_from_native(event.native_diagnostic)
-            if price is None:
+            actual = _monid_actual_cost_from_native(event.native_diagnostic)
+            target = _monid_spend_target(event.native_diagnostic)
+            quote = self._monid_candidate_prices.get(target) if target is not None else None
+            if actual is None and quote is None:
                 return
             if ref:
                 self._priced_tools.add(ref)
-            payload: dict[str, Any] = {
-                "tool": "monid_prepare",
-                "unit_price_micro": price[0],
-            }
-            if price[1]:
-                payload["price_type"] = price[1]
+            payload: dict[str, Any] = {"tool": "monid_spend"}
+            if actual is not None:
+                payload["unit_price_micro"] = actual
+            else:
+                payload["unit_price_micro"] = quote[0]
+                if quote[1]:
+                    payload["price_type"] = quote[1]
             _emit_status(self._agent_id, "tool_use", payload)
 
     def _reset(self) -> None:
@@ -1165,6 +1264,8 @@ class _LegacyStatusProjector:
         self._emitted_blocks.clear()
         self._emitted_tools.clear()
         self._priced_tools.clear()
+        # _monid_candidate_prices is deliberately NOT cleared here: it lives for the projector so a
+        # later reuse-spend that skips prepare can still show the earlier quote. Read-only display.
 
 
 async def _observe_compaction_activity(

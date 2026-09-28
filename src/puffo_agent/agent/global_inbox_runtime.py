@@ -31,6 +31,7 @@ from .context_controller import (
     ToolResultAdmission,
 )
 from .errors import AgentAPIError, ProviderFailureError
+from .global_inbox_recovery import resolve_effectless_recovery
 from .turn_recovery import read_recovery, recovery_required
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from ._usage_markers import looks_like_budget_cap
@@ -455,7 +456,9 @@ class GlobalInboxRuntime(
 
     async def recover_orphaned_turns(self) -> int:
         """Requeue active DB Turns left without a resumable crash join."""
-        if recovery_required(self.workspace):
+        if not await resolve_effectless_recovery(
+            workspace=self.workspace, store=self.store, agent_id=self.agent_id,
+        ):
             self._report_recovery_required()
             return 0
         recovered = 0

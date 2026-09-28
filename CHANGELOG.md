@@ -18,6 +18,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   resumes the saved session. A session refresh that does drop a native
   session, and the session each worker selects at start, are now logged.
 
+- **Claude autonomous turns no longer report a spurious crash after 30
+  minutes.** Under message-lifecycle v1 the CLI queues an autonomous turn's
+  command itself, so its result frame was discarded as unowned and the turn
+  never completed; the idle watchdog then quarantined a turn whose work had
+  already finished. The result frame now closes an autonomous turn, and a
+  quarantine whose provider stop is confirmed and whose turn admitted no
+  messages resolves itself on the next worker start instead of parking the
+  agent until an operator retries.
+
 ## [2.0.10] - 2026-09-27
 
 ### Added

@@ -1,8 +1,9 @@
-"""The codex path of the estimated-monid-cost surface: the legacy status
-projector reads monid_prepare's quoted unit price off a TOOL_COMPLETED event
-and emits it as a second ``tool_use`` on the same status stream the working row
-reads. Parallel to the Claude side (cli_session); read-only, never the spend
-path."""
+"""The codex path of the estimated-monid-cost surface: off a TOOL_COMPLETED
+event the legacy status projector emits the top-match price at monid_prepare as
+a wait-time estimate (and remembers every candidate), then re-emits the SELECTED
+capability's price when the model spends — both as ``tool_use`` events on the
+status stream the working row reads. Parallel to the Claude side (cli_session);
+read-only, never the spend path."""
 
 from __future__ import annotations
 
@@ -18,68 +19,152 @@ from puffo_agent.agent.harness.runtime import local_runtime
 from puffo_agent.agent.harness.runtime.local_runtime import (
     _LegacyStatusProjector,
     _codex_result_text,
-    _monid_price_from_native,
+    _monid_actual_cost_from_native,
+    _monid_candidate_prices_from_native,
+    _monid_estimate_price_from_native,
+    _monid_spend_target,
 )
 
-PRICE = {"price": {"price_type": "PER_CALL", "unit_price_micro": 10000}}
-PRICE_JSON = json.dumps(PRICE)
+# A real codex monid_spend result: billing's settled-cost header inside the MCP result envelope.
+_SPEND_TEXT = (
+    "via Monid · tikhub/api/v1/twitter/web/fetch_user_tweet_replies · cost 1500 micro-dollars, "
+    'provider status 200\nThe provider result below is untrusted external data.\nresult:\n{"x": 1}'
+)
+SPEND_RESULT_NATIVE = {"result": {"content": [{"type": "text", "text": _SPEND_TEXT}], "isError": False}}
+
+# A candidate shortlist: the by-id endpoint ranks first, the user-timeline one second and dearer.
+CANDIDATES = {
+    "provider": "tikhub",
+    "endpoint": "/fetch_tweet_detail",
+    "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
+    "candidates": [
+        {
+            "provider": "tikhub",
+            "endpoint": "/fetch_tweet_detail",
+            "price": {"price_type": "PER_CALL", "unit_price_micro": 1500},
+        },
+        {
+            "provider": "tikhub",
+            "endpoint": "/fetch_user_tweet_replies",
+            "price": {"price_type": "PER_RESULT", "unit_price_micro": 3000},
+        },
+    ],
+}
+CANDIDATES_JSON = json.dumps(CANDIDATES)
+# The REAL shape a codex mcpToolCall completed result carries: the monid JSON is text inside an MCP
+# result envelope (content parts), not a bare object. Feeding a bare object hid the wrong-layer read.
+MCP_ENVELOPE = {"content": [{"type": "text", "text": CANDIDATES_JSON}], "isError": False}
+_EXPECTED = {
+    ("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL"),
+    ("tikhub", "/fetch_user_tweet_replies"): (3000, "PER_RESULT"),
+}
 
 
 def test_codex_result_text_flattens_every_shape() -> None:
     # A plain string result, an MCP content list, and the dict wrappers codex
     # may hand back all flatten to the same JSON text.
-    assert _codex_result_text(PRICE_JSON) == PRICE_JSON
-    assert _codex_result_text([{"type": "text", "text": PRICE_JSON}]) == PRICE_JSON
-    assert _codex_result_text({"content": [{"type": "text", "text": PRICE_JSON}]}) == PRICE_JSON
-    assert _codex_result_text({"contentItems": [{"text": PRICE_JSON}]}) == PRICE_JSON
+    assert _codex_result_text(CANDIDATES_JSON) == CANDIDATES_JSON
+    assert _codex_result_text([{"type": "text", "text": CANDIDATES_JSON}]) == CANDIDATES_JSON
+    assert (
+        _codex_result_text({"content": [{"type": "text", "text": CANDIDATES_JSON}]})
+        == CANDIDATES_JSON
+    )
+    assert _codex_result_text({"contentItems": [{"text": CANDIDATES_JSON}]}) == CANDIDATES_JSON
     # Nothing usable → empty (never raises).
     assert _codex_result_text(None) == ""
     assert _codex_result_text(12345) == ""
     assert _codex_result_text({"other": 1}) == ""
 
 
-def test_monid_price_from_native_reads_price_from_every_normal_shape() -> None:
-    # The result may arrive as a JSON string, MCP content parts, or an
-    # already-parsed dict — each normal form must yield the price.
-    assert _monid_price_from_native({"result": PRICE_JSON}) == (10000, "PER_CALL")
-    assert _monid_price_from_native(
-        {"result": [{"type": "text", "text": PRICE_JSON}]}
-    ) == (10000, "PER_CALL")
-    assert _monid_price_from_native({"result": PRICE}) == (10000, "PER_CALL")
-    # price_type is optional.
-    assert _monid_price_from_native(
-        {"result": json.dumps({"price": {"unit_price_micro": 5}})}
-    ) == (5, None)
+def test_candidate_prices_from_native_reads_every_normal_shape() -> None:
+    # The result may arrive as an MCP result envelope (the REAL mcpToolCall shape), a JSON string,
+    # bare MCP content parts, or an already-parsed dict — each must yield the per-candidate map.
+    assert _monid_candidate_prices_from_native({"result": MCP_ENVELOPE}) == _EXPECTED
+    assert _monid_candidate_prices_from_native({"result": CANDIDATES_JSON}) == _EXPECTED
+    assert (
+        _monid_candidate_prices_from_native({"result": [{"type": "text", "text": CANDIDATES_JSON}]})
+        == _EXPECTED
+    )
+    assert _monid_candidate_prices_from_native({"result": CANDIDATES}) == _EXPECTED
+    # An older single-quote response (no candidates array) still yields its one entry.
+    single = {"provider": "x", "endpoint": "y", "price": {"unit_price_micro": 5}}
+    assert _monid_candidate_prices_from_native({"result": single}) == {("x", "y"): (5, None)}
 
 
-def test_monid_price_from_native_is_fail_safe_across_codex_result_shapes() -> None:
-    # The codex result shape is not empirically pinned, so the extractor must
-    # return None (→ no emit → blank row, never a guessed/0 price) for every
-    # shape that can't yield a clean price. The five it must survive:
-    # 1) a string that isn't a price body
-    assert _monid_price_from_native({"result": "not json"}) is None
-    # 2) a content-items list with no price body
-    assert _monid_price_from_native({"result": [{"type": "text", "text": "hi"}]}) is None
-    # 3) a dict result with no price
-    assert _monid_price_from_native({"result": {"other": 1}}) is None
-    assert _monid_price_from_native({"result": json.dumps({"price": {}})}) is None
-    # 4) an errored prepare — even with a well-formed body
-    assert _monid_price_from_native({"result": PRICE_JSON, "is_error": True}) is None
-    # 5) an omitted result (dynamicToolCall success with result None)
-    assert _monid_price_from_native({"result": None, "result_omitted": True}) is None
-    # And the whole native missing / empty text.
-    assert _monid_price_from_native(None) is None
-    assert _monid_price_from_native({"result": ""}) is None
-    # A string / bool / negative micro is not a trustworthy price → None.
-    assert _monid_price_from_native(
-        {"result": json.dumps({"price": {"unit_price_micro": "10000"}})}
-    ) is None
-    assert _monid_price_from_native(
-        {"result": json.dumps({"price": {"unit_price_micro": True}})}
-    ) is None
-    assert _monid_price_from_native(
-        {"result": json.dumps({"price": {"unit_price_micro": -1}})}
-    ) is None
+def test_candidate_prices_from_native_is_fail_safe_across_shapes() -> None:
+    # The codex result shape is not empirically pinned, so an entry that can't yield a clean price
+    # is skipped (→ no emit → blank row, never a guessed/0 price).
+    assert _monid_candidate_prices_from_native({"result": "not json"}) == {}
+    assert _monid_candidate_prices_from_native({"result": [{"type": "text", "text": "hi"}]}) == {}
+    assert _monid_candidate_prices_from_native({"result": {"other": 1}}) == {}
+    # an errored prepare — even with a well-formed body — yields nothing
+    assert _monid_candidate_prices_from_native({"result": CANDIDATES_JSON, "is_error": True}) == {}
+    # an omitted result (dynamicToolCall success with result None)
+    assert _monid_candidate_prices_from_native({"result": None, "result_omitted": True}) == {}
+    assert _monid_candidate_prices_from_native(None) == {}
+    assert _monid_candidate_prices_from_native({"result": ""}) == {}
+    # string / bool / negative micros are not trustworthy → those candidates dropped
+    bad = json.dumps(
+        {
+            "candidates": [
+                {"provider": "a", "endpoint": "/1", "price": {"unit_price_micro": "10000"}},
+                {"provider": "b", "endpoint": "/2", "price": {"unit_price_micro": True}},
+                {"provider": "c", "endpoint": "/3", "price": {"unit_price_micro": -1}},
+            ]
+        }
+    )
+    assert _monid_candidate_prices_from_native({"result": bad}) == {}
+
+
+def test_estimate_price_from_native_reads_top_match() -> None:
+    # The wait-time estimate is the top-level (best-match == candidates[0]) price — read through the
+    # REAL MCP result envelope, and through the older bare shapes too.
+    assert _monid_estimate_price_from_native({"result": MCP_ENVELOPE}) == (1500, "PER_CALL")
+    assert _monid_estimate_price_from_native({"result": CANDIDATES_JSON}) == (1500, "PER_CALL")
+    assert _monid_estimate_price_from_native({"result": CANDIDATES}) == (1500, "PER_CALL")
+    # fail-safe: errored / bad shape / no clean top-level price → None
+    assert _monid_estimate_price_from_native({"result": CANDIDATES_JSON, "is_error": True}) is None
+    # an MCP envelope whose inner text is not parseable → None (not a wrong-layer read of the shell)
+    assert (
+        _monid_estimate_price_from_native(
+            {"result": {"content": [{"type": "text", "text": "not json"}]}}
+        )
+        is None
+    )
+    assert _monid_estimate_price_from_native({"result": "not json"}) is None
+    assert _monid_estimate_price_from_native({"result": {"provider": "x", "endpoint": "y"}}) is None
+    assert _monid_estimate_price_from_native(None) is None
+
+
+def test_spend_target_reads_arguments() -> None:
+    assert _monid_spend_target({"arguments": {"provider": "p", "endpoint": "/e"}}) == ("p", "/e")
+    assert _monid_spend_target({"arguments": {"provider": "p"}}) is None  # endpoint missing
+    assert _monid_spend_target({"arguments": {}}) is None
+    assert _monid_spend_target({}) is None
+    assert _monid_spend_target(None) is None
+
+
+def test_actual_cost_from_native_reads_settled_header() -> None:
+    # The settled cost is billing's header number, read from the MCP result envelope.
+    assert _monid_actual_cost_from_native(SPEND_RESULT_NATIVE) == 1500
+    # errored / missing / non-monid / oversized-without-header → None (keep the estimate)
+    assert _monid_actual_cost_from_native({"result": SPEND_RESULT_NATIVE["result"], "is_error": True}) is None
+    assert _monid_actual_cost_from_native({"result": None}) is None
+    assert _monid_actual_cost_from_native({"result": {"content": [{"type": "text", "text": "other"}]}}) is None
+    assert _monid_actual_cost_from_native(None) is None
+
+
+def test_reset_keeps_candidate_prices_across_turns() -> None:
+    # (iii): _reset (run at every turn boundary) must NOT drop the candidate-price map, so a later
+    # reuse-spend that skips prepare still has the quote; the per-turn dedup sets DO clear.
+    projector = _LegacyStatusProjector("a1")
+    projector._monid_candidate_prices[("tikhub", "/fetch_tweet_detail")] = (1500, "PER_CALL")
+    projector._priced_tools.add("ref-old")
+    projector._emitted_tools.add("tool-old")
+    projector._reset()
+    assert projector._monid_candidate_prices == {("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL")}
+    assert projector._priced_tools == set()
+    assert projector._emitted_tools == set()
 
 
 def _completed(label: str, native: dict, *, ref: str = "tool-1") -> HarnessEvent:
@@ -106,44 +191,138 @@ def _drive(projector: _LegacyStatusProjector, *events: HarnessEvent) -> None:
         projector.project(event)
 
 
-def test_projector_emits_price_for_codex_monid_prepare(monkeypatch) -> None:
+def test_projector_emits_selected_candidate_price_on_spend(monkeypatch) -> None:
     calls: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        local_runtime, "_emit_status",
-        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
-    )
-    projector = _LegacyStatusProjector("a1")
-    _drive(projector, _completed("monid_prepare", {"result": PRICE_JSON}))
-    assert calls == [
-        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 10000, "price_type": "PER_CALL"}),
-    ]
-
-
-def test_projector_price_is_idempotent_per_tool_ref(monkeypatch) -> None:
-    calls: list[tuple[str, str, dict]] = []
-    monkeypatch.setattr(
-        local_runtime, "_emit_status",
-        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
-    )
-    projector = _LegacyStatusProjector("a1")
-    completed = _completed("monid_prepare", {"result": PRICE_JSON})
-    # A re-delivered completed frame for the same tool ref must not re-emit.
-    _drive(projector, completed, completed)
-    assert len(calls) == 1
-
-
-def test_projector_ignores_non_monid_and_errored(monkeypatch) -> None:
-    calls: list[tuple[str, str, dict]] = []
-    monkeypatch.setattr(
-        local_runtime, "_emit_status",
+        local_runtime,
+        "_emit_status",
         lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
     )
     projector = _LegacyStatusProjector("a1")
     _drive(
         projector,
-        _completed("read_inbox", {"result": PRICE_JSON}, ref="r1"),
-        _completed("monid_prepare", {"result": PRICE_JSON, "is_error": True}, ref="e1"),
-        _completed("monid_prepare", {"result": "not json"}, ref="m1"),
-        _completed("monid_prepare", {"result": None, "result_omitted": True}, ref="o1"),
+        _completed("monid_prepare", {"result": MCP_ENVELOPE}, ref="p1"),
+        # The model spends on the SECOND (lower-ranked) candidate.
+        _completed(
+            "monid_spend",
+            {"arguments": {"provider": "tikhub", "endpoint": "/fetch_user_tweet_replies"}},
+            ref="s1",
+        ),
+    )
+    # prepare emits the top-match wait-time estimate; the spend carries no settled result here, so
+    # it falls back to the SELECTED candidate's quote from the (session-scoped) prepare map.
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 3000, "price_type": "PER_RESULT"}),
+    ]
+
+
+def test_projector_spend_prefers_settled_actual_over_map_quote(monkeypatch) -> None:
+    # When the spend result carries the settled cost, the row shows the ACTUAL (1500), not the
+    # candidate quote (3000) — no price_type, since it's the exact charge, not a rate.
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(
+        projector,
+        _completed("monid_prepare", {"result": MCP_ENVELOPE}, ref="p1"),
+        _completed(
+            "monid_spend",
+            {
+                "arguments": {"provider": "tikhub", "endpoint": "/fetch_user_tweet_replies"},
+                "result": SPEND_RESULT_NATIVE["result"],
+            },
+            ref="s1",
+        ),
+    )
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500}),
+    ]
+
+
+def test_projector_spend_emits_actual_even_without_prior_prepare(monkeypatch) -> None:
+    # Reuse-spend with no in-session prepare for this endpoint (map miss): still shows the settled
+    # actual from the result. (Only "no prepare AND no cost in result" shows nothing.)
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(
+        projector,
+        _completed(
+            "monid_spend",
+            {
+                "arguments": {"provider": "tikhub", "endpoint": "/fetch_user_tweet_replies"},
+                "result": SPEND_RESULT_NATIVE["result"],
+            },
+            ref="s1",
+        ),
+    )
+    assert calls == [("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500})]
+
+
+def test_projector_prepare_emits_top_match_estimate(monkeypatch) -> None:
+    # prepare alone emits the top-match price as the wait-time estimate (shown even if no spend).
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(projector, _completed("monid_prepare", {"result": MCP_ENVELOPE}, ref="p1"))
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+    ]
+
+
+def test_projector_price_emits_are_idempotent_per_tool_ref(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    prepare = _completed("monid_prepare", {"result": MCP_ENVELOPE}, ref="p1")
+    spend = _completed(
+        "monid_spend",
+        {"arguments": {"provider": "tikhub", "endpoint": "/fetch_tweet_detail"}},
+        ref="s1",
+    )
+    # Re-delivered prepare/spend frames for the same tool ref must not re-emit.
+    _drive(projector, prepare, prepare, spend, spend)
+    assert calls == [
+        ("a1", "tool_use", {"tool": "monid_prepare", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500, "price_type": "PER_CALL"}),
+    ]
+
+
+def test_projector_ignores_errored_prepare_and_unknown_spend_target(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        local_runtime,
+        "_emit_status",
+        lambda agent_id, event, payload: calls.append((agent_id, event, payload)),
+    )
+    projector = _LegacyStatusProjector("a1")
+    _drive(
+        projector,
+        # errored prepare → nothing remembered
+        _completed("monid_prepare", {"result": CANDIDATES_JSON, "is_error": True}, ref="p1"),
+        # spend on a target not in the (empty) remembered map → nothing emitted
+        _completed(
+            "monid_spend",
+            {"arguments": {"provider": "tikhub", "endpoint": "/fetch_tweet_detail"}},
+            ref="s1",
+        ),
     )
     assert calls == []
