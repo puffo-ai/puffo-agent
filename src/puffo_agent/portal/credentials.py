@@ -25,6 +25,8 @@ the daemon only has to forget whatever those bumps made stale.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,6 +43,8 @@ from ..crypto.credential_keys import (
 from ..crypto.encoding import base64url_decode, base64url_encode
 from ..crypto.http_client import HttpError
 from ..crypto.primitives import Ed25519KeyPair
+
+logger = logging.getLogger(__name__)
 
 KEY_VERSION = 1
 
@@ -213,6 +217,31 @@ class AgentCredentials:
         for key in [key for key, held in self._held.items() if drop(held)]:
             del self._held[key]
         self._generation += 1
+
+
+async def keep_registering(credentials: AgentCredentials, *, sleep=asyncio.sleep) -> bool:
+    """Register this agent's key, retrying until the server has it.
+
+    The owner can only share a credential with an agent whose key is
+    published, so a transient failure at start must not leave it
+    unpublished until the next restart. A 404 means the server has no v2
+    endpoint yet; that is an answer, not a failure, and is not retried.
+    Returns whether the key was registered.
+    """
+    delay = 5.0
+    while True:
+        try:
+            await credentials.register()
+            return True
+        except HttpError as exc:
+            if exc.status == 404:
+                logger.info("credential key not registered: server has no v2 endpoint")
+                return False
+            logger.warning("credential key registration failed (%s); retrying", exc.status)
+        except Exception as exc:  # noqa: BLE001 - a background task must not die of it
+            logger.warning("credential key registration failed: %s; retrying", exc)
+        await sleep(delay)
+        delay = min(delay * 4, 300.0)
 
 
 def _access_token_type(rt_type: str) -> str:

@@ -28,6 +28,8 @@ from .profile_sync import extract_soul_body
 from ..agent.processing_receipts import processing_run_id
 from ..agent._usage_markers import looks_like_budget_cap, parse_reset_epoch
 from ..tasks import spawn
+from ..crypto.keystore import decode_secret
+from .credentials import AgentCredentials, keep_registering
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -117,6 +119,7 @@ class WorkerRunServices:
     status_task: asyncio.Task
     watch_task: asyncio.Task
     runtime_upload_task: asyncio.Task
+    credential_key_task: asyncio.Task | None = None
 
 
 class _NoopStatusReporter:
@@ -1093,6 +1096,12 @@ class StandardWorkerRun:
                 name="reminder_sync.run",
             )
         heartbeat_task = spawn(self._heartbeat(context.paths.agent_id), name="heartbeat")
+        credential_key_task = None
+        worker._credentials = self._build_credentials(context)
+        if worker._credentials is not None:
+            credential_key_task = spawn(
+                keep_registering(worker._credentials), name="credentials.keep_registering"
+            )
         status_task = spawn(reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
         watch_task = spawn(
             worker._refresh_watcher_loop(
@@ -1109,10 +1118,33 @@ class StandardWorkerRun:
             reminder_sync_task=reminder_task,
             reporter=reporter,
             heartbeat_task=heartbeat_task,
+            credential_key_task=credential_key_task,
             status_task=status_task,
             watch_task=watch_task,
             runtime_upload_task=upload_task,
         )
+
+    def _build_credentials(self, context: WorkerRunContext) -> AgentCredentials | None:
+        """This agent's credential-v2 view, or None if it cannot hold any.
+
+        The owner is the operator recorded in agent.yml: credential ids are
+        derived from it, so without one a response for one credential could
+        not be told from another's (see ``AgentCredentials._open``).
+        """
+        client = context.client
+        owner = self.worker.agent_cfg.puffo_core.operator_slug
+        if not owner or getattr(client.http, "keyless", False):
+            return None
+        try:
+            identity = client.keystore.load_identity(client.slug)
+            return AgentCredentials(
+                client.http, client.slug, owner, decode_secret(identity.root_secret_key)
+            )
+        except Exception as exc:  # noqa: BLE001 - credentials are optional to the run
+            logger.warning(
+                "agent %s: no credential key: %s", context.paths.agent_id, exc
+            )
+            return None
 
     async def _report_listener_error(
         self, context: WorkerRunContext, services: WorkerRunServices, exc: Exception
@@ -1196,11 +1228,16 @@ class StandardWorkerRun:
             pass
         services.reporter.stop()
         self.worker._status_reporter = None
-        background_tasks = (
-            services.heartbeat_task,
-            services.status_task,
-            services.watch_task,
-            services.runtime_upload_task,
+        background_tasks = tuple(
+            task
+            for task in (
+                services.heartbeat_task,
+                services.credential_key_task,
+                services.status_task,
+                services.watch_task,
+                services.runtime_upload_task,
+            )
+            if task is not None
         )
         for task in background_tasks:
             task.cancel()

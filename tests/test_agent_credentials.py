@@ -298,3 +298,62 @@ async def test_a_refresh_refused_as_not_held_drops_the_pair(server, agent, statu
     await agent.get(RT, 0)
     await agent.get(RT_AT, 0)
     assert server.gets == gets + 2
+
+
+def _run_with(server, *, owner=OWNER, keyless=False):
+    from types import SimpleNamespace as NS
+
+    from puffo_agent.crypto.keystore import encode_secret
+    from puffo_agent.portal.worker_run import StandardWorkerRun
+
+    server.keyless = keyless
+    identity = NS(root_secret_key=encode_secret(ROOT))
+    client = NS(http=server, slug=SLUG, keystore=NS(load_identity=lambda slug: identity))
+    worker = NS(agent_cfg=NS(puffo_core=NS(operator_slug=owner)))
+    return StandardWorkerRun(worker), NS(client=client, paths=NS(agent_id="agent-1"))
+
+
+@pytest.mark.asyncio
+async def test_the_worker_registers_the_agents_own_key_at_start(server):
+    from puffo_agent.portal.credentials import keep_registering
+
+    run, context = _run_with(server)
+    assert await keep_registering(run._build_credentials(context))
+    root_pk = Ed25519KeyPair.from_secret_bytes(ROOT).public_key_bytes()
+    assert verify_credential_key_cert(
+        server.put_body["cert_json"], root_public_key=root_pk, slug=SLUG, key_version=1
+    ) == server.recipient
+
+
+@pytest.mark.parametrize("owner, keyless", [("", False), (OWNER, True)])
+def test_an_agent_without_an_owner_or_keys_holds_no_credentials(server, owner, keyless):
+    run, context = _run_with(server, owner=owner, keyless=keyless)
+    assert run._build_credentials(context) is None
+
+
+@pytest.mark.asyncio
+async def test_registration_retries_a_failure_but_takes_404_as_no_v2(server, agent):
+    from puffo_agent.portal.credentials import keep_registering
+
+    answers = [HttpError(503, "{}"), OSError("reset"), None]
+    naps = []
+
+    async def put(path, body):
+        answer = answers.pop(0)
+        if answer is not None:
+            raise answer
+
+    async def sleep(seconds):
+        naps.append(seconds)
+
+    server.put = put
+    assert await keep_registering(agent, sleep=sleep)
+    assert (answers, naps) == ([], [5.0, 20.0])
+
+    async def no_v2(path, body):
+        naps.append("put")
+        raise HttpError(404, "{}")
+
+    server.put, naps[:] = no_v2, []
+    assert not await keep_registering(agent, sleep=sleep)
+    assert naps == ["put"]
