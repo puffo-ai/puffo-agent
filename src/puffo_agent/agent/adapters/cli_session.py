@@ -1331,16 +1331,19 @@ class ClaudeSession:
             )
         return drained
 
-    async def _one_turn(self, user_message: str) -> TurnResult:
-        provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
-        self._active_provider_turn_id = provider_turn_id
+    def _clear_per_turn_monid_state(self) -> None:
+        """Reset the per-turn monid bookkeeping at a turn boundary. Deliberately leaves
+        ``_monid_candidate_prices`` intact: it lives for the whole ClaudeSession so a later
+        reuse-spend (model skips prepare on an endpoint it priced earlier this run) can still show
+        that quote as a pre-charge estimate. Read-only display echo; the real charge is billing's."""
         self._active_puffo_tool_calls.clear()
         self._pending_monid_prepare_ids.clear()
         self._pending_monid_spend_ids.clear()
-        # _monid_candidate_prices is deliberately NOT cleared per turn: it lives for
-        # the whole ClaudeSession so a later reuse-spend (model skips prepare on an
-        # endpoint it priced earlier this run) can still show that quote as a
-        # pre-charge estimate. Read-only display echo; the real charge is billing's.
+
+    async def _one_turn(self, user_message: str) -> TurnResult:
+        provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
+        self._active_provider_turn_id = provider_turn_id
+        self._clear_per_turn_monid_state()
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
@@ -1351,10 +1354,7 @@ class ClaudeSession:
                 for admission in self._continuation_admissions
                 if admission.provider_turn_id != provider_turn_id
             ]
-            self._active_puffo_tool_calls.clear()
-            self._pending_monid_prepare_ids.clear()
-            self._pending_monid_spend_ids.clear()
-            # _monid_candidate_prices intentionally survives the turn — see _one_turn head.
+            self._clear_per_turn_monid_state()
 
     async def _one_turn_inner(
         self,

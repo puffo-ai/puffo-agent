@@ -282,6 +282,23 @@ def test_track_puffo_tool_registers_prepare_and_spend_ids(tmp_path: Path) -> Non
     assert session._pending_monid_spend_ids == {"s1"}
 
 
+def test_clear_per_turn_monid_state_keeps_candidate_prices(tmp_path: Path) -> None:
+    # (iii): the candidate-price map survives the turn boundary so a later reuse-spend can still show
+    # the earlier quote as a pre-charge estimate; every other per-turn set is reset.
+    session = _session(tmp_path)
+    session._monid_candidate_prices[("tikhub", "/fetch_tweet_detail")] = (1500, "PER_CALL")
+    session._active_puffo_tool_calls["tu"] = ("monid_spend", {})
+    session._pending_monid_prepare_ids.add("p1")
+    session._pending_monid_spend_ids.add("s1")
+
+    session._clear_per_turn_monid_state()
+
+    assert session._monid_candidate_prices == {("tikhub", "/fetch_tweet_detail"): (1500, "PER_CALL")}
+    assert session._active_puffo_tool_calls == {}
+    assert session._pending_monid_prepare_ids == set()
+    assert session._pending_monid_spend_ids == set()
+
+
 def test_extract_actual_cost_reads_the_settled_header() -> None:
     # The settled cost is billing's header number, read through the {"result": <text>} envelope
     # (both content forms) and from a bare header string.
