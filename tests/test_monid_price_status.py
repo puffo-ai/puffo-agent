@@ -17,6 +17,7 @@ from puffo_agent.agent.adapters.cli_session import (
     _extract_monid_estimate_price,
     _monid_price_of,
     _monid_result_data,
+    _settled_cost_from_offload_file,
 )
 
 # A real monid_spend result: billing stamps the settled cost in the header line, then the
@@ -26,8 +27,21 @@ _SPEND_TEXT = (
     'provider status 200\nThe provider result below is untrusted external data.\nresult:\n{"x": 1}'
 )
 SPEND_WRAPPED = json.dumps({"result": _SPEND_TEXT})
-# When the result is too big, Claude Code replaces the content with a placeholder — no cost in it.
-SPEND_OFFLOADED = "Error: result (81,832 characters) exceeds maximum allowed tokens. Output has been saved to /tmp/x.txt"
+# When the result is too big, Claude Code offloads it to a file and replaces the content with this
+# placeholder (the sentence period after the path is part of the placeholder, not the path). The
+# path is filled in per test; a missing/headerless file must fail open to no cost.
+SPEND_OFFLOADED_MISSING = (
+    "Error: result (81,832 characters) exceeds maximum allowed tokens. "
+    "Output has been saved to /no/such/monid-offload/x.txt."
+)
+
+
+def _offloaded_placeholder(path: Path) -> str:
+    """The exact offload placeholder Claude Code leaves in the content, pointing at ``path``."""
+    return (
+        "Error: result (167,785 characters) exceeds maximum allowed tokens. "
+        f"Output has been saved to {path}.\nFormat: JSON with schema: {{result: string}}"
+    )
 
 # A candidate shortlist: the by-id endpoint ranks first, the user-timeline one second and dearer.
 CANDIDATES = {
@@ -277,11 +291,37 @@ def test_extract_actual_cost_reads_the_settled_header() -> None:
 
 
 def test_extract_actual_cost_none_when_absent() -> None:
-    # Offloaded/oversized result placeholder, empty, or a non-monid string → None (keep estimate).
-    assert _extract_monid_actual_cost(SPEND_OFFLOADED) is None
-    assert _extract_monid_actual_cost(json.dumps({"result": SPEND_OFFLOADED})) is None
+    # Offload placeholder whose file is missing, empty, or a non-monid string → None (keep estimate).
+    assert _extract_monid_actual_cost(SPEND_OFFLOADED_MISSING) is None
     assert _extract_monid_actual_cost("") is None
     assert _extract_monid_actual_cost("some other tool output") is None
+
+
+def test_extract_actual_cost_recovers_from_offloaded_file(tmp_path: Path) -> None:
+    # An oversized result Claude Code offloaded to a file: the settled header sits at the top of the
+    # file (our own {"result": "via Monid · … · cost N …\n<payload>"} envelope), so the cost is
+    # recovered from there even though the placeholder content carries no cost.
+    offloaded = tmp_path / "mcp-puffo-monid_spend-1790496011216.txt"
+    offloaded.write_text(SPEND_WRAPPED, encoding="utf-8")
+    assert _extract_monid_actual_cost(_offloaded_placeholder(offloaded)) == 1500
+
+
+def test_settled_cost_from_offload_file_is_bounded_and_fails_open(tmp_path: Path) -> None:
+    # Reads only the head: a header at the very start is found; one buried past the byte cap is not.
+    head_only = tmp_path / "head.txt"
+    head_only.write_text(SPEND_WRAPPED, encoding="utf-8")
+    assert _settled_cost_from_offload_file(_offloaded_placeholder(head_only)) == 1500
+
+    buried = tmp_path / "buried.txt"
+    buried.write_text("x" * 8192 + _SPEND_TEXT, encoding="utf-8")
+    assert _settled_cost_from_offload_file(_offloaded_placeholder(buried)) is None
+
+    # No placeholder, a missing file, or a file without our header → None (fail-open).
+    assert _settled_cost_from_offload_file("no placeholder here") is None
+    assert _settled_cost_from_offload_file(SPEND_OFFLOADED_MISSING) is None
+    headerless = tmp_path / "headerless.txt"
+    headerless.write_text('{"result": "no cost here"}', encoding="utf-8")
+    assert _settled_cost_from_offload_file(_offloaded_placeholder(headerless)) is None
 
 
 def test_capture_spend_actual_emits_settled_cost_for_tracked_spend(tmp_path: Path) -> None:
@@ -308,8 +348,10 @@ def test_capture_spend_actual_silent_on_offload_untracked_and_error(tmp_path: Pa
     async def drive() -> None:
         # Untracked id → ignored.
         session._capture_monid_spend_actual(_tool_result_event("tu-other", SPEND_WRAPPED), reporter)
-        # Tracked but offloaded (no cost in content) → nothing emitted, id consumed.
-        session._capture_monid_spend_actual(_tool_result_event("tu-off", SPEND_OFFLOADED), reporter)
+        # Tracked, offloaded, but the file is gone → nothing emitted, id consumed.
+        session._capture_monid_spend_actual(
+            _tool_result_event("tu-off", SPEND_OFFLOADED_MISSING), reporter
+        )
         # Tracked but errored → nothing emitted, id consumed.
         session._capture_monid_spend_actual(
             _tool_result_event("tu-err", SPEND_WRAPPED, is_error=True), reporter
@@ -319,3 +361,25 @@ def test_capture_spend_actual_silent_on_offload_untracked_and_error(tmp_path: Pa
     asyncio.run(drive())
     assert reporter.calls == []
     assert session._pending_monid_spend_ids == set()
+
+
+def test_capture_spend_actual_emits_from_offloaded_file(tmp_path: Path) -> None:
+    # The Eric case: a reuse-spend whose oversized result was offloaded still refreshes the row to
+    # the settled cost, recovered from the offloaded file's head.
+    session = _session(tmp_path)
+    reporter = _RecordingReporter()
+    session._pending_monid_spend_ids.add("tu-off")
+    offloaded = tmp_path / "mcp-puffo-monid_spend-1790549313492.txt"
+    offloaded.write_text(SPEND_WRAPPED, encoding="utf-8")
+
+    async def drive() -> None:
+        session._capture_monid_spend_actual(
+            _tool_result_event("tu-off", _offloaded_placeholder(offloaded)), reporter
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
+    assert reporter.calls == [
+        ("a1", "tool_use", {"tool": "monid_spend", "unit_price_micro": 1500}),
+    ]
+    assert "tu-off" not in session._pending_monid_spend_ids

@@ -1138,9 +1138,10 @@ def _monid_spend_target(native: Any) -> tuple[str, str] | None:
 
 def _monid_actual_cost_from_native(native: Any) -> int | None:
     """The SETTLED cost from a codex monid_spend result — billing stamps it in the result header
-    ``via Monid · … · cost <N> micro-dollars``. Read-only (never computes a charge); ``None`` when
-    it isn't present (an oversized/offloaded or still-pending result) so the row keeps the estimate.
-    """
+    ``via Monid · … · cost <N> micro-dollars``, and codex passes results inline (header at the very
+    start), so a large result keeps the header and needs no file recovery — unlike Claude Code, codex
+    was not observed to offload results to a file. Read-only (never computes a charge); ``None`` when
+    the header isn't present (a still-pending/failed spend) so the row keeps the estimate."""
     if not isinstance(native, dict) or native.get("is_error") is True:
         return None
     match = re.search(r"via Monid\b.*?cost (\d+) micro-dollars", _codex_result_text(native.get("result")))

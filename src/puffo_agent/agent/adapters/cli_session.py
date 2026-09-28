@@ -396,27 +396,61 @@ def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None
     return _monid_price_of(data)
 
 
+_MONID_SETTLED_COST_RE = re.compile(r"via Monid\b.*?cost (\d+) micro-dollars")
+# Claude Code offloads an oversized tool result to a file, replacing the content with an
+# ``Output has been saved to <path>`` placeholder. The path is space-free and ends the sentence, so
+# capture the rest of that line (a trailing sentence period is stripped below).
+_MONID_OFFLOAD_PATH_RE = re.compile(r"Output has been saved to (\S.*)")
+# The offloaded file is our own single-line ``{"result": "via Monid · … · cost <N> …\n<payload>"}``
+# envelope, so a small byte-prefix read recovers the settled header (at the very start) without ever
+# loading the untrusted provider payload that follows it.
+_MONID_OFFLOAD_HEAD_BYTES = 4096
+
+
+def _settled_cost_from_offload_file(text: str) -> int | None:
+    """Recover a settled monid_spend cost when Claude Code offloaded the oversized result to a file
+    and left only an ``Output has been saved to <path>`` placeholder in the content. We read the
+    path Claude Code itself wrote (never model input), bounded-read only the head of that file, and
+    require our own ``via Monid · … · cost <N> micro-dollars`` header to match before taking <N> —
+    so we only ever read the billing-stamped settled amount, not the untrusted payload after it. Any
+    missing/unreadable path or absent header returns ``None`` (fail-open, keeps the estimate)."""
+    match = _MONID_OFFLOAD_PATH_RE.search(text)
+    if not match:
+        return None
+    path = match.group(1).rstrip().rstrip(".")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(_MONID_OFFLOAD_HEAD_BYTES)
+    except OSError:
+        return None
+    cost = _MONID_SETTLED_COST_RE.search(head)
+    return int(cost.group(1)) if cost else None
+
+
 def _extract_monid_actual_cost(content: Any) -> int | None:
     """The SETTLED cost from a monid_spend result — the actual charged amount to refresh the
     working row to after the spend. Billing stamps it in the result header ``via Monid · … · cost
-    <N> micro-dollars``; we read that already-charged number, never compute a charge. Returns
-    ``None`` when it isn't present (e.g. an oversized result Claude Code offloaded to a file, or a
-    pending/failed spend) so the row silently keeps the estimate rather than guessing."""
+    <N> micro-dollars``; we read that already-charged number, never compute a charge. When the result
+    was too large and Claude Code offloaded it to a file, the header is recovered from that file's
+    head instead. Returns ``None`` for a pending/failed/sourceless spend so the row silently keeps
+    the estimate rather than guessing."""
     text = _tool_result_text(content)
     if not text:
         return None
     # The spend result is usually the ``{"result": "<text>"}`` envelope; the header lives in that
     # inner string (which is not itself JSON). Unwrap it if present, else scan the raw text.
+    inner = text
     try:
         data = json.loads(text)
         if isinstance(data, dict) and isinstance(data.get("result"), str):
-            text = data["result"]
+            inner = data["result"]
     except (ValueError, TypeError):
         pass
-    match = re.search(r"via Monid\b.*?cost (\d+) micro-dollars", text)
-    if not match:
-        return None
-    return int(match.group(1))
+    match = _MONID_SETTLED_COST_RE.search(inner)
+    if match:
+        return int(match.group(1))
+    # No inline header: the result may have been offloaded to a file — recover it from there.
+    return _settled_cost_from_offload_file(text)
 
 
 class ClaudeSession:
@@ -1495,8 +1529,9 @@ class ClaudeSession:
 
     def _capture_monid_spend_actual(self, event: dict[str, Any], reporter: Any) -> None:
         """Emit a tracked monid_spend result's SETTLED cost so the working row refreshes from the
-        pre-charge estimate to the real charged amount. Read-only echo — the charge is billing's; an
-        absent/unreadable cost (an offloaded or still-pending result) leaves the estimate in place."""
+        pre-charge estimate to the real charged amount, whether the header is inline or in an
+        offloaded result file. Read-only echo — the charge is billing's; an absent/unreadable cost (a
+        still-pending or sourceless result) leaves the estimate in place."""
         content = (event.get("message") or {}).get("content") or []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
