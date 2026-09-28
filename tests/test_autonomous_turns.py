@@ -972,12 +972,18 @@ async def test_effectless_quarantine_resolves_at_startup(tmp_path, monkeypatch):
 async def test_effectless_resolution_refuses_ambiguous_or_replayable_records(tmp_path):
     """Replayable or ambiguous records keep the operator gate."""
     from dataclasses import replace
+    from puffo_agent.agent.global_inbox_recovery import resolve_effectless_recovery
     from puffo_agent.agent.turn_recovery import TurnRecovery, read_recovery, write_recovery
 
     store = await make_store(tmp_path)
-    runtime = GlobalInboxRuntime(
-        store=store, adapter=Adapter(), run_turn=lambda _: None, workspace=tmp_path,
-    )
+
+    async def resolve():
+        return await resolve_effectless_recovery(
+            workspace=tmp_path, store=store, agent_id="agent",
+        )
+
+    # no record: nothing blocks recovery
+    assert await resolve() is True
     record = TurnRecovery(
         session_ref="session-ref", turn_ref="turn-ref",
         provider_session_id="provider-session", provider_turn_id="native-turn",
@@ -987,22 +993,22 @@ async def test_effectless_resolution_refuses_ambiguous_or_replayable_records(tmp
 
     # stop unconfirmed
     write_recovery(tmp_path, replace(record, stopped=False, stop_attempted=False))
-    assert await runtime._resolve_effectless_recovery() is False
+    assert await resolve() is False
     # operator retry pending
     write_recovery(tmp_path, replace(record, retry_requested=True))
-    assert await runtime._resolve_effectless_recovery() is False
+    assert await resolve() is False
     # no durable binding, no unique candidate
     write_recovery(tmp_path, record)
-    assert await runtime._resolve_effectless_recovery() is False
+    assert await resolve() is False
     assert read_recovery(tmp_path).resolved is False
 
     # named turn gone durably
     write_recovery(tmp_path, replace(record, durable_turn_id="turn_gone"))
-    assert await runtime._resolve_effectless_recovery() is True
+    assert await resolve() is True
     assert read_recovery(tmp_path).resolved is True
 
     # already resolved
-    assert await runtime._resolve_effectless_recovery() is True
+    assert await resolve() is True
     await store.close()
 
 
