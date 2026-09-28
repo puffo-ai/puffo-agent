@@ -397,17 +397,14 @@ def _extract_monid_estimate_price(content: Any) -> tuple[int, str | None] | None
 
 
 _MONID_SETTLED_COST_RE = re.compile(r"via Monid\b.*?cost (\d+) micro-dollars")
-# Claude Code's offload placeholder for an oversized result is
-# ``… exceeds maximum allowed tokens. Output has been saved to <path>.``. Since this parses a
-# filesystem path out of tool output (near money/untrusted data), anchor on both phrases before
-# trusting the path, then capture the rest of that line (a trailing sentence period is stripped
-# below). The path is space-free.
+# Anchor on Claude Code's full oversized-result phrasing before trusting a path parsed out of tool
+# output (near money/untrusted data): ``… exceeds maximum allowed tokens. Output has been saved to
+# <path>.``.
 _MONID_OFFLOAD_PATH_RE = re.compile(
     r"exceeds maximum allowed tokens\b.*?Output has been saved to (\S.*)"
 )
-# The offloaded file is our own single-line ``{"result": "via Monid · … · cost <N> …\n<payload>"}``
-# envelope, so a small byte-prefix read recovers the settled header (at the very start) without ever
-# loading the untrusted provider payload that follows it.
+# The offloaded file is our own ``{"result": "<header>\n<payload>"}`` envelope with the settled
+# header at the start, so a small byte prefix recovers it without loading the untrusted payload.
 _MONID_OFFLOAD_HEAD_BYTES = 4096
 
 
@@ -441,8 +438,7 @@ def _extract_monid_actual_cost(content: Any) -> int | None:
     text = _tool_result_text(content)
     if not text:
         return None
-    # The spend result is usually the ``{"result": "<text>"}`` envelope; the header lives in that
-    # inner string (which is not itself JSON). Unwrap it if present, else scan the raw text.
+    # The header lives inside the ``{"result": "<text>"}`` envelope's inner string; unwrap it first.
     inner = text
     try:
         data = json.loads(text)
@@ -453,7 +449,6 @@ def _extract_monid_actual_cost(content: Any) -> int | None:
     match = _MONID_SETTLED_COST_RE.search(inner)
     if match:
         return int(match.group(1))
-    # No inline header: the result may have been offloaded to a file — recover it from there.
     return _settled_cost_from_offload_file(text)
 
 
@@ -522,13 +517,10 @@ class ClaudeSession:
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
-        # monid_prepare tool_use ids awaiting their result (to read the candidate prices).
         self._pending_monid_prepare_ids: set[str] = set()
-        # monid_spend tool_use ids awaiting their result (to read the settled actual cost).
         self._pending_monid_spend_ids: set[str] = set()
-        # Session-scoped (NOT per-turn) monid_prepare candidate prices; read at spend to emit the
-        # SELECTED capability's price for the working-row estimate — kept across turns so a
-        # reuse-spend that skips prepare still has the earlier quote to show. Read-only.
+        # Session-scoped, NOT per-turn: kept across turns so a reuse-spend that skips prepare can
+        # still show the earlier candidate quote as the working-row estimate. Read-only.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
         self._active_provider_turn_id: str | None = None
 

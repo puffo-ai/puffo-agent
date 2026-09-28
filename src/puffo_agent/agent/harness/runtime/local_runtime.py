@@ -1053,8 +1053,7 @@ def _monid_result_data(native: Any) -> dict | None:
     result = native.get("result")
     if isinstance(result, dict):
         # An MCP result envelope carries the monid JSON as text under content/contentItems — unwrap
-        # it (the codex analogue of claude's ``{"result": "<json>"}`` double-encoding). A dict that
-        # is already the monid object (no envelope) is used as-is.
+        # it (the codex analogue of claude's ``{"result": "<json>"}`` double-encoding).
         if "content" in result or "contentItems" in result:
             text = _codex_result_text(result)
         else:
@@ -1168,9 +1167,8 @@ class _LegacyStatusProjector:
         self._emitted_blocks: set[str] = set()
         self._emitted_tools: set[str] = set()
         self._priced_tools: set[str] = set()
-        # Session-scoped (NOT per-turn — survives _reset) monid_prepare candidate prices; read at
-        # spend to emit the SELECTED capability's price, kept across turns so a reuse-spend that
-        # skips prepare still has the earlier quote to show as an estimate. Read-only.
+        # Session-scoped, NOT per-turn (survives _reset): kept across turns so a reuse-spend that
+        # skips prepare can still show the earlier candidate quote as an estimate. Read-only.
         self._monid_candidate_prices: dict[tuple[str, str], tuple[int, str | None]] = {}
 
     def project(self, event: HarnessEvent) -> None:
@@ -1217,10 +1215,8 @@ class _LegacyStatusProjector:
         if kind == "turn.tool_completed":
             label = _normalized_tool_label(str(data.get("label") or ""))
             if label == "monid_prepare":
-                # Remember candidate prices, and emit the top-match price as a wait-time estimate so
-                # the working row shows a cost while the model is still deciding (or never spends).
-                # The spend below re-emits the SELECTED candidate's price to refresh it. Read-only;
-                # never the spend path.
+                # Emit the top-match price as a wait-time estimate so the row shows a cost while the
+                # model is still deciding (or never spends); the spend refreshes it. Read-only.
                 self._monid_candidate_prices.update(
                     _monid_candidate_prices_from_native(event.native_diagnostic)
                 )
@@ -1242,10 +1238,8 @@ class _LegacyStatusProjector:
                 return
             if label != "monid_spend":
                 return
-            # Emit this spend's working-row cost: prefer the SETTLED actual from the result, else the
-            # selected candidate's quote from this session's prepares (reuse-spend estimate). Both are
-            # read-only echoes — never the spend/charge path. Codex exposes args + result on
-            # completion, so this rides the completed event.
+            # Emit this spend's cost: prefer the SETTLED actual, else the selected candidate's quote
+            # from this session's prepares (reuse-spend estimate). Read-only echo — never the charge.
             ref = str(data.get("tool_call_ref") or "")
             if ref and ref in self._priced_tools:
                 return
