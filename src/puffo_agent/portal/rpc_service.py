@@ -538,7 +538,12 @@ async def gmail_send_route(request: web.Request) -> web.Response:
         )
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
-        return web.json_response({"error": "no warm worker"}, status=503)
+        # Definitely not sent. A 503 would read as "unknown" on the MCP side
+        # and tell the agent a message may have gone out (Boris 227840).
+        return web.json_response(
+            {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
+            status=409,
+        )
     try:
         result = await host_mcp_handler.gmail_send(
             ctx, to=body.get("to", ""), subject=body.get("subject", ""),

@@ -18,8 +18,9 @@ def register_gmail_tools(mcp: FastMCP, cfg: Any) -> None:
         """Send an email from the Google account your operator shared with you.
 
         ``to`` is one address or a comma-separated list; ``body`` is plain
-        text. ``from_account`` picks the account by its email when more than
-        one is shared (the error lists them); leave it empty otherwise.
+        text. ``from_account`` picks the account when more than one is shared:
+        pass one of the names the error lists (normally the account's email,
+        but it is the name the owner gave it). Leave it empty otherwise.
 
         Returns ``{"status": "sent", "message_id": ...}``, or
         ``{"status": "unknown", ...}`` when the request went out but the

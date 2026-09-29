@@ -252,3 +252,24 @@ async def test_the_rpc_hop_keeps_unknown_distinct_from_failure(unused_tcp_port, 
     finally:
         await client.close()
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_no_running_worker_is_a_definite_failure_not_unknown():
+    """Boris 227840: the daemon's 'no warm worker' must not read as 'may have
+    been sent' on the MCP side."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import rpc_service
+
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-send", rpc_service.gmail_send_route)
+    previous = rpc_service._RPC_RESOLVER
+    rpc_service._RPC_RESOLVER = lambda agent_id: None
+    try:
+        async with TestClient(TestServer(app)) as http:
+            resp = await http.post("/v1/rpc/agent-1/gmail-send",
+                                   json={"to": "b@x", "subject": "s", "body": "b"})
+            assert resp.status == 409 and (await resp.json())["code"] == "no_worker"
+    finally:
+        rpc_service._RPC_RESOLVER = previous
