@@ -7,6 +7,7 @@ the bytes: what is cached, what is dropped, and what a race may not undo.
 
 import asyncio
 import hashlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -395,3 +396,149 @@ async def test_an_older_version_landing_late_does_not_replace_a_newer_one(server
     gate.set()                                    # now v1 lands
     assert (await old).value == b"secret-v2"
     assert (await agent.get(TYPE, 0)).value == b"secret-v2"
+
+
+@pytest.mark.asyncio
+async def test_a_credential_that_expired_while_cached_is_not_handed_back_by_a_late_older_get(
+    server, agent
+):
+    """Two rules meet: the cached value expired, so a refetch goes out, and
+    an older version lands. Keeping the newer one must not hand back an
+    expired one."""
+    soon = (datetime.now(timezone.utc) + timedelta(milliseconds=50)).isoformat()
+    server.row(0, b"secret-v5", version=5, expire_at=soon)
+    assert (await agent.get(TYPE, 0)).version == 5
+    await asyncio.sleep(0.06)
+    server.row(0, b"secret-v4", version=4)
+    assert await agent.get(TYPE, 0) is None
+
+
+@pytest.mark.asyncio
+async def test_a_transient_failure_is_raised_rather_than_read_as_a_revoke(server, agent):
+    """A 5xx says nothing about who holds what, so it must not drop the value
+    the way 403/404/410 do."""
+    server.row(0, b"secret-0")
+    await agent.get(TYPE, 0)
+
+    async def down(path):
+        raise HttpError(503, "{}")
+
+    real_get, server.get = server.get, down
+    agent._invalidate(lambda c: True)             # force the next call to fetch
+    with pytest.raises(HttpError):
+        await agent.get(TYPE, 0)
+    server.get = real_get
+    assert (await agent.get(TYPE, 0)).value == b"secret-0"
+
+
+@pytest.mark.asyncio
+async def test_refreshing_a_share_this_agent_does_not_hold_is_none_not_an_error(server, agent):
+    server.row(0, b"access-1", type=RT_AT)        # the AT only; no share
+    assert await agent.refresh(RT, 0) is None
+    assert server.refreshes == []
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_that_failed_for_an_unrelated_reason_keeps_the_share(server, agent):
+    """Only 409 means the share is dead. A 500 must leave it cached, or every
+    provider hiccup would cost a re-fetch."""
+    _oauth_pair(server)
+    await agent.get(RT, 0)
+    server.refresh_error = HttpError(500, "{}")
+    with pytest.raises(HttpError):
+        await agent.refresh(RT, 0)
+    server.refresh_error = None
+    gets = server.gets
+    assert (await agent.refresh(RT, 0)).value == b"access-2"
+    assert server.gets == gets                    # the share was served from memory
+
+
+def test_only_an_oauth_refresh_token_type_can_be_refreshed(server, agent):
+    from puffo_agent.portal.credentials import _access_token_type
+
+    assert _access_token_type(RT) == RT_AT
+    for rejected in (TYPE, RT_AT):
+        with pytest.raises(ValueError, match="not a refreshable credential type"):
+            _access_token_type(rejected)
+
+
+def test_an_owner_is_required_to_derive_the_ids_a_response_is_checked_against(server):
+    with pytest.raises(ValueError, match="owner_slug is required"):
+        AgentCredentials(server, SLUG, "", ROOT)
+
+
+def _services_run(server, *, owner=OWNER):
+    """``_start_services`` with every service but the credential wiring
+    stubbed, since each of the others needs a live runtime."""
+    from types import SimpleNamespace as NS
+
+    run, context = _run_with(server, owner=owner)
+
+    async def forever():
+        await asyncio.Event().wait()
+
+    reporter = NS(run_heartbeat_loop=forever, stop=lambda: None)
+    global_runtime = NS(run=forever, stop=lambda: None)
+    run._build_runtime_event_uploader = lambda ctx: None
+    run._build_reporter = lambda client: reporter
+    run._build_global_runtime = lambda ctx, **kw: global_runtime
+    run._prepare_reminder_sync = lambda ctx, runtime: _none()
+    run._heartbeat = lambda agent_id: forever()
+    run._upload_runtime_events = lambda uploader: forever()
+    run.worker._refresh_watcher_loop = lambda flags, apply: forever()
+    run.worker.runtime = NS(status="running", activity="x", save=lambda agent_id: None)
+    run.worker._status_reporter = reporter
+    context.paths.refresh_flags = None
+    context.runtime_event_outbox = None
+    return run, context
+
+
+async def _none():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_publishes_the_agents_key(server):
+    run, context = _services_run(server)
+    services = await run._start_services(context)
+    assert run.worker._credentials is not None
+    assert await services.credential_key_task is True
+    assert server.put_body is not None
+    await run._cleanup(context, services)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_wait_for_a_registration_that_is_still_retrying(server):
+    """``keep_registering`` retries for as long as the agent runs, so stopping
+    the worker has to cancel it rather than await it."""
+    run, context = _services_run(server)
+
+    async def never(path, body):
+        await asyncio.Event().wait()
+
+    server.put = never
+    services = await run._start_services(context)
+    await asyncio.sleep(0)
+    assert not services.credential_key_task.done()
+    await asyncio.wait_for(run._cleanup(context, services), timeout=5)
+    assert services.credential_key_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_holds_no_credentials_starts_and_stops_without_the_task(server):
+    run, context = _services_run(server, owner="")
+    services = await run._start_services(context)
+    assert (run.worker._credentials, services.credential_key_task) == (None, None)
+    await run._cleanup(context, services)
+    assert server.put_body is None
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_identity_leaves_the_agent_without_credentials(server):
+    run, context = _run_with(server)
+
+    def unreadable(slug):
+        raise OSError("keystore is unreadable")
+
+    context.client.keystore.load_identity = unreadable
+    assert run._build_credentials(context) is None

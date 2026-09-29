@@ -1127,9 +1127,8 @@ class StandardWorkerRun:
     def _build_credentials(self, context: WorkerRunContext) -> AgentCredentials | None:
         """This agent's credential-v2 view, or None if it cannot hold any.
 
-        The owner is the operator recorded in agent.yml: credential ids are
-        derived from it, so without one a response for one credential could
-        not be told from another's (see ``AgentCredentials._open``).
+        Credential ids derive from the operator recorded in agent.yml, so
+        without one no response can be checked (``AgentCredentials._open``).
         """
         client = context.client
         owner = self.worker.agent_cfg.puffo_core.operator_slug

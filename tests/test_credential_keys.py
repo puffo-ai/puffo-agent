@@ -176,3 +176,61 @@ def test_the_rust_id_vector_matches_the_daemons_derivation():
 
     v = R["id_vector"]
     assert credential_id(v["owner_slug"], v["credential_type"], v["index"]) == v["id"]
+
+
+@pytest.mark.parametrize(
+    "field, value, refusal",
+    [
+        ("type", "subkey_cert", "not a v1 credential key cert"),
+        ("version", 2, "not a v1 credential key cert"),
+        ("kem_public_key", "AAAA", "not 32 bytes"),
+        ("signature", "!!not base64!!", "malformed cert"),
+    ],
+)
+def test_a_cert_is_refused_before_its_signature_is_trusted(field, value, refusal):
+    """Shape first, signature after: a cert of the wrong type or with an
+    undecodable field must be refused rather than reaching the verifier."""
+    cert = copy.deepcopy(V["cert"]["cert"])
+    cert[field] = value
+    with pytest.raises(CredentialKeyError, match=refusal):
+        verify_credential_key_cert(
+            cert, root_public_key=d(V["cert"]["root_public_key"]),
+            slug=V["cert"]["slug"], key_version=1,
+        )
+
+
+def test_a_cert_missing_a_required_field_is_refused():
+    cert = copy.deepcopy(V["cert"]["cert"])
+    del cert["signature"]
+    with pytest.raises(CredentialKeyError, match="malformed cert"):
+        verify_credential_key_cert(
+            cert, root_public_key=d(V["cert"]["root_public_key"]),
+            slug=V["cert"]["slug"], key_version=1,
+        )
+
+
+def test_a_blob_with_no_room_for_a_ciphertext_is_refused_without_decrypting():
+    with pytest.raises(CredentialKeyError, match="too short"):
+        open_credential(_rust_recipient(), b"aad", bytes(32))
+
+
+def test_key_version_starts_at_one():
+    with pytest.raises(ValueError, match="key_version starts at 1"):
+        derive_credential_kem_keypair(bytes(32), 0)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"version": -1}, {"key_version": 1 << 63}],
+)
+def test_an_aad_integer_outside_i64_is_refused(override):
+    """The AAD is a fixed-width contract with Rust's i64; a value that would
+    not round-trip has to fail here rather than produce different bytes."""
+    with pytest.raises(ValueError, match="i64"):
+        compute_credential_wrap_aad(**{**V["wrap"]["aad_fields"], **override})
+
+
+@pytest.mark.parametrize("field", ["recipient_slug", "credential_type"])
+def test_an_empty_aad_string_is_refused(field):
+    with pytest.raises(ValueError, match="1..65535"):
+        compute_credential_wrap_aad(**{**V["wrap"]["aad_fields"], field: ""})

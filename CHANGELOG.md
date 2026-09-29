@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **An agent publishes its own credential key at start, so its operator can
+  share a credential with it.** The key is derived from the agent's root, so
+  nothing is stored for it and re-enrolling a device does not invalidate
+  anything already shared. An agent with no recorded operator publishes
+  nothing. If the server has no credentials support yet, the agent keeps
+  checking and picks it up after the server is upgraded, without a restart.
+  Credential values an operator shares are held in memory only and are
+  fetched again after a restart; nothing is written to disk. Agents cannot
+  use shared credentials yet, and there is no tool for it: the first consumer
+  is the Google connector. (#426)
+
 ## [2.0.10] - 2026-09-27
 
 ### Added

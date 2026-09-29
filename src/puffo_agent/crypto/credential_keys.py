@@ -1,21 +1,11 @@
-"""Credential design v2 wire format: key derivation, key cert, and wraps.
+"""Credential design v2 wire format (v2 §2, §4.1, §5.1).
 
-Everything here is part of the wire contract with the server and the web
-client. Rust and TypeScript implement the same bytes, and the only symptom
-of drift is a wrap that will not open or a cert that will not verify — with
-no hint of which byte moved. ``credential_vectors.json`` pins every layout
-below; change one and a vector fails.
+Rust and TypeScript implement the same bytes. Drift is silent: a wrap that
+will not open, with no hint of which byte moved. ``credential_vectors.json``
+pins every layout here.
 
-Three pieces, each fixed by the design doc (v2 §2, §4.1, §5.1) plus the
-amendments that pinned what the doc left open:
-
-- **Derivation.** Each principal derives one X25519 key from its root, not
-  from a device, so a wrap survives the device being re-enrolled.
-- **Key cert.** The derived public key cannot be computed from the root's
-  public key, so the root signs a cert publishing it.
-- **Wrap.** A credential value (or the S2 share) HPKE-sealed to one
-  recipient, with the AAD binding it to one credential, version, recipient,
-  type and key version, so a blob cannot be moved between rows or recipients.
+Keys derive from a principal's root rather than a device, so a wrap survives
+re-enrolment; the derived public key needs a root-signed cert to publish it.
 """
 
 from __future__ import annotations
@@ -54,8 +44,7 @@ class CredentialKeyError(Exception):
 def derive_credential_kem_keypair(root_secret: bytes, key_version: int = 1) -> KemKeyPair:
     """``HKDF-SHA256(ikm=root_secret, salt=none, info=..., L=32)`` as X25519.
 
-    No salt, per RFC 5869 §2.2 (a zero-filled HashLen salt). Clamping is left
-    to X25519 itself, which is what every implementation does on use.
+    ``salt=None`` is RFC 5869 §2.2: 32 zero bytes, not an absent salt.
     """
     if key_version < 1:
         raise ValueError("key_version starts at 1")
@@ -77,9 +66,9 @@ def create_credential_key_cert(
 ) -> dict:
     """The root-signed cert that publishes a derived key.
 
-    Same shape and signing rule as the subkey cert: RFC 8785 over the object
-    without ``signature``. ``slug`` is inside the signature so a cert cannot be
-    re-registered under another identity with the same root.
+    Signs RFC 8785 over the object without ``signature``, as the subkey cert
+    does. ``slug`` is signed, so one root cannot re-register a cert under
+    another identity.
     """
     cert = {
         "type": CERT_TYPE,
@@ -99,11 +88,9 @@ def verify_credential_key_cert(
 ) -> bytes:
     """Return the published KEM key, or raise.
 
-    ``root_public_key`` is the caller's trust anchor, and where it comes from
-    is the whole point. The server runs this to stop one principal registering
-    a key for another. A party about to wrap a secret runs it against an anchor
-    the server did not hand it (amendment 6), because a live server can swap
-    the cert and the root key together and the check would then pass.
+    Where ``root_public_key`` comes from is the point: a server can swap the
+    cert and the root together, so a party about to wrap must anchor on a root
+    the server did not hand it (amendment 6).
     """
     if cert.get("type") != CERT_TYPE or cert.get("version") != 1:
         raise CredentialKeyError("not a v1 credential key cert")
@@ -129,9 +116,8 @@ _CREDENTIAL_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "puffo:credentials")
 def credential_id(owner_slug: str, credential_type: str, index: int) -> str:
     """The id the server assigns to ``(owner, type, index)``.
 
-    Server-pinned (puffo-server ``types.rs::credential_id``). A reader derives
-    it too, so that a response naming some other credential is caught before
-    its value is handed back as the one that was asked for.
+    Pinned by puffo-server ``types.rs::credential_id``. A reader derives it to
+    catch a response that names some other credential.
     """
     return str(uuid.uuid5(_CREDENTIAL_ID_NAMESPACE, f"{owner_slug}/{credential_type}/{index}"))
 
@@ -147,9 +133,8 @@ def compute_credential_wrap_aad(
     """``label || uuid(16) || version(i64 BE) || lp(recipient_slug) || lp(type)
     || key_version(i64 BE)``, where ``lp`` is a u16 BE length then UTF-8.
 
-    The UUID goes in as its 16 raw bytes rather than text, so upper- and
-    lower-case renderings of the same id cannot produce two different AADs.
-    Integers and length prefixes follow ``v2_aad``.
+    The UUID goes in as 16 raw bytes, not text, so two renderings of the same
+    id cannot produce two AADs. Integers and prefixes follow ``v2_aad``.
     """
     return (
         CREDENTIAL_WRAP_AAD_LABEL

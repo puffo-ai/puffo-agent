@@ -1,26 +1,19 @@
 """One agent's view of its credentials under design v2 (phase 1, read side).
 
-The server holds nothing usable on its own, and this daemon holds nothing on
-disk: every value lives in this process only, keyed by credential id, and a
-restart simply fetches again (amendment 9). What makes that safe is the
-order of three rules:
+Values live in this process only; a restart fetches again (amendment 9).
+Three rules keep that safe:
 
-- **Absence from the list is revocation.** ``GET /v2/credentials`` lists what
-  this agent currently holds; anything cached and not listed goes. A list
-  call that failed deletes nothing (amendment 4) — a timeout is not a revoke.
+- **Absence from the list is revocation**, but a list call that *failed*
+  deletes nothing (amendment 4): a timeout is not a revoke.
 - **A result may not outlive a revocation it raced.** Revoking does not bump
-  the value version, so a GET that left before a revoke and lands after it
-  carries a perfectly current-looking version. Every invalidation bumps a
-  generation counter; a fetch that started under an older generation is
-  thrown away rather than cached (amendment 10, Jeff 226108).
-- **Anything that does not open is refused, not retried as something else.**
-  The AAD binds id, version, this slug, type and key version, so a blob that
-  was moved, or a version the server misreports, fails to open and the fetch
-  fails with it.
+  the version, so a response that crossed one still looks current. Every
+  invalidation bumps a generation counter and fences those fetches off
+  (amendment 10, Jeff 226108).
+- **Anything that does not open is refused**, never retried as something
+  else: the AAD binds id, version, slug, type and key version.
 
-Refresh (§5.5) trades this agent's S2 share for a fresh access token. The
-server recomposes the refresh token, calls the provider and bumps versions;
-the daemon only has to forget whatever those bumps made stale.
+Refresh (§5.5) trades this agent's S2 share for a fresh access token; the
+daemon only has to forget whatever the server's version bumps made stale.
 """
 
 from __future__ import annotations
@@ -60,18 +53,16 @@ class HeldCredential:
     index: int
     version: int
     expire_at: datetime | None
-    # The secret itself, or the S2 share for a split type; which one is a
-    # function of ``type`` and is the caller's business. Kept out of repr so a
-    # log line or traceback that prints one does not print the secret.
+    # The secret, or the S2 share for a split type (``type`` says which).
+    # Out of repr so a traceback cannot print it.
     value: bytes = field(repr=False)
 
 
 class AgentCredentials:
     def __init__(self, http: Any, slug: str, owner_slug: str, root_secret: bytes) -> None:
         if not owner_slug:
-            # Without it the id a response must carry cannot be derived, and
-            # then nothing stops a response for one credential being served as
-            # another.
+            # Without it the expected id cannot be derived, and then nothing
+            # stops one credential being served as another.
             raise ValueError("owner_slug is required")
         self._http = http
         self._slug = slug
@@ -84,8 +75,7 @@ class AgentCredentials:
     async def register(self) -> None:
         """Publish this agent's credential key. Idempotent; run every start.
 
-        Re-deriving and re-registering on each start is what lets the daemon
-        keep no state for it: the key is a function of the root.
+        The key is a function of the root, so nothing is stored for it.
         """
         cert = create_credential_key_cert(
             self._root, self._slug, self._kem.public_key_bytes(), KEY_VERSION,
@@ -108,26 +98,31 @@ class AgentCredentials:
             data = await self._http.get(f"/v2/credentials/{credential_type}/{index}")
         except HttpError as exc:
             if exc.status in _GONE:
+                # A revoke, an INACTIVATE and a lapsed operator attestation
+                # are otherwise indistinguishable from nothing happening.
+                logger.info(
+                    "credential %s/%s not available (%s)", credential_type, index, exc.status
+                )
                 self._invalidate(lambda c: c.type == credential_type and c.index == index)
                 return None
             raise
         held = self._open(data, credential_type, index)
         if generation != self._generation or _expired(held):
             return None
-        # Two overlapping fetches can land out of order; the older version
-        # must not replace the newer one. Only a revoke lowers what is held,
-        # and that goes through _invalidate, not here.
+        # Overlapping fetches can land out of order, and only a revoke lowers
+        # what is held (via _invalidate, not here). Keeping the newer one still
+        # means handing back nothing once it has expired.
         current = self._held.get(held.id)
         if current is not None and current.version > held.version:
-            return current
+            return None if _expired(current) else current
         self._held[held.id] = held
         return held
 
     async def reconcile(self) -> None:
         """Drop everything the server no longer lists as held and current.
 
-        Only deletes. A stale list can at worst drop something that is then
-        fetched again; it can never bring a revoked value back.
+        Deletes only, so a stale list can cost a re-fetch but never resurrect
+        a revoked value.
         """
         data = await self._http.get("/v2/credentials")
         current = {
@@ -139,10 +134,8 @@ class AgentCredentials:
     async def refresh(self, rt_type: str, index: int) -> HeldCredential | None:
         """A fresh access token for the OAuth credential at ``rt_type/index``.
 
-        ``None`` means the same as for ``get``: this agent may not use it now.
-        The returned token is for this call only and is not cached: it came
-        back in plaintext, not as a wrap the AAD ties to this agent, so a
-        later ``get`` of the access token fetches its wrap like any other.
+        ``None`` means the same as for ``get``. The token is not cached: it
+        arrived in plaintext, not as a wrap the AAD ties to this agent.
         """
         at_type = _access_token_type(rt_type)
         rt = await self.get(rt_type, index)
@@ -181,11 +174,9 @@ class AgentCredentials:
     def _open(self, data: dict, credential_type: str, index: int) -> HeldCredential:
         """Open the response as the credential that was asked for, or refuse.
 
-        The AAD stops a blob moving between rows or recipients, but it is built
-        from whatever id the response names. A server that answered a request
-        for A with B's genuine row would pass it, and B's secret would come back
-        as A's (Boris 226286). So the id is derived here and the response must
-        match it; the AAD is then built from what was asked, not what came back.
+        Answering a request for A with B's genuine row would otherwise pass,
+        and B's secret would come back as A's (Boris 226286). So the id is
+        derived here and the AAD built from the request, not the response.
         """
         expected_id = credential_id(self._owner, credential_type, index)
         if (data["id"], data["type"], data["index"]) != (expected_id, credential_type, index):
@@ -217,8 +208,8 @@ class AgentCredentials:
     def _invalidate(self, drop) -> None:
         """Drop matching entries and fence off every fetch already in flight.
 
-        The fence goes up even when nothing was cached: the fetch being
-        fenced may be the first one for a credential that was just revoked.
+        The fence goes up even when nothing was cached: the fetch being fenced
+        may be the first one for a credential that was just revoked.
         """
         for key in [key for key, held in self._held.items() if drop(held)]:
             del self._held[key]
@@ -228,12 +219,11 @@ class AgentCredentials:
 async def keep_registering(credentials: AgentCredentials, *, sleep=asyncio.sleep) -> bool:
     """Register this agent's key, retrying until the server has it.
 
-    The owner can only share a credential with an agent whose key is
-    published, so nothing here may leave it unpublished until a restart:
-    a transient failure is retried with backoff, and a 404 (the server has
-    no v2 endpoint yet) is polled hourly, so a running agent picks v2 up
-    when it is deployed. Any other 4xx is a rejection of the cert itself,
-    which asking again will not change. Returns whether it was registered.
+    An owner can only share with an agent whose key is published, so nothing
+    may leave it unpublished until a restart: transient failures back off, and
+    a 404 (no v2 endpoint yet) is polled hourly so a running agent picks v2 up
+    when it deploys. Any other 4xx rejects the cert itself, which retrying will
+    not change. Returns whether it was registered.
     """
     delay = 5.0
     waiting_for_v2 = False
@@ -260,7 +250,7 @@ async def keep_registering(credentials: AgentCredentials, *, sleep=asyncio.sleep
 
 def _access_token_type(rt_type: str) -> str:
     """``PUFFO_<P>_OAUTH_v1`` -> ``PUFFO_<P>_OAUTH_AT_v1`` (server ``types.rs``)."""
-    if not rt_type.endswith("_OAUTH_v1") or rt_type.endswith("_OAUTH_AT_v1"):
+    if not rt_type.endswith("_OAUTH_v1"):
         raise ValueError(f"{rt_type} is not a refreshable credential type")
     return rt_type.removesuffix("_OAUTH_v1") + "_OAUTH_AT_v1"
 
