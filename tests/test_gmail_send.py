@@ -512,3 +512,62 @@ async def test_a_refusal_the_mcp_side_cannot_parse_stays_a_definite_failure(unus
     finally:
         await client.close()
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_reply_split_across_chunks_is_read_whole(unused_tcp_port):
+    """``StreamReader.read(n)`` hands back whatever is buffered, so a large
+    answer came back truncated and read as malformed JSON."""
+    from puffo_agent.portal.gmail_send import gmail_transport
+
+    payload = json.dumps({"id": "m-big", "raw": "x" * 400_000}).encode()
+
+    async def route(request):
+        resp = web.StreamResponse(headers={"content-type": "application/json"})
+        await resp.prepare(request)
+        for start in range(0, len(payload), 32_768):
+            await resp.write(payload[start:start + 32_768])
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/big", route)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    try:
+        status, reply = await gmail_transport(
+            f"http://127.0.0.1:{unused_tcp_port}/big", None, {}, method="GET")
+        assert status == 200
+        assert len(reply) == len(payload)
+        assert json.loads(reply)["id"] == "m-big"
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_past_the_cap_is_refused_rather_than_buffered(unused_tcp_port, monkeypatch):
+    from puffo_agent.portal import gmail_send as gs
+
+    monkeypatch.setattr(gs, "MAX_REPLY_BYTES", 100_000)
+
+    async def route(request):
+        resp = web.StreamResponse(headers={"content-type": "application/json"})
+        await resp.prepare(request)
+        for _ in range(8):
+            await resp.write(b"x" * 32_768)
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/huge", route)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    try:
+        with pytest.raises(GmailSendError) as exc:
+            await gs.gmail_transport(
+                f"http://127.0.0.1:{unused_tcp_port}/huge", None, {}, method="GET")
+        assert exc.value.code == "too_large"
+    finally:
+        await runner.cleanup()

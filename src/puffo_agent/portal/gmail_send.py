@@ -179,6 +179,11 @@ def _log_failure(code: str) -> None:
     logger.warning("gmail send: failed (%s)", code)
 
 
+# A raw message can be megabytes; anything past this is refused rather
+# than buffered, and Gmail itself will not accept a larger one.
+MAX_REPLY_BYTES = 30 * 1024 * 1024
+
+
 async def gmail_transport(
     url: str, body: bytes | None, headers: dict, *, method: str = "POST",
 ) -> tuple[int, bytes]:
@@ -188,4 +193,20 @@ async def gmail_transport(
         async with session.request(
             method, url, data=body, headers=headers, allow_redirects=False,
         ) as resp:
-            return resp.status, await resp.content.read(1024 * 1024)
+            return resp.status, await _read_body(resp)
+
+
+async def _read_body(resp) -> bytes:
+    """Read to the end of the response.
+
+    ``StreamReader.read(n)`` returns whatever is buffered, not n bytes, so
+    a reply that arrives in several chunks comes back truncated — which
+    reads as malformed JSON rather than as a short read.
+    """
+    chunks, total = [], 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > MAX_REPLY_BYTES:
+            raise GmailSendError("too_large", "Gmail's answer was too large to read")
+        chunks.append(chunk)
+    return b"".join(chunks)
