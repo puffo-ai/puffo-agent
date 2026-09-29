@@ -44,9 +44,10 @@ class FakeServer:
         self.refresh_error = None  # an HttpError the next refresh raises
         self.rotate = False
 
-    def row(self, index, value, *, version=1, state="ACTIVATED", type=TYPE):
+    def row(self, index, value, *, version=1, state="ACTIVATED", type=TYPE, expire_at=None):
         self.rows[type, index] = dict(
-            id=credential_id(OWNER, type, index), version=version, state=state, value=value
+            id=credential_id(OWNER, type, index), version=version, state=state, value=value,
+            expire_at=expire_at,
         )
 
     async def put(self, path, body):
@@ -93,7 +94,7 @@ class FakeServer:
             credential_type=credential_type, key_version=1,
         )
         return {"id": row["id"], "type": credential_type, "index": index,
-                "version": row["version"], "state": row["state"], "expire_at": None,
+                "version": row["version"], "state": row["state"], "expire_at": row["expire_at"],
                 "blob": base64url_encode(seal_credential(self.recipient, aad, row["value"]))}
 
 
@@ -370,3 +371,27 @@ async def test_a_rejected_cert_is_not_retried(server, agent):
     server.put = rejected
     assert not await keep_registering(agent, sleep=sleep)
     assert naps == ["put"]
+
+
+@pytest.mark.asyncio
+async def test_a_value_already_expired_on_arrival_is_not_handed_out(server, agent):
+    """Codex review on #426: the expiry check ran on cache hits only."""
+    server.row(0, b"access-old", type=RT_AT, expire_at="2000-01-01T00:00:00+00:00")
+    assert await agent.get(RT_AT, 0) is None
+
+
+@pytest.mark.asyncio
+async def test_an_older_version_landing_late_does_not_replace_a_newer_one(server, agent):
+    """Codex review on #426: two cache misses overlap an update and the newer
+    response lands first. Nothing local was invalidated, so the generation
+    fence cannot tell them apart; the version has to."""
+    server.row(0, b"secret-v1")
+    gate = server.hold = asyncio.Event()
+    old = asyncio.create_task(agent.get(TYPE, 0))
+    await asyncio.sleep(0)                        # the old GET has read v1
+    server.hold = None
+    server.row(0, b"secret-v2", version=2)       # a new row; the old GET keeps v1
+    assert (await agent.get(TYPE, 0)).value == b"secret-v2"
+    gate.set()                                    # now v1 lands
+    assert (await old).value == b"secret-v2"
+    assert (await agent.get(TYPE, 0)).value == b"secret-v2"

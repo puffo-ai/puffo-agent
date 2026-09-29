@@ -112,8 +112,14 @@ class AgentCredentials:
                 return None
             raise
         held = self._open(data, credential_type, index)
-        if generation != self._generation:
+        if generation != self._generation or _expired(held):
             return None
+        # Two overlapping fetches can land out of order; the older version
+        # must not replace the newer one. Only a revoke lowers what is held,
+        # and that goes through _invalidate, not here.
+        current = self._held.get(held.id)
+        if current is not None and current.version > held.version:
+            return current
         self._held[held.id] = held
         return held
 
