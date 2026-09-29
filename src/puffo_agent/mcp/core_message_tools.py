@@ -32,6 +32,10 @@ def register_message_tools(
     ) -> Any:
         """Post text to a channel ``ch_<uuid>`` or DM ``@<slug>``.
 
+        ``channel`` also accepts Inbox ``target_ref`` values: ``dm:<peer>``,
+        ``channel:<space_id>:<channel_id>`` and its ``:thread:<root_id>`` form.
+        Thread targets must resolve locally; conflicting ``root_id`` is rejected.
+
         ``root_id`` is an optional thread root; ``visibility_level`` is
         ``human``, ``default`` (default), or ``agent_only``; ``send_anyway``
         is an explicit held-send flag. ``covers`` lists the inbound

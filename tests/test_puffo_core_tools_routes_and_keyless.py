@@ -1311,11 +1311,12 @@ async def test_keyless_whoami_needs_no_keystore():
 
 
 @pytest.mark.asyncio
-async def test_keyless_send_message_dm_posts_unsigned():
+@pytest.mark.parametrize("destination", ["@alice-0001", "dm:alice-0001"])
+async def test_keyless_send_message_dm_posts_unsigned(destination):
     cfg, http, ms = _setup_keyless()
     mcp = _build_tools(cfg)
     result = await _call(mcp, "send_message", {
-        "channel": "@alice-0001", "text": "hi there",
+        "channel": destination, "text": "hi there",
     })
     assert "posted" in result
     sends = [(p, b) for m, p, b in http.calls if m == "POST_UNSIGNED"]
@@ -1326,12 +1327,13 @@ async def test_keyless_send_message_dm_posts_unsigned():
 
 
 @pytest.mark.asyncio
-async def test_keyless_send_message_channel_posts_unsigned():
+@pytest.mark.parametrize("destination", ["ch_abc", "channel:sp_test:ch_abc"])
+async def test_keyless_send_message_channel_posts_unsigned(destination):
     cfg, http, ms = _setup_keyless()
     await ms.mark_channel_space("ch_abc", "sp_test")
     mcp = _build_tools(cfg)
     result = await _call(mcp, "send_message", {
-        "channel": "ch_abc", "text": "hello channel",
+        "channel": destination, "text": "hello channel",
     })
     assert "posted" in result
     sends = [(p, b) for m, p, b in http.calls if m == "POST_UNSIGNED"]
@@ -1351,7 +1353,11 @@ async def test_keyless_send_message_channel_posts_unsigned():
 
 
 @pytest.mark.asyncio
-async def test_keyless_send_message_channel_threaded_carries_ids():
+@pytest.mark.parametrize("route", [
+    {"channel": "ch_abc", "root_id": "msg_root"},
+    {"channel": "channel:sp_test:ch_abc:thread:msg_root"},
+])
+async def test_keyless_send_message_channel_threaded_carries_ids(route):
     cfg, http, ms = _setup_keyless()
     await ms.mark_channel_space("ch_abc", "sp_test")
     await ms.store({
@@ -1362,7 +1368,7 @@ async def test_keyless_send_message_channel_threaded_carries_ids():
     })
     mcp = _build_tools(cfg)
     result = await _call(mcp, "send_message", {
-        "channel": "ch_abc", "text": "reply", "root_id": "msg_root",
+        **route, "text": "reply",
     })
     assert "posted" in result
     body = _keyless_sends(http)[0]
@@ -1399,7 +1405,8 @@ async def test_keyless_send_message_bypasses_bridge():
 
 
 @pytest.mark.asyncio
-async def test_keyless_attachments_bypasses_bridge():
+@pytest.mark.parametrize("destination", ["ch_abc", "channel:sp_test:ch_abc"])
+async def test_keyless_attachments_bypasses_bridge(destination):
     """Keyless attachments upload via post_bytes_unsigned and never touch
     the bridge's upload_blob/send_send."""
     bridge = _RecordingBridge()
@@ -1408,7 +1415,7 @@ async def test_keyless_attachments_bypasses_bridge():
     _write_ws_file(ws, "a.txt", b"aaa")
     mcp = _build_tools(cfg)
     await _call(mcp, "send_message_with_attachments", {
-        "paths": ["a.txt"], "channel": "ch_abc", "caption": "cap",
+        "paths": ["a.txt"], "channel": destination, "caption": "cap",
     })
     assert bridge.sent == []
     assert bridge.uploaded == []
@@ -1467,3 +1474,29 @@ def test_build_server_native_transport_is_not_keyless(tmp_path, monkeypatch):
         data_service_url="http://127.0.0.1:1",
     )
     assert captured["client"].keyless is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [
+    {"channel": "channel:sp_wrong:ch_abc"},
+    {"channel": "channel:sp_test:ch_abc:thread:msg_root", "root_id": "msg_other"},
+    {"channel": "channel:sp_test:ch_abc:thread:"},
+    {"channel": "dm:"},
+    {"channel": "dm:alice:extra"},
+    {"channel": "dm:@alice"},
+    {"channel": "dm:alice bob"},
+    {"channel": "channel:sp_test:ch_abc:thread:msg_missing"},
+])
+async def test_canonical_send_target_rejects_ambiguous_routes_before_upload(route, tmp_path):
+    """Copied context routes must not silently send to another space/thread."""
+    cfg, http, ms = _setup_keyless()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    cfg.workspace = str(tmp_path)
+    (tmp_path / "note.txt").write_text("private attachment")
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception):
+        await _call(mcp, "send_message_with_attachments", {
+            **route, "paths": ["note.txt"],
+        })
+    assert not http.calls
+    assert not http.uploaded

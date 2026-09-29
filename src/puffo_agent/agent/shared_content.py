@@ -259,7 +259,12 @@ Post a message to a Puffo.ai channel or DM a user.
 
 **Arguments:**
 - `channel` (required) — `"@<slug>"` for a DM, `"ch_<uuid>"` for a
-  channel. No `#<name>` shortcut; use `list_channels_in_all_spaces`
+  channel. You may also copy the Inbox `target_ref`: `dm:<peer>`,
+  `channel:<space_id>:<channel_id>`, or
+  `channel:<space_id>:<channel_id>:thread:<root_id>`. A thread target
+  supplies `root_id`; a conflicting explicit root is rejected. An unresolvable
+  thread target fails instead of falling back to a top-level send. The space
+  must match the local channel record. No `#<name>` shortcut; use `list_channels_in_all_spaces`
   to look up an id.
 - `text` (required) — message body. Markdown preserved on the wire.
 - `root_id` (optional) — `message_id` (`msg_<uuid>`) of the post you
@@ -346,7 +351,7 @@ separate messages).
   list for a single-file send. ``..`` and absolute paths are
   rejected; the cap is 10 files per call and 8 MiB per file.
 - `channel`: same syntax as `send_message` — `@<slug>` for a DM,
-  `ch_<uuid>` for a channel.
+  `ch_<uuid>` for a channel, or an Inbox `target_ref` (including threads).
 - `caption`: optional text posted alongside the files. Empty by
   default; recipients see just the attachments.
 - `root_id`: optional — reply with the attachments inside an
