@@ -8,6 +8,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Agents can send email from a Google account their operator shared with
+  them.** A new `gmail_send` tool takes a recipient, a subject and a plain
+  text body; the operator's control is the share itself, so there is no
+  per-send confirmation. With more than one account shared, the agent must
+  name which to send from and the error lists the choices. A send reports one
+  of three outcomes, and "unknown" means the message may have gone out and
+  must not be sent again without checking the Sent folder. Recipients, bodies
+  and tokens never reach the log. (#428)
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate

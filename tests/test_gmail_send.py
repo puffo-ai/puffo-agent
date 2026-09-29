@@ -273,3 +273,242 @@ async def test_no_running_worker_is_a_definite_failure_not_unknown():
             assert resp.status == 409 and (await resp.json())["code"] == "no_worker"
     finally:
         rpc_service._RPC_RESOLVER = previous
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("to", ["", "   "])
+async def test_a_message_with_no_recipient_never_reaches_gmail(to):
+    gmail = Gmail()
+    with pytest.raises(GmailSendError) as exc:
+        await _send(Wallet(), gmail, to=to)
+    assert exc.value.code == "bad_request" and gmail.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_share_that_yields_no_token_at_all_is_a_definite_failure():
+    """Revoked between the list and the send: nothing to authorize with."""
+    wallet = Wallet(cached=None)
+    wallet.refresh = lambda *a, **k: _none_token()
+    gmail = Gmail()
+    with pytest.raises(GmailSendError) as exc:
+        await _send(wallet, gmail)
+    assert exc.value.code == "not_held" and gmail.requests == []
+
+
+async def _none_token():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_is_not_json_is_read_by_status_alone():
+    """An HTML error page from a proxy: 2xx may have gone out, 4xx did not."""
+    class Raw(Gmail):
+        async def __call__(self, url, body, headers):
+            self.requests.append((headers["authorization"], json.loads(body)))
+            status = self.answers.pop(0)
+            return status, b"<html>no json here</html>"
+
+    assert (await _send(Wallet(), Raw(200)))["status"] == "unknown"
+    with pytest.raises(GmailSendError) as exc:
+        await _send(Wallet(), Raw(400))
+    assert exc.value.code == "gmail_400"
+
+
+@pytest.mark.asyncio
+async def test_gmails_own_refusal_text_reaches_the_agent():
+    gmail = Gmail((400, {"error": {"message": "Recipient address required"}}))
+    with pytest.raises(GmailSendError) as exc:
+        await _send(Wallet(), gmail)
+    assert "Recipient address required" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_the_real_transport_returns_the_status_and_body_it_was_given(unused_tcp_port):
+    """``gmail_transport`` itself, against a local server standing in for Gmail."""
+    from puffo_agent.portal.gmail_send import gmail_transport
+
+    seen = {}
+
+    async def route(request):
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = await request.read()
+        return web.json_response({"id": "m-real", "threadId": "t-real"})
+
+    app = web.Application()
+    app.router.add_post("/send", route)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    try:
+        status, reply = await gmail_transport(
+            f"http://127.0.0.1:{unused_tcp_port}/send", b'{"raw":"x"}',
+            {"authorization": "Bearer t", "content-type": "application/json"},
+        )
+        assert (status, json.loads(reply)["id"]) == (200, "m-real")
+        assert seen["auth"] == "Bearer t" and seen["body"] == b'{"raw":"x"}'
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_tool_hands_the_call_to_the_daemon():
+    """The tool registers only with an RPC link, and forwards verbatim."""
+    from types import SimpleNamespace as NS
+
+    from puffo_agent.mcp.core_gmail_tools import register_gmail_tools
+
+    registered = {}
+
+    class FakeMcp:
+        def tool(self):
+            def decorate(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return decorate
+
+    register_gmail_tools(FakeMcp(), NS(rpc_client=None))
+    assert registered == {}                       # no link, no tool
+
+    calls = []
+
+    async def rpc_gmail_send(**kw):
+        calls.append(kw)
+        return {"status": "sent", "message_id": "m-9"}
+
+    register_gmail_tools(FakeMcp(), NS(rpc_client=NS(gmail_send=rpc_gmail_send)))
+    out = await registered["gmail_send"](
+        to="b@x", subject="s", body="hello", from_account="me@example.com")
+    assert out == {"status": "sent", "message_id": "m-9"}
+    assert calls == [{"to": "b@x", "subject": "s", "body": "hello",
+                      "from_account": "me@example.com"}]
+
+
+async def _rpc_against(port, route):
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-send", route)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner, PuffoRpcClient(f"http://127.0.0.1:{port}", "agent-1")
+
+
+@pytest.mark.asyncio
+async def test_the_rpc_hop_passes_the_chosen_account_on(unused_tcp_port):
+    seen = {}
+
+    async def route(request):
+        seen.update(await request.json())
+        return web.json_response({"status": "sent", "message_id": "m-1"})
+
+    runner, client = await _rpc_against(unused_tcp_port, route)
+    try:
+        await client.gmail_send(to="b@x", subject="s", body="b", from_account="me@example.com")
+        assert seen["from_account"] == "me@example.com"
+        seen.clear()
+        await client.gmail_send(to="b@x", subject="s", body="b")
+        assert "from_account" not in seen          # omitted, not sent empty
+    finally:
+        await client.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b"not json at all", b'"a string, not an object"'])
+async def test_an_unreadable_daemon_answer_is_unknown_not_a_failure(unused_tcp_port, payload):
+    """A 200 we cannot read may still have sent the message."""
+
+    async def route(request):
+        return web.Response(body=payload, content_type="application/json")
+
+    runner, client = await _rpc_against(unused_tcp_port, route)
+    try:
+        out = await client.gmail_send(to="b@x", subject="s", body="b")
+        assert out["status"] == "unknown"
+    finally:
+        await client.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_daemon_that_is_not_listening_is_a_definite_failure(unused_tcp_port):
+    client = PuffoRpcClient(f"http://127.0.0.1:{unused_tcp_port}", "agent-1")
+    try:
+        with pytest.raises(RuntimeError, match="nothing was sent"):
+            await client.gmail_send(to="b@x", subject="s", body="b")
+    finally:
+        await client.close()
+
+
+def _route_app():
+    from puffo_agent.portal import rpc_service
+
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-send", rpc_service.gmail_send_route)
+    return app, rpc_service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body, data", [
+    ("not json", None),
+    (None, {"to": "b@x", "subject": "s", "body": "b", "extra": "no"}),
+    (None, {"to": "b@x", "subject": "s", "body": 7}),
+    (None, ["not", "an", "object"]),
+])
+async def test_the_route_refuses_a_malformed_request_outright(body, data):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    app, _ = _route_app()
+    async with TestClient(TestServer(app)) as http:
+        kw = {"data": body} if body is not None else {"json": data}
+        resp = await http.post("/v1/rpc/agent-1/gmail-send", **kw)
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["sent", "refused"])
+async def test_the_route_reaches_the_worker_and_keeps_the_two_outcomes_apart(outcome, monkeypatch):
+    """Route -> host_mcp_handler -> gmail_send, the seam the smoke test uses."""
+    from types import SimpleNamespace as NS
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import gmail_send as gs
+
+    answer = _sent("m-route") if outcome == "sent" else (400, {"error": {"message": "nope"}})
+
+    async def transport(url, body, headers):
+        return answer[0], json.dumps(answer[1]).encode()
+
+    monkeypatch.setattr(gs, "gmail_transport", transport)
+    app, rpc_service = _route_app()
+    previous = rpc_service._RPC_RESOLVER
+    rpc_service._RPC_RESOLVER = lambda agent_id: NS(credentials=Wallet())
+    try:
+        async with TestClient(TestServer(app)) as http:
+            resp = await http.post("/v1/rpc/agent-1/gmail-send",
+                                   json={"to": "b@x", "subject": "s", "body": "b"})
+            payload = await resp.json()
+            if outcome == "sent":
+                assert resp.status == 200 and payload["message_id"] == "m-route"
+            else:
+                assert resp.status == 400 and payload["code"] == "gmail_400"
+    finally:
+        rpc_service._RPC_RESOLVER = previous
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_the_mcp_side_cannot_parse_stays_a_definite_failure(unused_tcp_port):
+    """The daemon answers 4xx only when nothing was sent, so an unreadable
+    body must not soften into "may have been sent"."""
+
+    async def route(request):
+        return web.Response(body=b"<html>gateway</html>", status=400,
+                            content_type="application/json")
+
+    runner, client = await _rpc_against(unused_tcp_port, route)
+    try:
+        with pytest.raises(RuntimeError, match="not sent"):
+            await client.gmail_send(to="b@x", subject="s", body="b")
+    finally:
+        await client.close()
+        await runner.cleanup()

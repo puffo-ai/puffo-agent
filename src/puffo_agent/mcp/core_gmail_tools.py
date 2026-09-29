@@ -6,8 +6,8 @@ from mcp.server.fastmcp import FastMCP
 
 
 def register_gmail_tools(mcp: FastMCP, cfg: Any) -> None:
-    # Sending goes through the daemon, which holds the agent's credentials;
-    # without the RPC link (ws-local) there is nothing to send with.
+    # The daemon holds the credentials; without the RPC link there is
+    # nothing to send with.
     if getattr(cfg, "rpc_client", None) is None:
         return
 

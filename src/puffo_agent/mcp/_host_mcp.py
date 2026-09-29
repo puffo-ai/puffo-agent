@@ -141,10 +141,12 @@ class PuffoRpcClient:
     async def gmail_send(
         self, *, to: str, subject: str, body: str, from_account: str = "",
     ) -> dict[str, Any]:
-        """Send through the daemon. Unlike other routes, losing the answer is
-        not a failure: the daemon may already have sent the message, so a
-        dropped connection, a timeout or a 5xx comes back as "unknown" and
-        must never be retried as if nothing happened (Jeff 227820)."""
+        """Send through the daemon.
+
+        Unlike other routes, a lost answer is not a failure: the daemon may
+        already have sent it, so a hang-up, timeout or 5xx is "unknown" and
+        must never be retried (Jeff 227820).
+        """
         path = f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/gmail-send"
         payload = {"to": to, "subject": subject, "body": body}
         if from_account:
@@ -157,19 +159,22 @@ class PuffoRpcClient:
         session = await self._get_session()
         try:
             async with session.post(f"{self.base_url}{path}", json=payload) as resp:
-                if resp.status >= 500:
+                status = resp.status
+                if status >= 500:
                     return unknown
                 try:
                     data = await resp.json()
                 except Exception:
-                    return unknown
+                    data = None
         except aiohttp.ClientConnectorError as exc:
             raise RuntimeError(f"gmail_send: daemon unreachable, nothing was sent: {exc}") from exc
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return unknown
-        if resp.status >= 400:
+        if status >= 400:
+            # The daemon answers 4xx only when nothing was sent, so an
+            # unreadable body here must not soften into "may have been sent".
             error = data.get("error") if isinstance(data, dict) else None
-            raise RuntimeError(f"not sent: {error or resp.status}")
+            raise RuntimeError(f"not sent: {error or status}")
         if not isinstance(data, dict):
             return unknown
         return data

@@ -51,8 +51,7 @@ class HostMcpContext:
     # The worker's single persistent semantic send coordinator. Package 4
     # supplies it; optional preserves existing context constructors.
     send_coordinator: Any = None
-    # The worker's AgentCredentials (credential design v2), for tools that
-    # use a credential shared with this agent. None when it cannot hold any.
+    # The worker's AgentCredentials (design v2); None when it holds none.
     credentials: Any = None
 
 

@@ -520,8 +520,8 @@ def _warm_context(agent_id: str) -> HostMcpContext | None:
 
 
 async def gmail_send_route(request: web.Request) -> web.Response:
-    """Send one message through Gmail. A 400 means definitely not sent; a
-    200 carries ``status`` "sent" or "unknown" (may have been sent)."""
+    """Send one message through Gmail. 4xx: definitely not sent. 200 carries
+    ``status`` "sent" or "unknown"."""
     from .gmail_send import GmailSendError
 
     try:
@@ -538,8 +538,8 @@ async def gmail_send_route(request: web.Request) -> web.Response:
         )
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
-        # Definitely not sent. A 503 would read as "unknown" on the MCP side
-        # and tell the agent a message may have gone out (Boris 227840).
+        # 409, not 503: a 5xx reads as "unknown" one hop up and would tell
+        # the agent a message may have gone out (Boris 227840).
         return web.json_response(
             {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
             status=409,

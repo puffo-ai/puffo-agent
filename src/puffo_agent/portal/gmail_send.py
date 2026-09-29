@@ -1,20 +1,10 @@
 """Send mail through Gmail as a Google account shared with this agent.
 
-The token comes from the agent's credential-v2 view (``credentials.py``):
-the access token it holds, or a fresh one from a share-based refresh. The
-operator's control is the share itself; there is no per-send confirmation.
-
-What matters most here is telling three outcomes apart, because an agent
-that reads "failed" will send again:
-
-- **sent**: Gmail answered with a message id.
-- **failed**: definitely not sent (never reached Gmail, or Gmail refused).
-- **unknown**: the request went out and no answer came back (timeout, a
-  dropped connection, an unreadable reply). It may have been sent, so this
-  is never retried and never reported as a failure (Jeff 227820).
-
-The token, recipients and body never go to the log; only the message id or
-a failure code does (Boris 227821).
+An agent that reads "failed" sends again, so three outcomes stay distinct
+(Jeff 227820): *sent* (Gmail gave a message id), *failed* (definitely not
+sent), *unknown* (the request went out and the answer was lost, so never
+retried). Only the message id and failure codes reach the log, never the
+token, recipients or body (Boris 227821).
 """
 
 from __future__ import annotations
@@ -55,8 +45,7 @@ class GmailSendError(Exception):
 def build_message(to: str, subject: str, body: str) -> bytes:
     """RFC 5322 bytes. Gmail sets From to the authorized account.
 
-    The email package refuses a header value containing CR or LF, so a
-    recipient or subject cannot smuggle in extra headers.
+    The email package refuses CR/LF in a header, blocking header injection.
     """
     if not to.strip():
         raise GmailSendError("bad_request", "to must name at least one recipient")
@@ -104,7 +93,7 @@ async def send(
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return _unknown("the connection dropped after the request was sent")
         if status == 401 and attempt == 1:
-            # A definite refusal of the token: nothing was sent. One refresh.
+            # A refused token means nothing was sent. One refresh.
             token = await _access_token(credentials, index, fresh=True)
             continue
         return _outcome(status, reply)
@@ -149,8 +138,6 @@ async def _before_sending(code: str, call):
     """Anything failing before the Gmail request goes out: nothing was sent."""
     try:
         return await call
-    except GmailSendError:
-        raise
     except Exception as exc:  # noqa: BLE001 - reported as a definite, logged-by-code failure
         _log_failure(code)
         raise GmailSendError(code, f"nothing was sent: {type(exc).__name__}: {exc}") from exc
@@ -166,10 +153,10 @@ def _outcome(status: int, reply: bytes) -> dict:
             logger.info("gmail send: sent %s", data["id"])
             return {"status": "sent", "message_id": data["id"],
                     "thread_id": data.get("threadId", "")}
-        # Accepted but no id we can read: it may well have gone out.
+        # Accepted with no id we can read: it may well have gone out.
         return _unknown(f"Gmail answered {status} without a message id")
     if status >= 500:
-        # A server error after accepting the request says nothing definite.
+        # A server error after the request went out says nothing definite.
         return _unknown(f"Gmail answered {status}")
     reason = ""
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
