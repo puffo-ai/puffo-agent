@@ -185,6 +185,25 @@ async def test_a_move_interrupted_before_saving_finishes_without_provisioning_tw
 
 
 @pytest.mark.asyncio
+async def test_an_existing_resident_binding_with_another_workspace_is_rejected(lingtai):
+    old = lingtai.argv(lingtai.legacy)
+    _write_agent("a1", old)
+    await move_to_resident_registry("a1", old)
+    _write_agent("a1", old)
+    registry = json.loads(lingtai.resident.read_text())
+    registry["runtimes"][RUNTIME_ID]["workspace"] = str(lingtai.workspace / "other")
+    lingtai.resident.write_text(json.dumps(registry))
+    before = lingtai.resident.read_bytes()
+
+    with pytest.raises(ValueError, match="workspace"):
+        await move_to_resident_registry("a1", old)
+
+    assert _saved_argv("a1") == old
+    assert lingtai.resident.read_bytes() == before
+    assert len(_provisions(lingtai)) == 1
+
+
+@pytest.mark.asyncio
 async def test_an_argv_already_on_the_resident_registry_is_left_alone(lingtai):
     current = lingtai.argv(lingtai.resident)
     _write_agent("a1", current)

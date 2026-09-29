@@ -71,7 +71,13 @@ async def move_to_resident_registry(agent_id: str, harness_command: list[str]) -
     # Already moved by an earlier start that stopped before saving the argv.
     # Anything else goes to provision, which refuses every conflict itself.
     placed = _row_for(await _query(str(executable), agent_dir, resident), agent_dir)
-    if not (placed and placed.get("status") == "bound" and placed.get("runtime_id") == runtime_id):
+    if placed and placed.get("status") == "bound" and placed.get("runtime_id") == runtime_id:
+        placed_workspace = placed.get("workspace")
+        if (not isinstance(placed_workspace, str)
+                or not Path(placed_workspace).is_absolute()
+                or Path(placed_workspace).resolve() != Path(workspace).resolve()):
+            raise ValueError(f"resident LingTai binding {runtime_id} has a different workspace")
+    else:
         await _run(executable, Path(workspace), [
             "puffo-v0", "provision", "--runtime-id", runtime_id,
             "--agent-dir", str(agent_dir), "--workspace", workspace,
