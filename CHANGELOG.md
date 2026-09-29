@@ -19,6 +19,42 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   use shared credentials yet, and there is no tool for it: the first consumer
   is the Google connector. (#426)
 
+## [2.0.11] - 2026-09-29
+
+### Added
+
+- Paid-data status updates show the quoted price while a purchase is pending
+  and the settled cost after it completes. (#423)
+
+### Fixed
+
+- LingTai bindings imported before attach support automatically migrate to
+  the resident registry on startup. Migration preserves the runtime id,
+  validates the active binding and workspace, and retains the old configuration
+  if migration fails. (#430)
+- Message and attachment sends accept Inbox `target_ref` addresses for DMs,
+  channels and threads. Invalid spaces, conflicting roots and unverifiable
+  thread targets fail without silently sending to the channel. (#431)
+
+- **Codex agents keep their conversation across daemon upgrades.** Since
+  July the daemon rotated every cli-local Codex session at startup whenever
+  the puffo MCP tool surface had changed — in practice on every release —
+  and did so without logging, so agents silently forgot their standing
+  instructions after each upgrade. Codex loads MCP servers per process and
+  every worker starts a fresh process at boot, so the rotation only
+  discarded context; the daemon now records the fingerprint change and
+  resumes the saved session. A session refresh that does drop a native
+  session, and the session each worker selects at start, are now logged.
+
+- **Claude autonomous turns no longer report a spurious crash after 30
+  minutes.** Under message-lifecycle v1 the CLI queues an autonomous turn's
+  command itself, so its result frame was discarded as unowned and the turn
+  never completed; the idle watchdog then quarantined a turn whose work had
+  already finished. The result frame now closes an autonomous turn, and a
+  quarantine whose provider stop is confirmed and whose turn admitted no
+  messages resolves itself on the next worker start instead of parking the
+  agent until an operator retries.
+
 ## [2.0.10] - 2026-09-27
 
 ### Added

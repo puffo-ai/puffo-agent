@@ -20,6 +20,8 @@ class SemanticSendRequest:
     visibility_level: str = "default"
     send_anyway: bool = False
     covers: tuple[str, ...] = ()
+    # Derived locally from target_ref, never accepted or serialized as a tool field.
+    _require_thread: bool = field(default=False, repr=False)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> SemanticSendRequest:

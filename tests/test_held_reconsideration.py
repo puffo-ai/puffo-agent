@@ -578,12 +578,16 @@ async def _assert_one_shot_held_send(case):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["native", "keyless"])
-async def test_complete_exact_held_identity_and_one_shot_contract(transport):
+@pytest.mark.parametrize("canonical_target", [False, True])
+async def test_complete_exact_held_identity_and_one_shot_contract(transport, canonical_target):
     case = (
         await _native_held_contract()
         if transport == "native"
         else await _keyless_held_contract()
     )
+    if canonical_target:
+        space = await case.coordinator.data_client.lookup_channel_space(case.destination)
+        case.destination = f"channel:{space}:{case.destination}"
     await _assert_initial_held_contract(case)
     await _assert_wrong_turn_and_pair(case)
     await _assert_held_identity_mismatches(case)

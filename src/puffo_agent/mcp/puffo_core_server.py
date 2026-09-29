@@ -141,12 +141,8 @@ def _capture_tool_surface() -> dict[str, dict[str, object]]:
 
 
 def mcp_tool_fingerprint() -> str:
-    """Hash of the tool surface the model is offered (see
-    ``_capture_tool_surface``). When it changes, the daemon rotates stale
-    codex sessions at startup (``_respawn_codex_on_mcp_change_at_startup``).
-    The earlier version hashed only names + param names under a dummy
-    monid-disabled config and skipped the memory tools, so enabling monid
-    never moved the hash and the session kept a monid-less surface."""
+    """Tool-surface hash: docstrings + param names/required only (defaults
+    could leak process addresses)."""
     import hashlib
     import json
 

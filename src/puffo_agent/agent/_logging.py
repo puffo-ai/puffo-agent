@@ -67,6 +67,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "turn.finalized",
     "turn.autonomous_adoption",
     "turn.autonomous_finalized",
+    "turn.recovery_resolved",
     "turn.uncovered_messages",
     "turn.cover_reconciliation_failed",
     "runtime.command",

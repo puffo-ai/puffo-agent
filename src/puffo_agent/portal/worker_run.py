@@ -422,6 +422,16 @@ class StandardWorkerRun:
                 "native_session_harness", ""
             ),
         )
+        logger.info(
+            "agent %s: native session selection: source=%s selected=%s "
+            "persisted=%s persisted_harness=%s harness=%s",
+            paths.agent_id,
+            prepared.migration_source,
+            prepared.native_session_id or "<fresh>",
+            persisted.get("native_session_id", "") or "<none>",
+            persisted.get("native_session_harness", "") or "<none>",
+            prepared.harness_name,
+        )
         try:
             return await self._bind_driver_runtime(
                 outbox, prepared, persisted
@@ -456,12 +466,14 @@ class StandardWorkerRun:
         if runtime.lingtai_attach:
             if not local_acp:
                 raise RuntimeError("LingTai attach runs only on the cli-local acp harness")
-            target = await running_lingtai_target(runtime.harness_command)
+            command = await self._resident_lingtai_command(prepared)
+            target = await running_lingtai_target(command)
         elif local_acp and _lingtai_constrained_profile(
             tuple(runtime.harness_command)
         ) == "puffo-v1":
             try:
-                target = await running_lingtai_target(runtime.harness_command)
+                command = await self._resident_lingtai_command(prepared)
+                target = await running_lingtai_target(command)
             except (ValueError, OSError) as exc:
                 logger.info(
                     "agent %s: LingTai probe failed, starting LingTai: %s",
@@ -477,6 +489,26 @@ class StandardWorkerRun:
         logger.info("agent %s: attaching to running LingTai",
                     prepared.preparer.agent_id)
         return AcpAttachDriver(target)
+
+    async def _resident_lingtai_command(self, prepared: Any) -> list[str]:
+        """The harness argv, moved off Puffo's pre-attach registry if needed.
+
+        A running LingTai accepts an attach only through its own registry. A
+        failed move keeps the old argv, which still starts LingTai itself.
+        """
+        from .control.lingtai_registry_move import move_to_resident_registry
+
+        runtime = prepared.preparer.agent_cfg.runtime
+        try:
+            return await move_to_resident_registry(
+                prepared.preparer.agent_id, runtime.harness_command,
+            )
+        except Exception as exc:  # noqa: BLE001 - the old argv still starts LingTai
+            logger.warning(
+                "agent %s: could not move LingTai runtime to its own registry: %s",
+                prepared.preparer.agent_id, exc,
+            )
+            return runtime.harness_command
 
     async def _bind_driver_runtime(
         self,

@@ -86,7 +86,7 @@ async def test_worker_preparation_failure_is_best_effort(
 
     monkeypatch.setattr(
         daemon_mod,
-        "_respawn_codex_on_mcp_change_at_startup",
+        "_record_mcp_fingerprint_at_startup",
         fail_preparation,
     )
 
@@ -228,7 +228,7 @@ async def test_daemon_run_cleans_partial_services_before_readiness(
     monkeypatch.setattr(daemon_mod, "set_rpc_resolver", lambda _value: None)
     monkeypatch.setattr(daemon_mod, "clear_daemon_pid", lambda: None)
     monkeypatch.setattr(daemon_mod, "clear_stop_request", lambda: None)
-    monkeypatch.setattr(daemon_mod, "_respawn_codex_on_mcp_change_at_startup", lambda: None)
+    monkeypatch.setattr(daemon_mod, "_record_mcp_fingerprint_at_startup", lambda: None)
     monkeypatch.setattr(daemon_mod, "_log_outdated_version_warning", noop)
     monkeypatch.setattr(daemon_mod, "_sweep_archived_pending_revokes_at_startup", noop)
     monkeypatch.setattr(daemon_mod, "_migrate_linked_agents_at_startup", noop)

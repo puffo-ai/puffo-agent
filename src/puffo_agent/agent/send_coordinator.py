@@ -35,6 +35,7 @@ from .channel_format import is_channel_format_mismatch
 from .held_context import build_held_context_output
 from .message_projection import CONTEXT_VERSION
 from .send_models import SemanticSendRequest, SendResult
+from .send_routing import normalize_send_target
 from .send_response_validation import (
     BASELINE_PERSISTENCE_WARNING,
     coordinator_config,
@@ -237,6 +238,7 @@ class SendCoordinator:
                 raise ValueError("pass either a request or keyword fields, not both")
             if not isinstance(request, SemanticSendRequest):
                 raise ValueError("invalid semantic send request")
+            request = await normalize_send_target(request, self.data_client)
             return await self._send_request(request)
         except Exception as exc:  # semantic facade never leaks tool exceptions
             logger.exception("semantic send failed before transport")
@@ -536,11 +538,11 @@ class SendCoordinator:
         channel_id: str,
         boundary: _ChannelSendBoundary,
     ) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]] | dict[str, Any]:
-        from ..mcp.puffo_core_tools import _resolve_outgoing_root
+        from .send_routing import resolve_send_root
         from ._visibility import resolve_visibility
 
-        root_id, root_note = await _resolve_outgoing_root(
-            request.root_id,
+        root_id, root_note = await resolve_send_root(
+            request,
             self.data_client,
             self_slug=self.slug,
             channel_id=channel_id,
@@ -1323,7 +1325,7 @@ class SendCoordinator:
         encrypt: bool = True,
         prepared: tuple[list[AttachmentMeta], str] | None = None,
     ) -> dict[str, Any]:
-        from ..mcp.puffo_core_tools import _resolve_outgoing_root
+        from .send_routing import resolve_send_root
         from ._visibility import resolve_visibility
 
         destination = request.destination.strip()
@@ -1334,8 +1336,8 @@ class SendCoordinator:
             encrypt=encrypt,
         )
 
-        root, root_note = await _resolve_outgoing_root(
-            request.root_id,
+        root, root_note = await resolve_send_root(
+            request,
             self.data_client,
             self_slug=self.slug,
             channel_id=channel_id,
