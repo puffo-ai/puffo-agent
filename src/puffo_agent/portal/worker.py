@@ -1443,6 +1443,7 @@ class Worker:
             http_client=client.http,
             message_client=client,
             send_coordinator=getattr(client, "send_delegate", None),
+            credentials=getattr(self, "_credentials", None),
         )
 
     # Set by stop(): True only when the task ended and the adapter and

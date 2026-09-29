@@ -51,6 +51,9 @@ class HostMcpContext:
     # The worker's single persistent semantic send coordinator. Package 4
     # supplies it; optional preserves existing context constructors.
     send_coordinator: Any = None
+    # The worker's AgentCredentials (credential design v2), for tools that
+    # use a credential shared with this agent. None when it cannot hold any.
+    credentials: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -708,6 +711,17 @@ async def read_inbox(
         cursor=cursor,
         limit=limit,
         tool_arguments=arguments,
+    )
+
+
+async def gmail_send(
+    ctx: HostMcpContext, *, to: str, subject: str, body: str, from_account: str = "",
+) -> dict[str, object]:
+    """Send through Gmail with the Google account shared with this agent."""
+    from .gmail_send import send
+
+    return await send(
+        ctx.credentials, to=to, subject=subject, body=body, from_account=from_account,
     )
 
 

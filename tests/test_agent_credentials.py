@@ -71,11 +71,12 @@ class FakeServer:
                 "at_version": at["version"], "rt_version": rt["version"], "rotated": self.rotate}
 
     async def get(self, path):
-        if path == "/v2/credentials":
+        if path.startswith("/v2/credentials?type=") or path == "/v2/credentials":
+            wanted = path.partition("?type=")[2]
             return {"credentials": [
                 {"id": r["id"], "type": t, "index": i, "version": r["version"],
-                 "state": r["state"]}
-                for (t, i), r in self.rows.items()
+                 "state": r["state"], "alias": f"acct-{i}"}
+                for (t, i), r in self.rows.items() if not wanted or t == wanted
             ]}
         _, _, _, credential_type, index = path.split("/")
         index = int(index)
@@ -530,3 +531,12 @@ async def test_an_unreadable_identity_leaves_the_agent_without_credentials(serve
 
     context.client.keystore.load_identity = unreadable
     assert run._build_credentials(context) is None
+
+
+@pytest.mark.asyncio
+async def test_held_lists_only_usable_credentials_of_the_type_asked(server, agent):
+    server.row(2, b"s", type=RT)
+    server.row(0, b"s", type=RT)
+    server.row(1, b"s", type=RT, state="INACTIVATED")
+    server.row(5, b"s")                           # another type
+    assert await agent.held(RT) == [(0, "acct-0"), (2, "acct-2")]

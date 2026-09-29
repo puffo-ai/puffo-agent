@@ -519,6 +519,36 @@ def _warm_context(agent_id: str) -> HostMcpContext | None:
     return resolver(agent_id) if resolver is not None else None
 
 
+async def gmail_send_route(request: web.Request) -> web.Response:
+    """Send one message through Gmail. A 400 means definitely not sent; a
+    200 carries ``status`` "sent" or "unknown" (may have been sent)."""
+    from .gmail_send import GmailSendError
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    fields = ("to", "subject", "body", "from_account")
+    if not isinstance(body, dict) or not set(body) <= set(fields) or not all(
+        isinstance(body.get(k, ""), str) for k in fields
+    ):
+        return web.json_response(
+            {"error": "gmail_send accepts only string to, subject, body, from_account"},
+            status=400,
+        )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        result = await host_mcp_handler.gmail_send(
+            ctx, to=body.get("to", ""), subject=body.get("subject", ""),
+            body=body.get("body", ""), from_account=body.get("from_account", ""),
+        )
+    except GmailSendError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+    return web.json_response(result)
+
+
 async def create_reminder_route(request: web.Request) -> web.Response:
     """Strict loopback route for the semantic local reminder create tool."""
     try:
@@ -760,6 +790,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/create-reminder",
         create_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/gmail-send",
+        gmail_send_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",

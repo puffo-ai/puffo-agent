@@ -99,6 +99,16 @@ class AgentCredentials:
         self._held[held.id] = held
         return held
 
+    async def held(self, credential_type: str) -> list[tuple[int, str]]:
+        """``(index, alias)`` of every usable credential of this type this
+        agent holds, lowest index first. Asks the server; caches nothing."""
+        data = await self._http.get(f"/v2/credentials?type={credential_type}")
+        return sorted(
+            (item["index"], item.get("alias") or "")
+            for item in data["credentials"]
+            if item["type"] == credential_type and item["state"] == "ACTIVATED"
+        )
+
     async def reconcile(self) -> None:
         """Drop everything the server no longer lists as held and current.
 
