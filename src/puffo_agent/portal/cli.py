@@ -53,6 +53,7 @@ from .state import (
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     request_failed_agent_restart,
+    restart_flag_path,
     shared_fs_dir,
     stop_requested_for,
     write_refresh_token_request,
@@ -713,6 +714,52 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
 
 def cmd_agent_resume(args: argparse.Namespace) -> int:
     return _set_agent_state(args.id, "running")
+
+
+def cmd_agent_recover(args: argparse.Namespace) -> int:
+    """Inspect, or authorize replay of, a stuck operator-recovery gate."""
+    from ..agent.turn_recovery import authorize_retry, read_recovery
+
+    if not agent_yml_path(args.id).exists():
+        print(f"error: agent {args.id!r} not found", file=sys.stderr)
+        return 2
+    workspace = AgentConfig.load(args.id).resolve_workspace_dir()
+    record = read_recovery(workspace)
+    if record is None or record.resolved:
+        print(f"agent {args.id!r}: no recovery gate is open")
+        return 0
+
+    print(f"agent {args.id!r} recovery gate:")
+    print(f"  reason:               {record.reason}")
+    print(f"  session_ref:          {record.session_ref}")
+    print(f"  turn_ref:             {record.turn_ref}")
+    print(f"  provider_session_id:  {record.provider_session_id}")
+    print(f"  provider_turn_id:     {record.provider_turn_id}")
+    print(f"  durable_turn_id:      {record.durable_turn_id or '(unbound)'}")
+    print(f"  provider stopped:     {record.stopped}")
+    print(f"  retry authorized:     {record.retry_requested}")
+    if not args.retry:
+        print(
+            "\nThe quarantined turn's messages stay unprocessed until you "
+            "authorize replay:\n"
+            f"  puffo-agent agent recover {args.id} --retry\n"
+            "Replay redelivers those messages, so anything the original turn "
+            "already sent or wrote may happen twice."
+        )
+        return 0
+
+    try:
+        authorize_retry(workspace)
+    except ValueError as exc:
+        print(f"error: {exc}; cannot authorize replay", file=sys.stderr)
+        return 1
+    flag = restart_flag_path(args.id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    print("\nreplay authorized; the worker restart will requeue the turn")
+    if not is_daemon_alive():
+        print("daemon is not running — this happens at its next start.")
+    return 0
 
 
 def _summarise_credentials(path: Path) -> str:

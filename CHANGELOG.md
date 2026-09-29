@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`puffo-agent agent recover <id>` unparks an agent stuck on a recovery
+  gate.** A quarantined turn parks its agent until an operator accepts that
+  replaying it may repeat external effects, and only the operator's remote
+  client could accept that — a local deployment had to hand-edit
+  `turn_recovery.json`. The command now shows the gate (reason, session,
+  turn, whether the provider stopped), and `--retry` authorizes the replay
+  and restarts the worker, which requeues the turn's messages. It refuses
+  while the provider stop is unconfirmed. The parked-state diagnostic names
+  the command instead of the internal wire ops.
+
 ### Fixed
 
 - **Codex agents keep their conversation across daemon upgrades.** Since

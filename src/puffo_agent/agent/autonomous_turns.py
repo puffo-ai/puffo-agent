@@ -430,7 +430,12 @@ class AutonomousTurnLifecycleMixin:
     def _report_recovery_required(self) -> None:
         record = read_recovery(self.workspace)
         reference = f" session_ref={record.session_ref} turn_ref={record.turn_ref}" if record else ""
-        diagnostic = "Operator recovery required: original actions may have external effects; use inspect_recovery before explicit retry." + reference
+        diagnostic = (
+            "Operator recovery required: original actions may have external "
+            "effects. Inspect with `puffo-agent agent recover "
+            f"{self.agent_id or '<agent-id>'}`, then authorize replay with "
+            "`--retry`." + reference
+        )
         self.health = RuntimeHealth("degraded", diagnostic)
         if self.process_outcome is not None:
             self.process_outcome("recovery_required", diagnostic)

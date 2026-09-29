@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from ..portal.host_assets import atomic_write_private
@@ -58,3 +58,20 @@ def write_recovery(workspace: str | Path, record: TurnRecovery) -> None:
 def recovery_required(workspace: str | Path) -> bool:
     record = read_recovery(workspace)
     return record is not None and not record.resolved
+
+
+def authorize_retry(workspace: str | Path) -> TurnRecovery | None:
+    """Record explicit replay authorization; idempotent, None when no gate.
+
+    ValueError while the stop is unconfirmed: the turn may still be running,
+    so replay would repeat its effects.
+    """
+    record = read_recovery(workspace)
+    if record is None or record.resolved:
+        return None
+    if not record.stopped:
+        raise ValueError("provider stop is unconfirmed")
+    if not record.retry_requested:
+        record = replace(record, retry_requested=True)
+        write_recovery(workspace, record)
+    return record
