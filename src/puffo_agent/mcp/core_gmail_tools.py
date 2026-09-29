@@ -31,3 +31,52 @@ def register_gmail_tools(mcp: FastMCP, cfg: Any) -> None:
         return await cfg.rpc_client.gmail_send(
             to=to, subject=subject, body=body, from_account=from_account,
         )
+
+    @mcp.tool()
+    async def gmail_search(
+        query: str = "", limit: int = 10, from_account: str = "",
+    ) -> dict[str, Any]:
+        """Find mail in the mailbox your operator shared with you.
+
+        ``query`` is Gmail search syntax, the same as the Gmail search box:
+        ``is:unread``, ``from:alice@example.com``, ``subject:invoice``,
+        ``newer_than:7d``, ``has:attachment``, and combinations. Empty means
+        the most recent mail. ``limit`` is 1..50.
+
+        Returns ``{"messages": [...], "count": n}``; each message carries a
+        ``message_id`` for ``gmail_read`` and ``gmail_organize``, plus from,
+        subject, date, a snippet and whether it is unread. Reading never
+        changes anything, so a failure here is always safe to retry.
+        """
+        return await cfg.rpc_client.gmail_mailbox(
+            "search", query=query, limit=limit, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def gmail_read(message_id: str, from_account: str = "") -> dict[str, Any]:
+        """Read one message in full, by the ``message_id`` a search returned.
+
+        Returns the headers, the plain-text body (HTML mail is converted to
+        text) and the names of any attachments. A very long body is cut and
+        ``body_truncated`` says so. Reading does not mark the message read;
+        use ``gmail_organize`` for that.
+        """
+        return await cfg.rpc_client.gmail_mailbox(
+            "read", message_id=message_id, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def gmail_organize(
+        message_id: str, action: str, from_account: str = "",
+    ) -> dict[str, Any]:
+        """File a message: ``archive``, ``move_to_inbox``, ``mark_read``,
+        ``mark_unread``, ``star``, ``unstar``, ``trash`` or ``untrash``.
+
+        ``trash`` is reversible with ``untrash``; nothing here deletes mail
+        permanently, because that access was never granted. Every action is
+        idempotent, so repeating one is harmless and a failure is safe to
+        retry.
+        """
+        return await cfg.rpc_client.gmail_mailbox(
+            "organize", message_id=message_id, action=action, from_account=from_account,
+        )

@@ -554,6 +554,57 @@ async def gmail_send_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+# op -> (required string fields, optional fields with their type)
+_MAILBOX_OPS = {
+    "search": (set(), {"query": str, "limit": int, "from_account": str}),
+    "read": ({"message_id"}, {"from_account": str}),
+    "organize": ({"message_id", "action"}, {"from_account": str}),
+}
+
+
+async def gmail_mailbox_route(request: web.Request) -> web.Response:
+    """Read or file mail. Every op here is idempotent, so a 5xx is safe for
+    the agent to retry; only ``gmail-send`` needs the third outcome."""
+    from .gmail_mailbox import GmailLostAnswer
+    from .gmail_send import GmailSendError
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or body.get("op") not in _MAILBOX_OPS:
+        return web.json_response(
+            {"error": "op must be one of " + ", ".join(sorted(_MAILBOX_OPS))}, status=400,
+        )
+    op = body["op"]
+    required, optional = _MAILBOX_OPS[op]
+    fields = {k: v for k, v in body.items() if k != "op"}
+    if not required <= set(fields) or not set(fields) <= (required | set(optional)):
+        return web.json_response(
+            {"error": f"{op} takes {sorted(required)} and optionally {sorted(optional)}"},
+            status=400,
+        )
+    for name, value in fields.items():
+        if not isinstance(value, optional.get(name, str)) or isinstance(value, bool):
+            return web.json_response({"error": f"{name} has the wrong type"}, status=400)
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response(
+            {"error": "the agent is not running yet", "code": "no_worker"}, status=409,
+        )
+    try:
+        result = await host_mcp_handler.gmail_mailbox(ctx, op=op, **fields)
+    except GmailSendError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+    except GmailLostAnswer as exc:
+        # Idempotent: say so plainly rather than inventing a third outcome.
+        return web.json_response(
+            {"error": f"{exc}; nothing changed twice, so this is safe to try again",
+             "code": "no_answer"}, status=400,
+        )
+    return web.json_response(result)
+
+
 async def create_reminder_route(request: web.Request) -> web.Response:
     """Strict loopback route for the semantic local reminder create tool."""
     try:
@@ -799,6 +850,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/gmail-send",
         gmail_send_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/gmail-mailbox",
+        gmail_mailbox_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",

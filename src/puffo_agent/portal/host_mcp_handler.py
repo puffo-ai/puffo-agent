@@ -724,6 +724,16 @@ async def gmail_send(
     )
 
 
+async def gmail_mailbox(
+    ctx: HostMcpContext, *, op: str, **kw,
+) -> dict[str, object]:
+    """Read or file mail with the Google account shared with this agent."""
+    from . import gmail_mailbox as mailbox
+
+    handler = {"search": mailbox.search, "read": mailbox.read, "organize": mailbox.organize}[op]
+    return await handler(ctx.credentials, **kw)
+
+
 async def create_reminder(
     ctx: HostMcpContext,
     *,

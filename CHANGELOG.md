@@ -8,14 +8,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Agents can send email from a Google account their operator shared with
-  them.** A new `gmail_send` tool takes a recipient, a subject and a plain
-  text body; the operator's control is the share itself, so there is no
-  per-send confirmation. With more than one account shared, the agent must
-  name which to send from and the error lists the choices. A send reports one
-  of three outcomes, and "unknown" means the message may have gone out and
-  must not be sent again without checking the Sent folder. Recipients, bodies
-  and tokens never reach the log. (#428)
+- **Agents can work a mailbox their operator shared with them.** Four tools:
+  `gmail_send`, `gmail_search` (Gmail's own search syntax), `gmail_read`
+  (HTML mail is converted to text, attachments are listed by name only) and
+  `gmail_organize` (archive, move to inbox, mark read or unread, star, trash
+  and their reverses). The operator's control is the share itself, so there
+  is no per-action confirmation. With more than one account shared, the agent
+  names which to use and the error lists the choices. Nothing can delete mail
+  permanently: trash is reversible, and that access is never requested.
+  Recipients, bodies and tokens never reach the log.
+
+  Sending reports one of three outcomes, and "unknown" means the message may
+  have gone out and must not be sent again without checking the Sent folder.
+  Reading and filing are repeatable, so they report a plain failure the agent
+  may simply retry. An account connected before mailbox access was granted
+  keeps its old permissions through every refresh; the error says to
+  reconnect it. (#428)
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate

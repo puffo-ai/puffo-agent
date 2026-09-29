@@ -179,6 +179,11 @@ class PuffoRpcClient:
             return unknown
         return data
 
+    async def gmail_mailbox(self, op: str, **fields) -> dict[str, Any]:
+        """Read or file mail. Idempotent, so this uses the ordinary route
+        semantics: any failure is a failure the agent may simply retry."""
+        return await self._post_object("gmail-mailbox", {"op": op, **fields})
+
     async def _post_object(
         self, route: str, body: dict[str, Any],
     ) -> dict[str, Any]:

@@ -28,10 +28,10 @@ SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 RT_TYPE = "PUFFO_GOOGLE_OAUTH_v1"
 AT_TYPE = "PUFFO_GOOGLE_OAUTH_AT_v1"
 
-# (url, json body bytes, headers) -> (status, response bytes). Raises
-# aiohttp.ClientConnectorError when nothing was sent, and any other
-# aiohttp.ClientError / TimeoutError when the outcome is unknown.
-Transport = Callable[[str, bytes, dict], Awaitable[tuple[int, bytes]]]
+# (url, body bytes or None, headers, method=) -> (status, response bytes).
+# Raises aiohttp.ClientConnectorError when the request never went out, and
+# any other aiohttp.ClientError / TimeoutError when the answer was lost.
+Transport = Callable[..., Awaitable[tuple[int, bytes]]]
 
 
 class GmailSendError(Exception):
@@ -179,9 +179,13 @@ def _log_failure(code: str) -> None:
     logger.warning("gmail send: failed (%s)", code)
 
 
-async def gmail_transport(url: str, body: bytes, headers: dict) -> tuple[int, bytes]:
+async def gmail_transport(
+    url: str, body: bytes | None, headers: dict, *, method: str = "POST",
+) -> tuple[int, bytes]:
     async with create_remote_http_session(
         url, timeout=aiohttp.ClientTimeout(total=60)
     ) as session:
-        async with session.post(url, data=body, headers=headers, allow_redirects=False) as resp:
-            return resp.status, await resp.content.read(64 * 1024)
+        async with session.request(
+            method, url, data=body, headers=headers, allow_redirects=False,
+        ) as resp:
+            return resp.status, await resp.content.read(1024 * 1024)
