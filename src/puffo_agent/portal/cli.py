@@ -705,7 +705,29 @@ def cmd_agent_show(args: argparse.Namespace) -> int:
         print(f"  updated_at:    {_format_ts(rs.updated_at)}")
         if rs.error:
             print(f"  error:         {rs.error}")
+    _print_recovery_gate(ac)
     return 0
+
+
+def _print_recovery_gate(cfg: AgentConfig) -> None:
+    """Show an open quarantine: nothing else tells the operator it is there."""
+    from ..agent.turn_recovery import read_recovery
+
+    record = read_recovery(cfg.resolve_workspace_dir())
+    if record is None or record.resolved:
+        return
+    print("recovery gate (agent is parked):")
+    print(f"  reason:              {record.reason}")
+    print(f"  session_ref:         {record.session_ref}")
+    print(f"  turn_ref:            {record.turn_ref}")
+    print(f"  provider_session_id: {record.provider_session_id}")
+    print(f"  durable_turn_id:     {record.durable_turn_id or '(unbound)'}")
+    print(f"  provider stopped:    {record.stopped}")
+    print(
+        f"  clear with:          puffo-agent agent restart {cfg.id}\n"
+        "  (that requeues the quarantined turn's messages, so anything it "
+        "already sent may repeat)"
+    )
 
 
 def cmd_agent_pause(args: argparse.Namespace) -> int:
@@ -716,48 +738,47 @@ def cmd_agent_resume(args: argparse.Namespace) -> int:
     return _set_agent_state(args.id, "running")
 
 
-def cmd_agent_recover(args: argparse.Namespace) -> int:
-    """Inspect, or authorize replay of, a stuck operator-recovery gate."""
-    from ..agent.turn_recovery import authorize_retry, read_recovery
+def cmd_agent_restart(args: argparse.Namespace) -> int:
+    """Respawn one agent's worker, clearing an open recovery gate.
+
+    A quarantined turn parks its agent until an operator accepts that replay
+    may repeat external effects; typing this command for a named agent *is*
+    that acceptance. An unattended respawn never reaches here, so it still
+    cannot replay silently.
+    """
+    from ..agent.turn_recovery import authorize_retry
 
     if not agent_yml_path(args.id).exists():
         print(f"error: agent {args.id!r} not found", file=sys.stderr)
         return 2
-    workspace = AgentConfig.load(args.id).resolve_workspace_dir()
-    record = read_recovery(workspace)
-    if record is None or record.resolved:
-        print(f"agent {args.id!r}: no recovery gate is open")
-        return 0
-
-    print(f"agent {args.id!r} recovery gate:")
-    print(f"  reason:               {record.reason}")
-    print(f"  session_ref:          {record.session_ref}")
-    print(f"  turn_ref:             {record.turn_ref}")
-    print(f"  provider_session_id:  {record.provider_session_id}")
-    print(f"  provider_turn_id:     {record.provider_turn_id}")
-    print(f"  durable_turn_id:      {record.durable_turn_id or '(unbound)'}")
-    print(f"  provider stopped:     {record.stopped}")
-    print(f"  retry authorized:     {record.retry_requested}")
-    if not args.retry:
+    cfg = AgentConfig.load(args.id)
+    if cfg.state != "running":
         print(
-            "\nThe quarantined turn's messages stay unprocessed until you "
-            "authorize replay:\n"
-            f"  puffo-agent agent recover {args.id} --retry\n"
-            "Replay redelivers those messages, so anything the original turn "
-            "already sent or wrote may happen twice."
+            f"agent {args.id!r} is {cfg.state}; resume it instead",
+            file=sys.stderr,
         )
-        return 0
-
-    try:
-        authorize_retry(workspace)
-    except ValueError as exc:
-        print(f"error: {exc}; cannot authorize replay", file=sys.stderr)
         return 1
+    try:
+        authorized = authorize_retry(cfg.resolve_workspace_dir())
+    except ValueError as exc:
+        print(
+            f"warning: {exc}; the quarantined turn stays parked after this "
+            "restart",
+            file=sys.stderr,
+        )
+        authorized = None
+    if authorized is not None:
+        print(
+            "clearing the recovery gate: the quarantined turn's messages are "
+            "requeued, so anything it already sent may repeat"
+        )
     flag = restart_flag_path(args.id)
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.touch()
-    print("\nreplay authorized; the worker restart will requeue the turn")
-    if not is_daemon_alive():
+    print(f"agent {args.id!r} restart requested")
+    if is_daemon_alive():
+        print("daemon will stop the worker and respawn it on the next tick.")
+    else:
         print("daemon is not running — this happens at its next start.")
     return 0
 

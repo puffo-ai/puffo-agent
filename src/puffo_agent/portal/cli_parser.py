@@ -223,23 +223,15 @@ def _add_agent_basic_commands(agent_sub, handlers: CommandHandlers) -> None:
     resume.add_argument("id")
     resume.set_defaults(func=handlers["cmd_agent_resume"])
 
-    recover = agent_sub.add_parser(
-        "recover",
+    restart = agent_sub.add_parser(
+        "restart",
         help=(
-            "Show an agent's stuck recovery gate, or authorize replay of "
-            "the quarantined turn with --retry"
+            "Respawn one agent's worker. Clears a recovery gate left by a "
+            "quarantined turn, requeueing its messages (see `agent show`)"
         ),
     )
-    recover.add_argument("id")
-    recover.add_argument(
-        "--retry",
-        action="store_true",
-        help=(
-            "Accept that replaying the quarantined turn may repeat its "
-            "external effects, and restart the worker to requeue it"
-        ),
-    )
-    recover.set_defaults(func=handlers["cmd_agent_recover"])
+    restart.add_argument("id")
+    restart.set_defaults(func=handlers["cmd_agent_restart"])
 
     refresh_token = agent_sub.add_parser(
         "refresh-token",

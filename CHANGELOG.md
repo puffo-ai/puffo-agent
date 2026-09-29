@@ -8,14 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`puffo-agent agent recover <id>` unparks an agent stuck on a recovery
-  gate.** A quarantined turn parks its agent until an operator accepts that
-  replaying it may repeat external effects, and only the operator's remote
-  client could accept that — a local deployment had to hand-edit
-  `turn_recovery.json`. The command now shows the gate (reason, session,
-  turn, whether the provider stopped), and `--retry` authorizes the replay
-  and restarts the worker, which requeues the turn's messages. It refuses
-  while the provider stop is unconfirmed. The parked-state diagnostic names
+- **`puffo-agent agent restart <id>` respawns one agent's worker, and unparks
+  an agent stuck on a recovery gate.** Restarting a single agent previously
+  meant `pause` then `resume`. A quarantined turn additionally parks its
+  agent until an operator accepts that replaying it may repeat external
+  effects, and only the operator's remote client could accept that — a local
+  deployment had to hand-edit `turn_recovery.json`. Restarting a named agent
+  is now that acceptance: it requeues the quarantined turn's messages and
+  says so. An unattended respawn still cannot replay silently, and the
+  command refuses to clear a gate whose provider stop is unconfirmed.
+  `agent show` reports an open gate, and the parked-state diagnostic names
   the command instead of the internal wire ops.
 
 ### Fixed

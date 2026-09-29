@@ -1,6 +1,6 @@
 """A quarantined turn parks its agent until an operator accepts that replay
 may repeat external effects. Only the operator's remote client could accept
-that, so a local deployment had no way out; `agent recover` is that way."""
+that, so a local deployment had no way out; `agent restart` is that way."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -27,8 +27,8 @@ STOPPED = TurnRecovery(
 )
 
 
-def _agent(aid: str = "helen-parr-3874"):
-    cfg = AgentConfig(id=aid, display_name=aid)
+def _agent(aid: str = "helen-parr-3874", state: str = "running"):
+    cfg = AgentConfig(id=aid, display_name=aid, state=state)
     cfg.save()
     return cfg
 
@@ -61,58 +61,97 @@ def test_authorize_retry_refuses_while_provider_may_still_run(tmp_path):
     assert read_recovery(tmp_path).retry_requested is False
 
 
-def test_recover_reports_the_gate_without_touching_it(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    cfg = _agent()
-    workspace = _park(cfg)
-
-    assert main(["agent", "recover", cfg.id]) == 0
-
-    out = capsys.readouterr().out
-    assert "autonomous idle timeout" in out
-    assert "903c7bce" in out and "turn_2049" in out
-    assert f"puffo-agent agent recover {cfg.id} --retry" in out
-    assert read_recovery(workspace).retry_requested is False
-    assert not restart_flag_path(cfg.id).exists()
-
-
-def test_recover_retry_authorizes_replay_and_restarts_the_worker(
+def test_restart_clears_the_gate_and_requests_a_respawn(
     tmp_path, monkeypatch, capsys,
 ):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    from puffo_agent.portal import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "is_daemon_alive", lambda: True)
     cfg = _agent()
     workspace = _park(cfg)
 
-    assert main(["agent", "recover", cfg.id, "--retry"]) == 0
+    assert main(["agent", "restart", cfg.id]) == 0
 
     assert read_recovery(workspace).retry_requested is True
     assert restart_flag_path(cfg.id).exists()
-    assert "replay authorized" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "clearing the recovery gate" in out
+    assert "respawn it on the next tick" in out
 
 
-def test_recover_retry_refuses_an_unstopped_provider(tmp_path, monkeypatch, capsys):
+def test_restart_without_a_gate_is_a_plain_respawn(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = _agent()
+
+    assert main(["agent", "restart", cfg.id]) == 0
+
+    assert restart_flag_path(cfg.id).exists()
+    out = capsys.readouterr().out
+    assert "restart requested" in out
+    assert "recovery gate" not in out
+    assert "daemon is not running" in out
+
+
+def test_restart_keeps_the_gate_when_the_provider_stop_is_unconfirmed(
+    tmp_path, monkeypatch, capsys,
+):
+    """Replay could double-run a turn whose provider may still be alive, so
+    the respawn happens but the gate stays."""
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
     cfg = _agent()
     workspace = _park(cfg, replace(STOPPED, stopped=False))
 
-    assert main(["agent", "recover", cfg.id, "--retry"]) == 1
+    assert main(["agent", "restart", cfg.id]) == 0
 
+    assert read_recovery(workspace).retry_requested is False
+    assert restart_flag_path(cfg.id).exists()
+    captured = capsys.readouterr()
+    assert "stays parked" in captured.err
+    assert "restart requested" in captured.out
+
+
+def test_restart_refuses_a_paused_or_unknown_agent(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    paused = _agent("paused-0001", state="paused")
+
+    assert main(["agent", "restart", paused.id]) == 1
+    assert "resume it instead" in capsys.readouterr().err
+    assert not restart_flag_path(paused.id).exists()
+    assert main(["agent", "restart", "nope-0000"]) == 2
+
+
+def test_show_reports_an_open_gate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = _agent()
+    workspace = _park(cfg)
+
+    assert main(["agent", "show", cfg.id]) == 0
+
+    out = capsys.readouterr().out
+    assert "recovery gate (agent is parked)" in out
+    assert "autonomous idle timeout" in out
+    assert "903c7bce" in out and "turn_2049" in out
+    assert f"puffo-agent agent restart {cfg.id}" in out
+    # read-only
     assert read_recovery(workspace).retry_requested is False
     assert not restart_flag_path(cfg.id).exists()
 
 
-def test_recover_without_a_gate_or_agent(tmp_path, monkeypatch, capsys):
+def test_show_is_quiet_without_a_gate(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
     cfg = _agent()
-    assert main(["agent", "recover", cfg.id]) == 0
-    assert "no recovery gate" in capsys.readouterr().out
-    assert main(["agent", "recover", "nope-0000"]) == 2
+    _park(cfg, replace(STOPPED, resolved=True))
+
+    assert main(["agent", "show", cfg.id]) == 0
+
+    assert "recovery gate" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
 async def test_authorized_retry_replays_a_turn_that_holds_messages(tmp_path):
     """The startup self-healing path deliberately refuses a turn with admitted
-    rows; an operator-authorized retry is what requeues them."""
+    rows; the operator-authorized replay is what requeues them."""
     from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 
     store = await make_store(tmp_path)
@@ -150,23 +189,8 @@ async def test_authorized_retry_replays_a_turn_that_holds_messages(tmp_path):
     await store.close()
 
 
-def test_recover_retry_notes_a_live_daemon(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    from puffo_agent.portal import cli as cli_mod
-
-    monkeypatch.setattr(cli_mod, "is_daemon_alive", lambda: True)
-    cfg = _agent()
-    _park(cfg)
-
-    assert main(["agent", "recover", cfg.id, "--retry"]) == 0
-
-    out = capsys.readouterr().out
-    assert "worker restart will requeue" in out
-    assert "daemon is not running" not in out
-
-
 @pytest.mark.asyncio
-async def test_parked_diagnostic_names_the_recovery_command(tmp_path):
+async def test_parked_diagnostic_names_the_restart_command(tmp_path):
     """The operator's only clue is this text, so it must name the command."""
     from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 
@@ -179,6 +203,5 @@ async def test_parked_diagnostic_names_the_recovery_command(tmp_path):
 
     runtime._report_recovery_required()
 
-    assert "puffo-agent agent recover helen-parr-3874" in runtime.health.diagnostic
-    assert "--retry" in runtime.health.diagnostic
+    assert "puffo-agent agent restart helen-parr-3874" in runtime.health.diagnostic
     await store.close()

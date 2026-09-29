@@ -432,9 +432,8 @@ class AutonomousTurnLifecycleMixin:
         reference = f" session_ref={record.session_ref} turn_ref={record.turn_ref}" if record else ""
         diagnostic = (
             "Operator recovery required: original actions may have external "
-            "effects. Inspect with `puffo-agent agent recover "
-            f"{self.agent_id or '<agent-id>'}`, then authorize replay with "
-            "`--retry`." + reference
+            "effects. Replay them with `puffo-agent agent restart "
+            f"{self.agent_id or '<agent-id>'}`." + reference
         )
         self.health = RuntimeHealth("degraded", diagnostic)
         if self.process_outcome is not None:
