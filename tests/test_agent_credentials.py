@@ -1,8 +1,7 @@
 """The daemon's read side of credential design v2, against a fake server.
 
-The fake seals blobs with the same wire format the Rust server uses (pinned by
-credential_vectors.json), so these cells are about the daemon's rules, not
-the bytes: what is cached, what is dropped, and what a race may not undo.
+The fake seals with the real wire format, so these cells are about the rules:
+what is cached, what is dropped, and what a race may not undo.
 """
 
 import asyncio
@@ -129,8 +128,7 @@ async def test_a_fetched_value_opens_and_is_served_from_memory_after(server, age
 
 @pytest.mark.asyncio
 async def test_a_blob_sealed_for_another_version_is_refused_and_not_cached(server, agent):
-    """The server says v2 but the wrap was sealed for v1: the AAD disagrees,
-    so the fetch fails rather than handing back a value of unknown standing."""
+    """Wrap sealed for v1, response claiming v2: the AAD disagrees."""
     server.row(0, b"secret-0", version=1)
     real_get = server.get
 
@@ -175,8 +173,7 @@ async def test_reconcile_drops_the_absent_the_stale_and_the_inactivated(server, 
 
 @pytest.mark.asyncio
 async def test_offline_across_delete_and_recreate_the_old_secret_is_not_served(server, agent):
-    """Boris 226189 / 測試姬 226205: with the index never reused, a recreated
-    credential has a new id, and the old one is simply absent from the list."""
+    """Boris 226189 / 測試姬 226205: a recreated credential gets a new id."""
     server.row(0, b"old-secret")
     await agent.get(TYPE, 0)
     del server.rows[TYPE, 0]
@@ -205,9 +202,8 @@ async def test_a_failed_list_call_deletes_nothing(server, agent):
 
 @pytest.mark.asyncio
 async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent):
-    """Jeff 226108: GET(v1) leaves, the credential is revoked and reconcile
-    sees it gone, then the old response lands. Revoking does not bump the
-    version, so only the generation fence can tell this response is stale."""
+    """Jeff 226108: revoking does not bump the version, so only the
+    generation fence can tell the response that crossed it is stale."""
     server.row(0, b"secret-0")
     server.hold = asyncio.Event()
     fetch = asyncio.create_task(agent.get(TYPE, 0))
@@ -224,8 +220,7 @@ async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent
 async def test_a_genuine_row_for_another_credential_is_not_served_as_the_one_asked_for(
     server, agent
 ):
-    """Boris 226286. B's row is real and sealed to this agent, so it opens
-    under its own AAD; only the requested id tells it is not A."""
+    """Boris 226286: B's row opens under its own AAD; only the id says it is not A."""
     server.row(0, b"secret-A")
     server.row(1, b"secret-B")
     real_get = server.get
@@ -267,8 +262,7 @@ async def test_refresh_spends_the_held_share_and_drops_only_the_access_token(ser
 
 @pytest.mark.asyncio
 async def test_after_a_rotation_the_next_refresh_uses_the_new_share(server, agent):
-    """The server's fake asserts the share matches the RT's current version,
-    so a daemon that kept the rotated-away share fails the second refresh."""
+    """A daemon that kept the rotated-away share fails the second refresh."""
     _oauth_pair(server)
     server.rotate = True
     await agent.refresh(RT, 0)
@@ -335,8 +329,7 @@ def test_an_agent_without_an_owner_or_keys_holds_no_credentials(server, owner, k
 
 @pytest.mark.asyncio
 async def test_registration_retries_failures_and_waits_out_a_server_without_v2(server, agent):
-    """Boris 227783: an agent already running when v2 is deployed must pick it
-    up without a restart, so a 404 is polled (hourly), not given up on."""
+    """Boris 227783: 404 is polled, so a running agent picks v2 up on deploy."""
     from puffo_agent.portal.credentials import keep_registering
 
     answers = [HttpError(404, "{}"), HttpError(404, "{}"), HttpError(503, "{}"),
@@ -383,9 +376,8 @@ async def test_a_value_already_expired_on_arrival_is_not_handed_out(server, agen
 
 @pytest.mark.asyncio
 async def test_an_older_version_landing_late_does_not_replace_a_newer_one(server, agent):
-    """Codex review on #426: two cache misses overlap an update and the newer
-    response lands first. Nothing local was invalidated, so the generation
-    fence cannot tell them apart; the version has to."""
+    """Codex review on #426: nothing was invalidated, so the fence cannot
+    tell the two responses apart; the version has to."""
     server.row(0, b"secret-v1")
     gate = server.hold = asyncio.Event()
     old = asyncio.create_task(agent.get(TYPE, 0))
@@ -402,9 +394,8 @@ async def test_an_older_version_landing_late_does_not_replace_a_newer_one(server
 async def test_a_credential_that_expired_while_cached_is_not_handed_back_by_a_late_older_get(
     server, agent
 ):
-    """Two rules meet: the cached value expired, so a refetch goes out, and
-    an older version lands. Keeping the newer one must not hand back an
-    expired one."""
+    """Expired cache plus a late older version: keeping the newer one must
+    not hand back an expired one."""
     soon = (datetime.now(timezone.utc) + timedelta(milliseconds=50)).isoformat()
     server.row(0, b"secret-v5", version=5, expire_at=soon)
     assert (await agent.get(TYPE, 0)).version == 5
@@ -415,8 +406,7 @@ async def test_a_credential_that_expired_while_cached_is_not_handed_back_by_a_la
 
 @pytest.mark.asyncio
 async def test_a_transient_failure_is_raised_rather_than_read_as_a_revoke(server, agent):
-    """A 5xx says nothing about who holds what, so it must not drop the value
-    the way 403/404/410 do."""
+    """A 5xx says nothing about who holds what, unlike 403/404/410."""
     server.row(0, b"secret-0")
     await agent.get(TYPE, 0)
 
@@ -440,8 +430,7 @@ async def test_refreshing_a_share_this_agent_does_not_hold_is_none_not_an_error(
 
 @pytest.mark.asyncio
 async def test_a_refresh_that_failed_for_an_unrelated_reason_keeps_the_share(server, agent):
-    """Only 409 means the share is dead. A 500 must leave it cached, or every
-    provider hiccup would cost a re-fetch."""
+    """Only 409 means the share is dead; a 500 must leave it cached."""
     _oauth_pair(server)
     await agent.get(RT, 0)
     server.refresh_error = HttpError(500, "{}")
@@ -468,8 +457,7 @@ def test_an_owner_is_required_to_derive_the_ids_a_response_is_checked_against(se
 
 
 def _services_run(server, *, owner=OWNER):
-    """``_start_services`` with every service but the credential wiring
-    stubbed, since each of the others needs a live runtime."""
+    """``_start_services`` with every other service stubbed: each needs a live runtime."""
     from types import SimpleNamespace as NS
 
     run, context = _run_with(server, owner=owner)
@@ -509,8 +497,8 @@ async def test_worker_startup_publishes_the_agents_key(server):
 
 @pytest.mark.asyncio
 async def test_shutdown_does_not_wait_for_a_registration_that_is_still_retrying(server):
-    """``keep_registering`` retries for as long as the agent runs, so stopping
-    the worker has to cancel it rather than await it."""
+    """``keep_registering`` retries for as long as the agent runs, so shutdown
+    must cancel it rather than await it."""
     run, context = _services_run(server)
 
     async def never(path, body):

@@ -1159,8 +1159,7 @@ class StandardWorkerRun:
     def _build_credentials(self, context: WorkerRunContext) -> AgentCredentials | None:
         """This agent's credential-v2 view, or None if it cannot hold any.
 
-        Credential ids derive from the operator recorded in agent.yml, so
-        without one no response can be checked (``AgentCredentials._open``).
+        ids derive from the operator in agent.yml (``AgentCredentials._open``).
         """
         client = context.client
         owner = self.worker.agent_cfg.puffo_core.operator_slug
@@ -1171,7 +1170,7 @@ class StandardWorkerRun:
             return AgentCredentials(
                 client.http, client.slug, owner, decode_secret(identity.root_secret_key)
             )
-        except Exception as exc:  # noqa: BLE001 - credentials are optional to the run
+        except Exception as exc:  # noqa: BLE001 - credentials are optional
             logger.warning(
                 "agent %s: no credential key: %s", context.paths.agent_id, exc
             )

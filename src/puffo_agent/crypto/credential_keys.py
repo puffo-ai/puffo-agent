@@ -1,11 +1,6 @@
 """Credential design v2 wire format (v2 §2, §4.1, §5.1).
 
-Rust and TypeScript implement the same bytes. Drift is silent: a wrap that
-will not open, with no hint of which byte moved. ``credential_vectors.json``
-pins every layout here.
-
-Keys derive from a principal's root rather than a device, so a wrap survives
-re-enrolment; the derived public key needs a root-signed cert to publish it.
+Shared with Rust and TypeScript; ``credential_vectors.json`` pins the bytes.
 """
 
 from __future__ import annotations
@@ -25,7 +20,7 @@ from .primitives import (
     hpke_seal,
 )
 
-# v2 §2 fixes this string, version included; a v2 key changes the suffix.
+# Wire-pinned, version included (v2 §2).
 _KEM_HKDF_INFO = "puffo-credential-kem-v{version}"
 
 CREDENTIAL_HPKE_INFO = b"puffo/credential-hpke/v1"
@@ -33,7 +28,7 @@ CREDENTIAL_WRAP_AAD_LABEL = b"puffo/credential-wrap/v1"
 
 CERT_TYPE = "credential_key_cert"
 
-# X25519 encapsulated key length; the wrap blob is ``enc || ciphertext``.
+# blob = enc(32) || ciphertext
 _ENC_LEN = 32
 
 
@@ -42,10 +37,7 @@ class CredentialKeyError(Exception):
 
 
 def derive_credential_kem_keypair(root_secret: bytes, key_version: int = 1) -> KemKeyPair:
-    """``HKDF-SHA256(ikm=root_secret, salt=none, info=..., L=32)`` as X25519.
-
-    ``salt=None`` is RFC 5869 §2.2: 32 zero bytes, not an absent salt.
-    """
+    """HKDF-SHA256 -> X25519. ``salt=None`` is 32 zero bytes (RFC 5869 §2.2)."""
     if key_version < 1:
         raise ValueError("key_version starts at 1")
     okm = HKDF(
@@ -64,11 +56,9 @@ def create_credential_key_cert(
     key_version: int,
     issued_at: int,
 ) -> dict:
-    """The root-signed cert that publishes a derived key.
+    """Root-signed cert publishing a derived key.
 
-    Signs RFC 8785 over the object without ``signature``, as the subkey cert
-    does. ``slug`` is signed, so one root cannot re-register a cert under
-    another identity.
+    RFC 8785 over the object without ``signature``; ``slug`` is signed.
     """
     cert = {
         "type": CERT_TYPE,
@@ -88,9 +78,8 @@ def verify_credential_key_cert(
 ) -> bytes:
     """Return the published KEM key, or raise.
 
-    Where ``root_public_key`` comes from is the point: a server can swap the
-    cert and the root together, so a party about to wrap must anchor on a root
-    the server did not hand it (amendment 6).
+    A wrapping party's ``root_public_key`` must not come from the server: it
+    can swap cert and root together (amendment 6).
     """
     if cert.get("type") != CERT_TYPE or cert.get("version") != 1:
         raise CredentialKeyError("not a v1 credential key cert")
@@ -116,8 +105,8 @@ _CREDENTIAL_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "puffo:credentials")
 def credential_id(owner_slug: str, credential_type: str, index: int) -> str:
     """The id the server assigns to ``(owner, type, index)``.
 
-    Pinned by puffo-server ``types.rs::credential_id``. A reader derives it to
-    catch a response that names some other credential.
+    Pinned by puffo-server ``types.rs``; a reader derives it to catch a
+    response naming another credential.
     """
     return str(uuid.uuid5(_CREDENTIAL_ID_NAMESPACE, f"{owner_slug}/{credential_type}/{index}"))
 
@@ -133,8 +122,7 @@ def compute_credential_wrap_aad(
     """``label || uuid(16) || version(i64 BE) || lp(recipient_slug) || lp(type)
     || key_version(i64 BE)``, where ``lp`` is a u16 BE length then UTF-8.
 
-    The UUID goes in as 16 raw bytes, not text, so two renderings of the same
-    id cannot produce two AADs. Integers and prefixes follow ``v2_aad``.
+    Integers and prefixes follow ``v2_aad``.
     """
     return (
         CREDENTIAL_WRAP_AAD_LABEL
@@ -157,7 +145,7 @@ def open_credential(recipient: KemKeyPair, aad: bytes, blob: bytes) -> bytes:
         raise CredentialKeyError("wrap is too short to hold a key and a ciphertext")
     try:
         return hpke_open(recipient, blob[:_ENC_LEN], CREDENTIAL_HPKE_INFO, aad, blob[_ENC_LEN:])
-    except Exception as exc:  # noqa: BLE001 - any failure means "not for us, or moved"
+    except Exception as exc:  # noqa: BLE001 - any failure means "not ours"
         raise CredentialKeyError("wrap does not open under this key and AAD") from exc
 
 

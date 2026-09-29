@@ -1,8 +1,7 @@
 """Credential v2 wire format, checked against the pinned vectors.
 
-The vectors are the contract with the Rust server and the web client, so
-these cells check the vectors as much as the code: a vector that only agreed
-with the code that wrote it would pin nothing.
+The vectors are checked as much as the code: one that only agreed with its
+own writer would pin nothing.
 """
 
 import copy
@@ -31,7 +30,7 @@ V = json.loads(
 
 
 def test_derivation_matches_an_hkdf_computed_without_the_module():
-    """RFC 5869 by hand, from stdlib HMAC: the oracle shares no code with the module."""
+    """RFC 5869 by hand from stdlib HMAC: the oracle shares no code."""
     root = d(V["derivation"]["root_secret"])
     prk = hmac.new(b"\x00" * 32, root, hashlib.sha256).digest()
     okm = hmac.new(prk, V["derivation"]["hkdf_info_utf8"].encode() + b"\x01", hashlib.sha256).digest()
@@ -51,9 +50,8 @@ def test_the_cert_verifies_and_signs_exactly_the_pinned_bytes():
 
 
 def test_a_substituted_cert_fails_against_the_callers_own_anchor():
-    """Amendment 6. The positive control is that the same cert verifies against
-    the root that did sign it — otherwise a verifier that rejects everything
-    would pass this cell too."""
+    """Amendment 6, with the positive control: the same cert verifies against
+    the root that did sign it."""
     evil = V["cert_substituted"]
     with pytest.raises(CredentialKeyError, match="signature"):
         verify_credential_key_cert(
@@ -71,9 +69,7 @@ def test_a_substituted_cert_fails_against_the_callers_own_anchor():
     [("agt-someone-else", 1, "different slug"), ("agt-vector-0001", 2, "different key_version")],
 )
 def test_a_genuine_cert_is_refused_when_it_does_not_match_the_request(slug, key_version, refusal):
-    """A valid cert registered under another slug, or declared as another key
-    version. The edited-cert cells cannot see these checks: the signature
-    fails there first."""
+    """The edited-cert cells cannot reach these: the signature fails first."""
     with pytest.raises(CredentialKeyError, match=refusal):
         verify_credential_key_cert(
             V["cert"]["cert"], root_public_key=d(V["cert"]["root_public_key"]),
@@ -126,8 +122,7 @@ def test_a_wrap_moved_to_another_row_or_recipient_does_not_open(field, value):
 
 
 def test_credential_id_matches_the_literal_the_rust_server_asserts():
-    """puffo-server be49551 pins the same literal in its Rust test, so a drift
-    on either side reds one of the two suites rather than every real fetch."""
+    """puffo-server be49551 pins the same literal, so drift reds a suite."""
     from puffo_agent.crypto.credential_keys import credential_id
 
     assert credential_id("agt-vector-0001", "CUSTOMIZED", 7) == "3b0fec1b-f7fa-5cc4-a18d-9d5ce8c401ce"
@@ -146,8 +141,7 @@ def _rust_recipient():
 
 
 def test_a_rust_sealed_wrap_opens_under_an_aad_the_daemon_computes_itself():
-    """The AAD comes from this module, not from the file's hex, so an AAD
-    layout that drifted on either side fails here rather than in production."""
+    """AAD recomputed here, not read from the file's hex."""
     assert hashlib.sha256(_RUST_PATH.read_bytes()).hexdigest() == (
         "c9127965378ecfade172520cac240a68bd3a64317b7cef85a79c533f7396aa7a"
     )
@@ -188,8 +182,7 @@ def test_the_rust_id_vector_matches_the_daemons_derivation():
     ],
 )
 def test_a_cert_is_refused_before_its_signature_is_trusted(field, value, refusal):
-    """Shape first, signature after: a cert of the wrong type or with an
-    undecodable field must be refused rather than reaching the verifier."""
+    """Shape first: refused before reaching the verifier."""
     cert = copy.deepcopy(V["cert"]["cert"])
     cert[field] = value
     with pytest.raises(CredentialKeyError, match=refusal):
@@ -224,8 +217,7 @@ def test_key_version_starts_at_one():
     [{"version": -1}, {"key_version": 1 << 63}],
 )
 def test_an_aad_integer_outside_i64_is_refused(override):
-    """The AAD is a fixed-width contract with Rust's i64; a value that would
-    not round-trip has to fail here rather than produce different bytes."""
+    """Fixed-width contract with Rust's i64: refuse rather than emit other bytes."""
     with pytest.raises(ValueError, match="i64"):
         compute_credential_wrap_aad(**{**V["wrap"]["aad_fields"], **override})
 
