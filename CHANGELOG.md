@@ -6,7 +6,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.11] - 2026-09-29
+
+### Added
+
+- Paid-data status updates show the quoted price while a purchase is pending
+  and the settled cost after it completes. (#423)
+
 ### Fixed
+
+- LingTai bindings imported before attach support automatically migrate to
+  the resident registry on startup. Migration preserves the runtime id,
+  validates the active binding and workspace, and retains the old configuration
+  if migration fails. (#430)
+- Message and attachment sends accept Inbox `target_ref` addresses for DMs,
+  channels and threads. Invalid spaces, conflicting roots and unverifiable
+  thread targets fail without silently sending to the channel. (#431)
 
 - **Codex agents keep their conversation across daemon upgrades.** Since
   July the daemon rotated every cli-local Codex session at startup whenever
