@@ -327,6 +327,73 @@ async def test_held_send_reports_covers_dropped(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sent_reply_attests_whole_active_human_turn_after_covers(tmp_path):
+    """A partial cover must never be advertised as whole-turn completion."""
+    from puffo_agent.agent.global_inbox_runtime import (
+        SendAttemptState, TrackingSendDelegate,
+    )
+
+    store = await make_store(tmp_path)
+    await receipt(store, "a", 1, content=_human_content("first"))
+    await receipt(store, "b", 2, content=_human_content("second"))
+    await receipt(store, "agent-note", 3, content={
+        "text": "context", "sender_type": "agent",
+    })
+    await store.admit_messages(
+        ("a", "b", "agent-note"), turn_id="turn-1",
+        provider_session_id="provider-1",
+    )
+    runtime = _build_runtime(store, tmp_path)
+    runtime.active.turn_id = "turn-1"
+    runtime.active.provider_session_id = "provider-1"
+    runtime.active.message_ids[:] = ["a", "b", "agent-note"]
+    delegate = TrackingSendDelegate(None, SendAttemptState(), runtime=runtime)
+
+    first = {"state": "sent", "envelope_id": "reply-a"}
+    await delegate._record_covers({"covers": ["a"]}, {}, first)
+    await delegate._attest_active_human_covers(
+        first, origin_turn_id="turn-1", origin_provider_session_id="provider-1",
+    )
+    assert first["covers_recorded"] == ["a"]
+    assert first["coverage_turn_id"] == "turn-1"
+    assert first["active_human_uncovered_count"] == 1
+
+    second = {"state": "sent", "envelope_id": "reply-b"}
+    await delegate._record_covers({"covers": ["b"]}, {}, second)
+    await delegate._attest_active_human_covers(
+        second, origin_turn_id="turn-1", origin_provider_session_id="provider-1",
+    )
+    assert second["covers_recorded"] == ["b"]
+    assert second["coverage_turn_id"] == "turn-1"
+    assert second["active_human_uncovered_count"] == 0
+    from puffo_agent.mcp.tool_result_projection import format_send_result
+    projected = format_send_result(second)
+    assert 'coverage_turn_id="turn-1"' in projected
+    assert "active_human_uncovered_count=0" in projected
+
+    runtime.active.message_ids.append("missing-from-store")
+    drifted = {
+        "state": "sent", "envelope_id": "reply-drifted",
+        "covers_recorded": ["a"],
+    }
+    await delegate._attest_active_human_covers(
+        drifted, origin_turn_id="turn-1", origin_provider_session_id="provider-1",
+    )
+    assert "active_human_uncovered_count" not in drifted
+
+    runtime.active.message_ids.pop()
+    switched = {
+        "state": "sent", "envelope_id": "reply-after-turn-switch",
+        "covers_recorded": ["a"],
+    }
+    await delegate._attest_active_human_covers(
+        switched, origin_turn_id="turn-old", origin_provider_session_id="provider-1",
+    )
+    assert "active_human_uncovered_count" not in switched
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_mark_covered_rejects_blank_ids(tmp_path):
     store = await make_store(tmp_path)
     runtime = GlobalInboxRuntime(
