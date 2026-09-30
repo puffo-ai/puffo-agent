@@ -1277,20 +1277,15 @@ class GlobalInboxRuntime(
         )
         for item_id in self.active.message_ids:
             row = await self.store.get_message_by_envelope(item_id)
+            settled = row is not None and row.processing_state == ProcessingState.PROCESSED
             log_runtime_event(
-                logger,
-                "inbox.row_requeued",
+                logger, "inbox.row_requeued",
                 agent_id=self.agent_id,
                 turn_id=planned.turn_id,
                 provider_session_id=self.active.provider_session_id,
                 message_id=item_id,
                 server_seq=row.server_seq if row is not None else None,
-                outcome=(
-                    "settled_by_cover"
-                    if row is not None
-                    and row.processing_state == ProcessingState.PROCESSED
-                    else "requeued"
-                ),
+                outcome="settled_by_cover" if settled else "requeued",
             )
         log_runtime_event(
             logger,
