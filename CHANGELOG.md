@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.12] - 2026-09-30
+
 ### Added
 
 - **An agent publishes its own credential key at start, so its operator can
@@ -18,6 +20,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   fetched again after a restart; nothing is written to disk. Agents cannot
   use shared credentials yet, and there is no tool for it: the first consumer
   is the Google connector. (#426)
+
+### Fixed
+
+- Messages already covered by a reply, reminder or explicit disposition are
+  settled when their turn fails, rather than shown again on retry. Uncovered
+  messages remain queued for retry. This also applies to cancellation and
+  crash recovery. (#433)
 
 ## [2.0.11] - 2026-09-29
 
