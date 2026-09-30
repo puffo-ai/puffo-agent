@@ -35,3 +35,32 @@ async def test_requeue_settles_covered_rows_and_requeues_only_the_rest():
     await store.requeue_messages(["unanswered"], turn_id="all-answered")
     assert tuple(await store.get_pending()) == ()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cover_after_requeue_settles_previously_admitted_input():
+    """A restored model can answer from history before reading Inbox again."""
+    store = _temp_store()
+    for seq, name in enumerate(("recovered", "fresh"), start=1):
+        await store.store_receipt(
+            _channel_payload(name), server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE, reason="ok",
+        )
+    await store.admit_messages(
+        ["recovered"], turn_id="cancelled", provider_session_id="before",
+    )
+    await store.requeue_messages(["recovered"], turn_id="cancelled")
+
+    await store.add_message_covers(
+        ["recovered", "fresh"], source="send", by_envelope_id="reply",
+    )
+
+    recovered = await store.get_message_by_envelope("recovered")
+    assert recovered.processing_state is ProcessingState.PROCESSED
+    assert recovered.processed_at and recovered.processing_turn_id is None
+    assert [row.envelope_id for row in await store.get_pending()] == ["fresh"]
+    await store.admit_messages(
+        ["fresh"], turn_id="next", provider_session_id="after",
+    )
+    assert await store.get_model_visible_through_seq("next", "sp_1", "ch_1") == 2
+    await store.close()

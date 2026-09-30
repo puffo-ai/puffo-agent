@@ -1242,18 +1242,23 @@ class InboxStoreMixin:
                             for item in recorded
                         ],
                     )
-                    # A cover on a row that is sitting in its one-shot
-                    # redelivery window is the settlement the redelivery
-                    # asked for; without this, an explicitly settled row
-                    # would still be re-presented as uncovered.
+                    # Recovered sessions can answer an already-read input
+                    # from history before reading Inbox again. Settle that
+                    # pending row too, but preserve first presentation for
+                    # fresh inputs with no durable admission history.
                     placeholders = ",".join("?" for _ in recorded)
                     await db.execute(
                         f"""UPDATE messages SET processing_state = ?,
-                                processed_at = ?, processing_turn_id = NULL
+                                processed_at = ?, processing_turn_id = NULL,
+                                model_visible_at = COALESCE(model_visible_at, ?)
                             WHERE envelope_id IN ({placeholders})
-                              AND processing_state = ? AND renotified = 1""",
+                              AND processing_state = ?
+                              AND (renotified = 1 OR envelope_id IN (
+                                  SELECT envelope_id FROM turn_run_messages
+                              ))""",
                         (
                             ProcessingState.PROCESSED.value,
+                            now,
                             now,
                             *recorded,
                             ProcessingState.PENDING.value,
