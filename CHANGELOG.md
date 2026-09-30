@@ -20,7 +20,33 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `agent show` reports an open gate, and the parked-state diagnostic names
   the command instead of the internal wire ops.
 
+- **An agent publishes its own credential key at start, so its operator can
+  share a credential with it.** The key is derived from the agent's root, so
+  nothing is stored for it and re-enrolling a device does not invalidate
+  anything already shared. An agent with no recorded operator publishes
+  nothing. If the server has no credentials support yet, the agent keeps
+  checking and picks it up after the server is upgraded, without a restart.
+  Credential values an operator shares are held in memory only and are
+  fetched again after a restart; nothing is written to disk. Agents cannot
+  use shared credentials yet, and there is no tool for it: the first consumer
+  is the Google connector. (#426)
+
+## [2.0.11] - 2026-09-29
+
+### Added
+
+- Paid-data status updates show the quoted price while a purchase is pending
+  and the settled cost after it completes. (#423)
+
 ### Fixed
+
+- LingTai bindings imported before attach support automatically migrate to
+  the resident registry on startup. Migration preserves the runtime id,
+  validates the active binding and workspace, and retains the old configuration
+  if migration fails. (#430)
+- Message and attachment sends accept Inbox `target_ref` addresses for DMs,
+  channels and threads. Invalid spaces, conflicting roots and unverifiable
+  thread targets fail without silently sending to the channel. (#431)
 
 - **Codex agents keep their conversation across daemon upgrades.** Since
   July the daemon rotated every cli-local Codex session at startup whenever

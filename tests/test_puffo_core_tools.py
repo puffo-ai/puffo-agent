@@ -856,7 +856,11 @@ async def test_send_message_root_level_false_coerced():
 
 
 @pytest.mark.asyncio
-async def test_send_message_threaded_false_not_coerced():
+@pytest.mark.parametrize("route", [
+    {"channel": "ch_abc", "root_id": "msg_root_abc"},
+    {"channel": "channel:sp_test:ch_abc:thread:msg_root_abc"},
+])
+async def test_send_message_threaded_false_not_coerced(route):
     """A threaded reply with visibility_level='default' and no
     @-mention stays hidden — no coerce; the tool result carries
     the "be explicit" nudge note instead."""
@@ -893,10 +897,9 @@ async def test_send_message_threaded_false_not_coerced():
         mcp,
         "send_message",
         {
-            "channel": "ch_abc",
+            **route,
             "text": "agent-to-agent reply",
             "visibility_level": "default",
-            "root_id": "msg_root_abc",
         },
     )
     assert "posted" in result
@@ -1167,7 +1170,8 @@ async def test_ch_prefixed_cache_miss_keeps_membership_error():
 
 
 @pytest.mark.asyncio
-async def test_send_message_dm():
+@pytest.mark.parametrize("destination", ["@alice-0001", "dm:alice-0001"])
+async def test_send_message_dm(destination):
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
     sender_kem = KemKeyPair.generate()
@@ -1195,7 +1199,7 @@ async def test_send_message_dm():
     result = await _call(
         mcp,
         "send_message",
-        {"channel": "@alice-0001", "text": "hey", "visibility_level": "human"},
+        {"channel": destination, "text": "hey", "visibility_level": "human"},
     )
     assert "posted" in result
 

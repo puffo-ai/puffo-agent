@@ -1279,6 +1279,8 @@ class Worker:
         # the client owns. Required on Windows so ``messages.db*``
         # files release before ``puffo-agent agent archive`` renames.
         self._client = None
+        # Credential-v2 view; None when it cannot hold any.
+        self._credentials = None
         # Signalled when warm() finishes (success, failure, or skipped).
         # Daemon awaits this to serialise heavy startup across workers.
         self._warm_done = asyncio.Event()
