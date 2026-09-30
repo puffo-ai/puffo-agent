@@ -1285,7 +1285,12 @@ class GlobalInboxRuntime(
                 provider_session_id=self.active.provider_session_id,
                 message_id=item_id,
                 server_seq=row.server_seq if row is not None else None,
-                outcome="requeued",
+                outcome=(
+                    "settled_by_cover"
+                    if row is not None
+                    and row.processing_state == ProcessingState.PROCESSED
+                    else "requeued"
+                ),
             )
         log_runtime_event(
             logger,

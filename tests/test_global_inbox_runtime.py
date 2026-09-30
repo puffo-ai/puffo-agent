@@ -885,6 +885,45 @@ async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_turn_does_not_requeue_a_message_it_already_answered(
+    tmp_path, caplog,
+):
+    # Field case (Glimmer QA, 2026-09-30): the reply to m1 was sent with a
+    # cover, then the provider kept returning empty responses and the turn
+    # failed. Requeueing m1 presented it again next turn beside the new
+    # message, and the model answered it a second time.
+    caplog.set_level(logging.INFO)
+    store = await make_store(tmp_path)
+    await receipt(store, "m1", 1)
+    await receipt(store, "m2", 2)
+    adapter = Adapter()
+
+    async def answer_one_then_fail(_planned):
+        await adapter.admit()
+        page = await runtime.read_inbox(limit=10, tool_arguments={"limit": 10})
+        assert len(page["messages"]) == 2
+        await store.add_message_covers(["m1"], source="send", by_envelope_id="reply-1")
+        raise RuntimeError("empty responses exhausted")
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=answer_one_then_fail,
+        workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+
+    assert [m.envelope_id for m in await store.get_pending()] == ["m2"]
+    answered = await store.get_message_by_envelope("m1")
+    assert answered.processing_state == ProcessingState.PROCESSED
+    outcomes = {
+        event["message_id"]: event["outcome"]
+        for event in runtime_events(caplog)
+        if event["event"] == "inbox.row_requeued"
+    }
+    assert outcomes == {"m1": "settled_by_cover", "m2": "requeued"}
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_admission_failure_requeues_exact_union_and_provider_session_clears(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "m1", 1)
