@@ -162,9 +162,8 @@ def _refresh_flag_is_pending(flag: Path) -> bool:
 # deferral; a run of them means the provider is not reaching the Inbox at all.
 _NO_PROGRESS_TURN_THRESHOLD = 3
 
-# Held before the auth-failed DM: the daemon refreshes at a 600s margin while
-# Claude Code rotates at ~300s, so a turn in that window takes one 401 just
-# before the rotation lands. A genuine expiry is still failed after the wait.
+# Held before the auth-failed DM: refresh margin 600s vs claude's ~300s
+# rotation, so a turn in that window 401s just before the rotation lands.
 AUTH_FAILED_DM_DELAY_SECONDS = 20.0
 
 # Health values the MCP transport probe may replace with ``mcp_unreachable``.
@@ -811,8 +810,8 @@ class Worker:
         or send raised) so the next ENTER retries instead of staying
         silently gated.
 
-        Held by ``AUTH_FAILED_DM_DELAY_SECONDS``, then dropped if the episode
-        ended: advice to a human must describe state at send time.
+        Dropped when the episode ended during the wait: advice to a human
+        must describe state at send time.
         """
         if episode:
             await asyncio.sleep(AUTH_FAILED_DM_DELAY_SECONDS)
@@ -1273,8 +1272,7 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
-        # bumped on every auth_failed ENTER and recovery; a pending DM
-        # carries its value and drops itself when it no longer matches
+        # auth_failed episode; a pending DM drops itself when it moves on
         self._auth_failed_episode = 0
         self._drained_notification_sent = False
         self._extra_usage_notification_sent = False

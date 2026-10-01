@@ -701,9 +701,7 @@ def _notifier(episode: int, client):
 
 
 def test_pending_dm_drops_when_the_credential_recovered_first(monkeypatch, caplog):
-    """The observed false alarm: a 401 on a turn and the rotation that fixes
-    it are the same event, so the refresh landed 0.8s before the DM was sent
-    and the operator was told to re-run `claude auth login` for nothing."""
+    """The observed false alarm: the refresh landed 0.8s before the DM."""
     import logging
     from puffo_agent.portal import worker as worker_module
 
@@ -736,8 +734,7 @@ def test_pending_dm_is_sent_when_the_failure_outlives_the_delay(monkeypatch):
 
 
 def test_the_delay_is_what_gives_recovery_time_to_land(monkeypatch):
-    """The episode check only helps if the DM actually waits: recovery that
-    lands while the task sleeps must still suppress it."""
+    """Recovery landing while the task sleeps must still suppress it."""
     from puffo_agent.portal import worker as worker_module
 
     monkeypatch.setattr(worker_module, "AUTH_FAILED_DM_DELAY_SECONDS", 0.05)
