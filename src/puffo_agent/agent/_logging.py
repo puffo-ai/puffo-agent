@@ -30,6 +30,7 @@ RUNTIME_EVENT_FIELDS = frozenset({
     "runtime_ref", "session_ref", "turn_ref", "permission_ref", "run_id",
     "event_id", "event_type", "outbox_sequence", "retry_count",
     "capability", "capability_decision", "error_code", "error_type",
+    "error_detail",
     "first_sequence", "last_sequence", "event_count",
 })
 RUNTIME_EVENT_NAMES = frozenset({
