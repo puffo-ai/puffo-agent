@@ -1,9 +1,8 @@
-"""Reading and filing mail, against a fake Gmail: never the real one.
+"""Reading and filing mail against a fake Gmail.
 
-Everything here is idempotent, which is the whole reason it is separate from
-sending: a lost answer is a failure the agent may retry, not a "may have
-happened". The cells that matter check that split, that nothing here can
-delete mail permanently, and that bodies and addresses stay out of the log.
+The cells that matter: a lost answer is retryable here and not an "unknown",
+nothing can delete mail permanently, and bodies and addresses stay out of
+the log.
 """
 
 import base64
@@ -135,8 +134,7 @@ async def test_an_html_only_message_is_read_as_text_not_as_markup():
 
 @pytest.mark.asyncio
 async def test_an_empty_plain_part_falls_through_to_the_html_one():
-    """Bulk senders ship a blank text/plain next to the real HTML; preferring
-    plain blindly would hand the agent an empty message."""
+    """A blank text/plain beside real HTML must not read as empty."""
     api = Api({"/messages/m1": (200, {"id": "m1", "raw": _raw(body="", html=HTML)})})
     out = await read(Wallet(), message_id="m1", transport=api, api=API)
     assert "Hello" in out["body"] and "World" in out["body"]
@@ -270,8 +268,7 @@ async def test_a_token_refused_twice_is_a_definite_failure():
     (503, {"error": {"message": "backend"}}),
 ])
 async def test_a_lost_answer_is_retryable_here_not_a_third_outcome(failure):
-    """The send path answers "unknown" because it cannot know. Filing mail
-    is idempotent, so the honest answer is "try again"."""
+    """Send cannot know; filing is idempotent, so the answer is "try again"."""
     if isinstance(failure, BaseException):
         api = Api({"/messages/m1/modify": None}, fail_with=failure)
     else:
@@ -291,8 +288,7 @@ async def test_a_mailbox_we_cannot_reach_is_a_plain_failure():
 
 @pytest.mark.asyncio
 async def test_a_403_points_at_the_scope_rather_than_looking_like_a_bug():
-    """A token minted before the mailbox scope was widened keeps the old
-    scope through every refresh, so re-consent is the only fix."""
+    """A pre-widening token keeps its scope through every refresh."""
     api = Api({"/messages": (403, {"error": {"message": "Insufficient Permission"}})})
     with pytest.raises(GmailSendError) as exc:
         await search(Wallet(), transport=api, api=API)
@@ -425,8 +421,7 @@ async def test_the_route_reaches_the_worker_for_each_operation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_lost_answer_reaches_the_agent_as_retryable_not_as_unknown(monkeypatch):
-    """The send route would say "may have been sent". Here the honest answer
-    is that nothing changed twice, so try again."""
+    """Not "may have been sent": nothing changed twice, so try again."""
     api = Api({"/messages/m1/modify": (503, {})})
     status, payload = await _through_route(
         "organize", {"message_id": "m1", "action": "archive"}, api, monkeypatch)

@@ -538,8 +538,7 @@ async def gmail_send_route(request: web.Request) -> web.Response:
         )
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
-        # 409, not 503: a 5xx reads as "unknown" one hop up and would tell
-        # the agent a message may have gone out (Boris 227840).
+        # 409, not 503: a 5xx reads as "unknown" one hop up (Boris 227840).
         return web.json_response(
             {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
             status=409,
@@ -563,8 +562,8 @@ _MAILBOX_OPS = {
 
 
 async def gmail_mailbox_route(request: web.Request) -> web.Response:
-    """Read or file mail. Every op here is idempotent, so a 5xx is safe for
-    the agent to retry; only ``gmail-send`` needs the third outcome."""
+    """Read or file mail. Idempotent, so only ``gmail-send`` needs the
+    third outcome."""
     from .gmail_mailbox import GmailLostAnswer
     from .gmail_send import GmailSendError
 

@@ -171,8 +171,7 @@ class PuffoRpcClient:
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return unknown
         if status >= 400:
-            # The daemon answers 4xx only when nothing was sent, so an
-            # unreadable body here must not soften into "may have been sent".
+            # The daemon answers 4xx only when nothing was sent.
             error = data.get("error") if isinstance(data, dict) else None
             raise RuntimeError(f"not sent: {error or status}")
         if not isinstance(data, dict):
@@ -180,8 +179,7 @@ class PuffoRpcClient:
         return data
 
     async def gmail_mailbox(self, op: str, **fields) -> dict[str, Any]:
-        """Read or file mail. Idempotent, so this uses the ordinary route
-        semantics: any failure is a failure the agent may simply retry."""
+        """Read or file mail. Idempotent, so ordinary route semantics."""
         return await self._post_object("gmail-mailbox", {"op": op, **fields})
 
     async def _post_object(

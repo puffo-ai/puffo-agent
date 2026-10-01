@@ -1,10 +1,8 @@
-"""Send mail through Gmail as a Google account shared with this agent.
+"""Send mail as a Google account shared with this agent.
 
 An agent that reads "failed" sends again, so three outcomes stay distinct
-(Jeff 227820): *sent* (Gmail gave a message id), *failed* (definitely not
-sent), *unknown* (the request went out and the answer was lost, so never
-retried). Only the message id and failure codes reach the log, never the
-token, recipients or body (Boris 227821).
+(Jeff 227820): *sent*, *failed*, and *unknown* — went out, answer lost,
+never retried. Only ids and codes reach the log (Boris 227821).
 """
 
 from __future__ import annotations
@@ -28,9 +26,8 @@ SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 RT_TYPE = "PUFFO_GOOGLE_OAUTH_v1"
 AT_TYPE = "PUFFO_GOOGLE_OAUTH_AT_v1"
 
-# (url, body bytes or None, headers, method=) -> (status, response bytes).
-# Raises aiohttp.ClientConnectorError when the request never went out, and
-# any other aiohttp.ClientError / TimeoutError when the answer was lost.
+# ClientConnectorError means the request never went out; any other
+# ClientError / TimeoutError means the answer was lost.
 Transport = Callable[..., Awaitable[tuple[int, bytes]]]
 
 
@@ -43,10 +40,8 @@ class GmailSendError(Exception):
 
 
 def build_message(to: str, subject: str, body: str) -> bytes:
-    """RFC 5322 bytes. Gmail sets From to the authorized account.
-
-    The email package refuses CR/LF in a header, blocking header injection.
-    """
+    """RFC 5322 bytes; Gmail sets From. The email package refuses CR/LF in a
+    header, which is what blocks header injection."""
     if not to.strip():
         raise GmailSendError("bad_request", "to must name at least one recipient")
     msg = EmailMessage(policy=SMTP)
@@ -69,8 +64,8 @@ async def send(
     transport: Transport | None = None,
     send_url: str = SEND_URL,
 ) -> dict:
-    """Send one message. Returns ``{"status": "sent" | "unknown", ...}``;
-    raises ``GmailSendError`` when it definitely was not sent."""
+    """Returns ``{"status": "sent" | "unknown", ...}``; raises when it
+    definitely was not sent."""
     if credentials is None:
         raise GmailSendError(
             "no_credentials", "this agent cannot hold credentials (no operator recorded)"
@@ -135,7 +130,7 @@ async def _access_token(credentials: AgentCredentials, index: int, *, fresh: boo
 
 
 async def _before_sending(code: str, call):
-    """Anything failing before the Gmail request goes out: nothing was sent."""
+    """Anything failing before the request goes out: nothing was sent."""
     try:
         return await call
     except Exception as exc:  # noqa: BLE001 - reported as a definite, logged-by-code failure
@@ -153,10 +148,10 @@ def _outcome(status: int, reply: bytes) -> dict:
             logger.info("gmail send: sent %s", data["id"])
             return {"status": "sent", "message_id": data["id"],
                     "thread_id": data.get("threadId", "")}
-        # Accepted with no id we can read: it may well have gone out.
+        # Accepted with no readable id: it may well have gone out.
         return _unknown(f"Gmail answered {status} without a message id")
     if status >= 500:
-        # A server error after the request went out says nothing definite.
+        # A 5xx after the request went out says nothing definite.
         return _unknown(f"Gmail answered {status}")
     reason = ""
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
@@ -179,8 +174,7 @@ def _log_failure(code: str) -> None:
     logger.warning("gmail send: failed (%s)", code)
 
 
-# A raw message can be megabytes; anything past this is refused rather
-# than buffered, and Gmail itself will not accept a larger one.
+# Refused rather than buffered; Gmail will not accept a larger one anyway.
 MAX_REPLY_BYTES = 30 * 1024 * 1024
 
 
@@ -197,11 +191,10 @@ async def gmail_transport(
 
 
 async def _read_body(resp) -> bytes:
-    """Read to the end of the response.
+    """Read to the end.
 
-    ``StreamReader.read(n)`` returns whatever is buffered, not n bytes, so
-    a reply that arrives in several chunks comes back truncated — which
-    reads as malformed JSON rather than as a short read.
+    ``StreamReader.read(n)`` returns what is buffered, not n bytes, so a
+    chunked reply came back truncated and read as malformed JSON.
     """
     chunks, total = [], 0
     async for chunk in resp.content.iter_chunked(64 * 1024):

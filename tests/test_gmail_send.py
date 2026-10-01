@@ -1,9 +1,8 @@
-"""gmail_send against a fake Gmail: never the real one.
+"""gmail_send against a fake Gmail.
 
-The cells that matter most are the three outcomes. An agent that reads
-"failed" sends again, so a request that went out and lost its answer must
-come back as "unknown", exactly once, from the daemon and through the RPC
-hop alike (Jeff 227820).
+The cells that matter are the three outcomes: a request that went out and
+lost its answer reads as "unknown", exactly once, from the daemon and
+through the RPC hop alike (Jeff 227820).
 """
 
 import asyncio
@@ -125,8 +124,7 @@ async def test_a_lost_answer_is_unknown_and_never_resent(answer):
 
 @pytest.mark.asyncio
 async def test_gmail_taking_the_request_and_hanging_up_is_unknown(unused_tcp_port):
-    """Jeff 227820, end to end through the real transport: a server that
-    reads the whole request and drops the connection without an id."""
+    """Jeff 227820 through the real transport: read, then hang up."""
     received = []
 
     async def swallow(request):
@@ -223,8 +221,7 @@ async def test_the_log_carries_codes_and_ids_not_tokens_recipients_or_bodies(cap
     ("hang-up", "unknown"), ("500", "unknown"), ("sent", "sent"), ("400", "error"),
 ])
 async def test_the_rpc_hop_keeps_unknown_distinct_from_failure(unused_tcp_port, behaviour, expected):
-    """The MCP process talks to the daemon over loopback RPC; losing that
-    answer is the same situation one hop earlier and must read the same."""
+    """Losing the answer one hop earlier must read the same."""
 
     async def route(request):
         await request.read()
@@ -256,8 +253,7 @@ async def test_the_rpc_hop_keeps_unknown_distinct_from_failure(unused_tcp_port, 
 
 @pytest.mark.asyncio
 async def test_no_running_worker_is_a_definite_failure_not_unknown():
-    """Boris 227840: the daemon's 'no warm worker' must not read as 'may have
-    been sent' on the MCP side."""
+    """Boris 227840: 'no warm worker' must not read as 'may have been sent'."""
     from aiohttp.test_utils import TestClient, TestServer
 
     from puffo_agent.portal import rpc_service

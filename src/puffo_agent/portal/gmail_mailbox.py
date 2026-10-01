@@ -1,15 +1,9 @@
 """Read and organise the mailbox shared with this agent (``gmail.modify``).
 
-Sending is in ``gmail_send``, and the split is the outcome model, not the
-subject: a send that loses its answer may still have gone out, so it reports
-"unknown". Everything here is idempotent — listing twice reads the same
-mailbox, archiving twice leaves one archived message, trashing twice leaves
-one trashed message — so a lost answer is just a failure the agent may retry.
-
-``gmail.modify`` is deliberately short of ``mail.google.com``: nothing here
-can delete mail permanently. ``trash`` is reversible by the account owner.
-
-Message bodies and addresses never reach the log; only ids and codes do.
+Split from ``gmail_send`` by the outcome model, not the subject: everything
+here is idempotent, so a lost answer is a failure the agent may retry, not
+an "unknown". The scope stops short of ``mail.google.com``, so nothing here
+deletes mail permanently. Only ids and codes reach the log.
 """
 
 from __future__ import annotations
@@ -32,14 +26,12 @@ logger = logging.getLogger(__name__)
 
 API = "https://gmail.googleapis.com/gmail/v1/users/me"
 
-# A body large enough to bury the agent's own context; the rest is cut and
-# the message says so, rather than silently truncating.
+# Past this the body would bury the agent's own context; the cut is flagged.
 MAX_BODY_CHARS = 20_000
 MAX_RESULTS = 50
 
-# What an agent may change, mapped to the label edit Gmail wants. Names are
-# the user's words, not Gmail's; `mail.google.com` is not granted, so there
-# is no permanent delete here on purpose.
+# The user's words, mapped to the label edit Gmail wants. No delete: the
+# scope does not grant one.
 LABEL_ACTIONS = {
     "archive": ([], ["INBOX"]),
     "move_to_inbox": (["INBOX"], []),
@@ -51,8 +43,7 @@ LABEL_ACTIONS = {
 
 
 class GmailLostAnswer(Exception):
-    """The request went out and the answer was lost. Safe to try again here,
-    because every operation in this module is idempotent."""
+    """The answer was lost. Retryable, since everything here is idempotent."""
 
 
 async def search(
@@ -168,10 +159,7 @@ async def organize(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """One vocabulary for every way an agent may file a message.
-
-    Trash is reversible on purpose: the granted scope cannot delete mail.
-    """
+    """One vocabulary for every way an agent may file a message."""
     if not message_id.strip():
         raise GmailSendError("bad_request", "message_id is required")
     if action in TRASH_ACTIONS:
@@ -211,11 +199,8 @@ async def _post(account, url: str, payload: dict, transport) -> dict:
 
 
 async def _call(account, method: str, url: str, payload, transport) -> dict:
-    """One authed call, refreshing the token once on a 401.
-
-    A lost answer raises ``GmailLostAnswer``: every caller here is idempotent,
-    so the agent is told to try again rather than that nothing happened.
-    """
+    """One authed call, refreshing the token once on a 401. A lost answer
+    raises ``GmailLostAnswer``, not a definite failure."""
     transport = transport or gmail_transport
     token = await _access_token(account.credentials, account.index, fresh=False)
     for attempt in (1, 2):
@@ -250,8 +235,8 @@ def _read_reply(status: int, reply: bytes) -> dict:
         _fail("no_answer")
         raise GmailLostAnswer(f"Gmail answered {status}")
     if status == 403:
-        # The usual cause is a token granted before the mailbox scope was
-        # widened; refreshing keeps the old scope, so re-consent is the fix.
+        # Usually a token granted before the scope widened; a refresh keeps
+        # the old scope, so only re-consent fixes it.
         _fail("gmail_403")
         raise GmailSendError(
             "insufficient_scope",
@@ -299,12 +284,8 @@ def _summary(full: dict) -> dict:
 
 
 def _plain_body(parsed) -> tuple[str, bool]:
-    """The text the agent should read.
-
-    text/plain wins, but a bulk sender's empty plain part next to a real HTML
-    one would otherwise hand the agent a blank message, so an empty winner
-    falls through to the HTML.
-    """
+    """text/plain wins, but an empty one falls through to the HTML: bulk
+    senders ship a blank plain part beside the real content."""
     for preference in (("plain",), ("html",)):
         part = parsed.get_body(preferencelist=preference)
         if part is None:
