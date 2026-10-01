@@ -4,6 +4,7 @@ the daemon for single-writer semantics; cli-docker reaches the daemon via
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import urllib.parse
 from typing import Any, Optional
@@ -136,6 +137,50 @@ class PuffoRpcClient:
                 return data
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
+
+    async def gmail_send(
+        self, *, to: str, subject: str, body: str, from_account: str = "",
+    ) -> dict[str, Any]:
+        """Send through the daemon.
+
+        Unlike other routes, a lost answer is not a failure: the daemon may
+        already have sent it, so a hang-up, timeout or 5xx is "unknown" and
+        must never be retried.
+        """
+        path = f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/gmail-send"
+        payload = {"to": to, "subject": subject, "body": body}
+        if from_account:
+            payload["from_account"] = from_account
+        unknown = {
+            "status": "unknown",
+            "detail": "the answer from the daemon was lost. The message may have been "
+                      "sent; do not send it again without checking the Sent folder.",
+        }
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=payload) as resp:
+                status = resp.status
+                if status >= 500:
+                    return unknown
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = None
+        except aiohttp.ClientConnectorError as exc:
+            raise RuntimeError(f"gmail_send: daemon unreachable, nothing was sent: {exc}") from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return unknown
+        if status >= 400:
+            # The daemon answers 4xx only when nothing was sent.
+            error = data.get("error") if isinstance(data, dict) else None
+            raise RuntimeError(f"not sent: {error or status}")
+        if not isinstance(data, dict):
+            return unknown
+        return data
+
+    async def gmail_mailbox(self, op: str, **fields) -> dict[str, Any]:
+        """Read or file mail. Idempotent, so ordinary route semantics."""
+        return await self._post_object("gmail-mailbox", {"op": op, **fields})
 
     async def _post_object(
         self, route: str, body: dict[str, Any],

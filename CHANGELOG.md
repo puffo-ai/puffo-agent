@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Agents can work a mailbox their operator shared with them.** Four tools:
+  `gmail_send`, `gmail_search` (Gmail's own search syntax), `gmail_read`
+  (HTML mail is converted to text, attachments are listed by name only) and
+  `gmail_organize` (archive, move to inbox, mark read or unread, star, trash
+  and their reverses). The operator's control is the share itself, so there
+  is no per-action confirmation. With more than one account shared, the agent
+  names which to use and the error lists the choices. Nothing can delete mail
+  permanently: trash is reversible, and that access is never requested.
+  Recipients, bodies and tokens never reach the log.
+
+  Sending reports one of three outcomes, and "unknown" means the message may
+  have gone out and must not be sent again without checking the Sent folder.
+  Reading and filing are repeatable, so they report a plain failure the agent
+  may simply retry. An account connected before mailbox access was granted
+  keeps its old permissions through every refresh; the error says to
+  reconnect it. (#428)
+
 ### Fixed
 
 - **No more "my Claude sign-in has expired" DM for a credential that just
@@ -50,7 +69,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   command refuses to clear a gate whose provider stop is unconfirmed.
   `agent show` reports an open gate, and the parked-state diagnostic names
   the command instead of the internal wire ops.
-
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate

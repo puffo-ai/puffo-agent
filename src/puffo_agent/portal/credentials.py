@@ -2,8 +2,8 @@
 
 In-process only; a restart refetches (amendment 9). Revocation is absence
 from the list, but a *failed* list drops nothing (amendment 4). Every
-invalidation bumps a generation to fence fetches that raced it (amendment 10,
-Jeff 226108). Anything that does not open is refused. Refresh (§5.5) spends
+invalidation bumps a generation to fence fetches that raced it
+(amendment 10). Anything that does not open is refused. Refresh (§5.5) spends
 this agent's S2 share.
 """
 
@@ -99,6 +99,16 @@ class AgentCredentials:
         self._held[held.id] = held
         return held
 
+    async def held(self, credential_type: str) -> list[tuple[int, str]]:
+        """``(index, alias)`` of every usable credential of this type this
+        agent holds, lowest index first. Asks the server; caches nothing."""
+        data = await self._http.get(f"/v2/credentials?type={credential_type}")
+        return sorted(
+            (item["index"], item.get("alias") or "")
+            for item in data["credentials"]
+            if item["type"] == credential_type and item["state"] == "ACTIVATED"
+        )
+
     async def reconcile(self) -> None:
         """Drop everything the server no longer lists as held and current.
 
@@ -152,7 +162,7 @@ class AgentCredentials:
         """Open the response as the credential that was asked for, or refuse.
 
         The id is derived here and the AAD built from the request, not the
-        response, so B's genuine row cannot answer for A (Boris 226286).
+        response, so B's genuine row cannot answer for A.
         """
         expected_id = credential_id(self._owner, credential_type, index)
         if (data["id"], data["type"], data["index"]) != (expected_id, credential_type, index):
