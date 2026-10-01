@@ -4,15 +4,193 @@ the daemon for single-writer semantics; cli-docker reaches the daemon via
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import urllib.parse
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import aiohttp
 
 from ..portal.local_service_auth import local_service_headers
 
 logger = logging.getLogger(__name__)
+
+_RPC_FAILURE_DETAIL_MAX_CHARS = 500
+# Parity with ``agent._logging._TOKENISH``: this tail rides into
+# exceptions and logs, so secret-shaped values may not survive raw.
+_TOKENISH = re.compile(
+    r"(?i)(?:bearer\s+\S+|(?:access|refresh|id)[_-]?token\s*[:=]\s*\S+|"
+    r"sk-[a-z0-9_-]{12,}|eyJ[a-zA-Z0-9_-]{12,}\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)"
+)
+_SECRET_KEYS = re.compile(
+    r"(?i)(?:^|[_-])(?:token|secret|password|passwd|authorization|cookie|"
+    r"credential|api[_-]?key|verifier)s?(?:$|[_-])"
+)
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# An OAuth authorization code or CSRF state is an opaque string that no
+# shape heuristic can promise to catch (``private_session_nonce`` is a
+# perfectly snake-shaped secret), so ``code``/``error_code``/``state``
+# values pass through only when they are *known* diagnostic values;
+# everything else is redacted. Extend these sets when the daemon starts
+# returning new codes — an unlisted code costs one lookup in the daemon
+# log, a leaked credential cannot be recalled.
+# Every value below is a literal this repo actually returns; extend
+# only from real interface contracts, never invented names.
+_KNOWN_DIAGNOSTIC_CODES = frozenset({
+    # provider failure taxonomy (agent/provider_failures.py)
+    "authentication", "permission_denied", "model_not_found",
+    "not_entitled", "budget_exceeded", "plan_drained",
+    "extra_usage_required", "quota_exhausted", "rate_limit",
+    "provider_unavailable", "provider_error", "runtime_exited",
+    "resume_unconfirmed", "protocol_error", "cancel_failed", "unknown",
+    # control / runtime / receipt codes emitted elsewhere in this repo
+    "invalid_command", "agent_start_failed", "agent_start_timeout",
+    "command_rejected", "command_failed", "harness_not_ready",
+    "runtime_not_ready", "acp_prompt_failed", "cancelled",
+    "command_lifecycle_protocol", "invalid_resume",
+    "input_admission_ambiguous", "turn_timeout", "runtime_closed",
+    "operator_recovery_required", "event_persistence_failed",
+    "transport", "malformed_ack", "malformed_response", "capacity",
+})
+_KNOWN_DIAGNOSTIC_STATES = frozenset({
+    # send / staging / reminder lifecycle states on this interface
+    "sent", "held", "failed", "staged", "scheduled", "cancelled",
+    "delivered", "claimed", "requeued",
+})
+_QUERY_SECRETS = re.compile(
+    r"(?i)([?&#](?:code|state|access_token|refresh_token|id_token|token|"
+    r"client_secret|code_verifier)=)[^&#\s\"']+"
+)
+# Serialization priority under the truncation budget: stable diagnostic
+# fields first (in this order), everything else shortest-first.
+_DIAGNOSTIC_PRIORITY = (
+    "code", "error_code", "state", "reason", "category",
+    "message", "hint", "request_id", "retryable",
+)
+
+
+def _sanitize_detail(value: Any, *, key: str = "") -> Any:
+    # Normalize camelCase (accessToken) to snake so the separator-based
+    # secret-key pattern sees the same shape either way; the whole value
+    # is replaced before any recursion, so ``credentials: {...}`` cannot
+    # leak through its nested fields.
+    lowered = _CAMEL_BOUNDARY.sub("_", key).lower()
+    if _SECRET_KEYS.search(lowered):
+        return "[REDACTED]"
+    if lowered in ("code", "error_code", "state"):
+        known = (
+            _KNOWN_DIAGNOSTIC_STATES if lowered == "state"
+            else _KNOWN_DIAGNOSTIC_CODES
+        )
+        # These fields' contract is a string enum; any other type is an
+        # unknown value, not a loophole.
+        if not (isinstance(value, str) and value in known):
+            return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_detail(v, key=str(k)) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_detail(item) for item in value]
+    return value
+
+
+def _encode_detail_value(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+class PuffoRpcError(RuntimeError):
+    """A non-2xx RPC response. ``status`` carries the real HTTP status
+    and ``error`` the body's headline text, so compatibility probes read
+    them structurally instead of scanning the diagnostic message for
+    digits (a ``request_id`` like ``req-404-abc`` must not read as 404).
+    """
+
+    def __init__(
+        self, message: str, *, status: int = 0, route: str = "",
+        error: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.route = route
+        self.error = error
+
+
+def _raise_rpc_failure(route: str, status: int, data: Any) -> NoReturn:
+    error = data.get("error") if isinstance(data, dict) else None
+    raise PuffoRpcError(
+        _rpc_failure_message(route, status, data),
+        status=status,
+        route=route,
+        error=error if isinstance(error, str) else "",
+    )
+
+
+def _raise_non_json_failure(route: str, status: int, raw: str) -> NoReturn:
+    """A non-JSON body still carries a real HTTP status — an old daemon
+    with no such route answers with aiohttp's default text/plain 404, and
+    the rolling-upgrade probes must still see ``status`` structurally."""
+    message = f"rpc {route} returned non-JSON body (status {status})"
+    if raw:
+        message = f"{message}: {_redact_detail_text(raw)[:500]}"
+    if status >= 400:
+        raise PuffoRpcError(message, status=status, route=route)
+    raise RuntimeError(message)
+
+
+def _redact_detail_text(text: str) -> str:
+    text = _TOKENISH.sub("[REDACTED]", text)
+    return _QUERY_SECRETS.sub(r"\g<1>[REDACTED]", text)
+
+
+def _rpc_failure_message(route: str, status: int, data: Any) -> str:
+    """Carry the daemon's whole failure body into the raised error.
+
+    A 4xx body is the diagnosis — re-auth needed vs cloud config vs an
+    operator denial — so beyond the ``error`` headline every remaining
+    field rides along as a bounded JSON tail instead of being discarded.
+    Stable diagnostic fields serialize first so codes and reasons survive
+    the truncation budget regardless of how many other fields the body
+    carries; credential-named keys, secret-shaped values, opaque
+    ``code``/``state`` values, and secret URL query params are redacted.
+    """
+    headline = f"rpc {route} failed with status {status}"
+    error = data.get("error") if isinstance(data, dict) else None
+    headlined_error = isinstance(error, str) and bool(error)
+    if headlined_error:
+        headline = f"{headline}: {_redact_detail_text(error)}"
+    if isinstance(data, dict):
+        residue: Any = {
+            key: _sanitize_detail(value, key=str(key))
+            for key, value in data.items()
+            if (key != "error" or not headlined_error)
+            and value not in (None, "")
+        }
+    else:
+        residue = _sanitize_detail(data)
+    if residue in (None, "", {}, []):
+        return headline
+    if isinstance(residue, dict):
+        rank = {name: idx for idx, name in enumerate(_DIAGNOSTIC_PRIORITY)}
+        fields = [
+            (
+                str(key).lower(),
+                f"{_encode_detail_value(str(key))}:{_encode_detail_value(value)}",
+            )
+            for key, value in residue.items()
+        ]
+        fields.sort(
+            key=lambda item: (rank.get(item[0], len(rank)), len(item[1])),
+        )
+        tail = "{" + ",".join(encoded for _, encoded in fields) + "}"
+    else:
+        tail = _encode_detail_value(residue)
+    tail = _redact_detail_text(tail)
+    return f"{headline} detail={tail[:_RPC_FAILURE_DETAIL_MAX_CHARS]}"
 
 
 class PuffoRpcClient:
@@ -71,19 +249,11 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    text = await resp.text()
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON body "
-                        f"(status {resp.status}): {text[:500]}"
+                    _raise_non_json_failure(
+                        route, resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
-                    err = (
-                        data.get("error")
-                        if isinstance(data, dict) else None
-                    )
-                    raise RuntimeError(
-                        err or f"rpc {route} failed with status {resp.status}"
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 msg = (
                     data.get("message") if isinstance(data, dict) else None
                 )
@@ -117,16 +287,11 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    raw = await resp.text()
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON body "
-                        f"(status {resp.status}): {raw[:500]}"
+                    _raise_non_json_failure(
+                        route, resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
-                    raise RuntimeError(
-                        str(error or f"rpc {route} failed with status {resp.status}")
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object result")
                 if data.get("state") not in ("sent", "held", "failed"):
@@ -150,15 +315,10 @@ class PuffoRpcClient:
             async with session.post(f"{self.base_url}{path}", json=body) as resp:
                 try:
                     data = await resp.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON (status {resp.status})"
-                    ) from exc
+                except Exception:
+                    _raise_non_json_failure(route, resp.status, "")
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
-                    raise RuntimeError(
-                        str(error or f"rpc {route} failed ({resp.status})")
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object")
                 return data
@@ -229,20 +389,11 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    raw = await resp.text()
-                    raise RuntimeError(
-                        "rpc model-visible-read returned non-JSON body "
-                        f"(status {resp.status}): {raw[:500]}"
+                    _raise_non_json_failure(
+                        "model-visible-read", resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
-                    raise RuntimeError(
-                        str(
-                            error
-                            or "rpc model-visible-read failed with "
-                            f"status {resp.status}"
-                        )
-                    )
+                    _raise_rpc_failure("model-visible-read", resp.status, data)
                 if not isinstance(data, dict) or data.get("state") != "staged":
                     raise RuntimeError(
                         "rpc model-visible-read returned an invalid result"
@@ -267,14 +418,10 @@ class PuffoRpcClient:
             ) as resp:
                 try:
                     data = await resp.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"rpc read-inbox returned non-JSON (status {resp.status})"
-                    ) from exc
+                except Exception:
+                    _raise_non_json_failure("read-inbox", resp.status, "")
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        str(data.get("error") or f"rpc read-inbox failed ({resp.status})")
-                    )
+                    _raise_rpc_failure("read-inbox", resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError("rpc read-inbox returned a non-object")
                 return data
@@ -331,11 +478,12 @@ class PuffoRpcClient:
             body["covers"] = covers
         try:
             data = await self._post_object("create-reminder", body)
-        except RuntimeError as exc:
+        except PuffoRpcError as exc:
             # Rolling local upgrade: an older daemon rejects the covers key
             # wholesale. The deferral matters more than the declaration, so
-            # retry without covers and report them as dropped.
-            if not covers or "accepts only" not in str(exc):
+            # retry without covers and report them as dropped. Probe the
+            # body's own error text, never the full diagnostic message.
+            if not covers or "accepts only" not in exc.error:
                 raise
             data = await self._post_object(
                 "create-reminder",
@@ -362,8 +510,10 @@ class PuffoRpcClient:
             body["note"] = note
         try:
             return await self._post_object("mark-covered", body)
-        except RuntimeError as exc:
-            if "404" in str(exc) or "failed (404)" in str(exc):
+        except PuffoRpcError as exc:
+            # Judge by the real HTTP status — a request_id like
+            # "req-404-abc" in the diagnostic tail must not read as 404.
+            if exc.status == 404:
                 raise RuntimeError(
                     "mark_covered is not available on this daemon yet "
                     "(rolling upgrade in progress); declare covers on the "
