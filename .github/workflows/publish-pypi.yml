@@ -21,21 +21,27 @@
 # approval before publishing. Once a version is on PyPI it can never
 # be re-uploaded — the approval gate is the last cheap chance to
 # catch a bad build.
+#
+# The build runs in its own job *before* the gate and uploads dist/ as a
+# workflow artifact; the gated publish job uploads exactly those bytes.
+# Approvers can download the artifact and compare the SHA256 lines in the
+# build job summary before approving, instead of approving a build that
+# has not happened yet.
+#
+# Run it manually ("Run workflow", pick a tag or branch) to rehearse the
+# build. Manual runs never publish: the publish job only runs for a
+# published Release.
 
 name: Publish to PyPI
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/puffo-agent
-    permissions:
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +52,7 @@ jobs:
           python-version: "3.11"
 
       - name: Verify stable version and release tag
+        if: github.event_name == 'release'
         run: |
           python - <<'PY'
           import os
@@ -76,6 +83,41 @@ jobs:
           /tmp/smoke/bin/pip install --upgrade pip
           /tmp/smoke/bin/pip install dist/*.whl
           /tmp/smoke/bin/puffo-agent --help > /dev/null
+
+      - name: Record artifact hashes
+        run: |
+          {
+            echo "### dist/ for ${GITHUB_REF_NAME} @ ${GITHUB_SHA}"
+            echo '```'
+            (cd dist && sha256sum -- *)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/puffo-agent
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the built dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Show what is being published
+        run: cd dist && sha256sum -- *
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
