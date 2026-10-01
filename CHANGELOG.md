@@ -37,6 +37,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   expiry still notifies, and a real failure after a recovered blip still
   notifies.
 
+## [2.0.14] - 2026-10-01
+
+Same runtime as 2.0.13, plus one display fix and a safer release pipeline.
+2.0.13 was never published to PyPI.
+
+### Fixed
+
+- When LingTai refuses to start because `init.json` cannot be read, the agent
+  detail page shows LingTai's fix instructions instead of a truncated JSON
+  prefix. (#443)
+
+### Changed
+
+- Release builds run before the PyPI approval gate, and the approved job
+  uploads exactly the files that were built and checksummed. (#442)
+
 ## [2.0.13] - 2026-10-01
 
 ### Added
