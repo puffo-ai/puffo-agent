@@ -40,12 +40,12 @@ consumed as tracked work, and no signed HTTP invitation route is used.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from pathlib import Path
 from typing import Any
 
 from ..crypto.message import MessagePayload
-from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF
 from ..limits import (
     MAX_INBOUND_ATTACHMENTS,
     MAX_INBOUND_ATTACHMENT_BYTES,
@@ -89,16 +89,48 @@ KEYLESS_DM_REPLY_REASON = "handled keyless dm approval reply"
 KEYLESS_INVITATION_REPLY_REASON = "handled keyless invitation reply"
 
 
+# Reconnect schedule. The first attempt after losing a connection that had been
+# up for a while is immediate (a frozen-then-resumed sandbox must be back on the
+# relay in ~1–2 s); after that, jittered exponential backoff from 0.5 s capped at
+# 5 s, so a relay outage is retried often but never in a hot loop.
+_RECONNECT_BASE_SECONDS = 0.5
+_RECONNECT_CAP_SECONDS = 5.0
+# A connection that lived at least this long counts as healthy: losing it
+# resets the schedule to an immediate retry. A shorter-lived one (the server
+# accepts then drops us) keeps backing off, so connect/close cannot hot-loop.
+_STABLE_CONNECTION_SECONDS = 10.0
+
+
+def reconnect_delay(attempt: int, rand=random.random) -> float:
+    """Delay before reconnect attempt ``attempt`` (0-based since the loss).
+
+    ``0`` → 0 s. ``n ≥ 1`` → ``min(cap, base·2^(n-1))`` scaled by a factor in
+    ``[0.5, 1.0)`` ("equal jitter"), so it is always in ``(0, cap]`` and many
+    agents dropped by one relay restart do not reconnect in lockstep.
+    """
+    if attempt <= 0:
+        return 0.0
+    ceiling = min(_RECONNECT_CAP_SECONDS, _RECONNECT_BASE_SECONDS * 2 ** (attempt - 1))
+    return ceiling * (0.5 + 0.5 * rand())
+
+
 async def listen_bridge(client) -> None:
     """Bridge-transport lifecycle loop: connect → fetch_pending →
-    drain frames → reconnect, with the same backoff schedule as the
-    native ``PuffoCoreWsClient.run()`` (start at INITIAL_BACKOFF,
-    double on failure, cap at MAX_BACKOFF, reset on successful
-    connect).
+    drain frames → reconnect.
+
+    Reconnect schedule: see :func:`reconnect_delay` — immediate after losing a
+    healthy connection, then jittered exponential 0.5 s → 5 s. ``frames()``
+    ends the stream itself on a frozen-and-resumed sandbox (``clock_jump``) or
+    a silently dead socket (``read_timeout``), so a loss is acted on in about a
+    second instead of whenever TCP notices. One ``bridge disconnected`` line
+    per loss (cause) and one ``bridge reconnected`` line per recovery (delay).
 
     Each successfully decoded message is persisted before its bridge ACK
     is scheduled. A fresh ``connect()`` drives ``send_fetch_pending()``
-    once so a cold sandbox drains its server-side queue.
+    once so a cold sandbox drains its server-side queue; the resulting
+    ``pending_delivered`` marker re-issues the spaces refresh, so EVERY
+    reconnect re-seeds membership (closing gaps from membership events
+    that arrived while the socket was dead).
 
     Owns exactly one keyless invitation poller per connection: armed when
     the first ``pending_delivered`` marker proves the frame pump is live
@@ -115,12 +147,24 @@ async def listen_bridge(client) -> None:
     assert bridge is not None  # guarded by listen()
 
     await client.store.open()
-    backoff = INITIAL_BACKOFF
+    attempt = 0
+    lost_at: float | None = None  # monotonic time the current outage began
+    lost_cause = ""
     while True:
+        connected_at: float | None = None
         try:
             try:
                 await bridge.connect()
-                backoff = INITIAL_BACKOFF
+                connected_at = time.monotonic()
+                if lost_at is not None:
+                    client._log.info(
+                        "agent %s: bridge reconnected delay_ms=%d attempts=%d cause=%s",
+                        client.slug,
+                        int((connected_at - lost_at) * 1000),
+                        attempt,
+                        lost_cause,
+                    )
+                lost_at = None
                 await bridge.send_fetch_pending()
                 client._keyless_invite_poll_task = None
                 async for frame in bridge.frames():
@@ -130,18 +174,41 @@ async def listen_bridge(client) -> None:
             finally:
                 await _stop_keyless_invite_poller(client)
                 await bridge.close()
+            cause = getattr(bridge, "last_disconnect_cause", None) or "closed"
+            exception = ""
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reconnect on transport failure
+            cause = "bridge_transport"
+            exception = type(exc).__name__
+        now = time.monotonic()
+        lived = (now - connected_at) if connected_at is not None else 0.0
+        if connected_at is not None and lived >= _STABLE_CONNECTION_SECONDS:
+            attempt = 0
+        if lost_at is None:
+            lost_at = now
+            lost_cause = cause
+            jump = getattr(bridge, "last_clock_jump_s", None)
             client._log.warning(
-                "agent %s: bridge reconnect category=bridge_transport "
-                "exception=%s retry_delay=%ds",
+                "agent %s: bridge disconnected cause=%s category=bridge_transport "
+                "exception=%s connected_for_s=%.1f clock_jump_s=%s",
                 client.slug,
-                type(exc).__name__,
-                backoff,
+                cause,
+                exception or "-",
+                lived,
+                f"{jump:.1f}" if isinstance(jump, (int, float)) else "-",
             )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, MAX_BACKOFF)
+        delay = reconnect_delay(attempt)
+        attempt += 1
+        if delay > 0:
+            client._log.warning(
+                "agent %s: bridge reconnect retry_delay_ms=%d attempt=%d exception=%s",
+                client.slug,
+                int(delay * 1000),
+                attempt,
+                exception or "-",
+            )
+            await asyncio.sleep(delay)
 
 
 def _arm_keyless_invite_poller(client) -> None:

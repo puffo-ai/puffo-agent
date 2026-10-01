@@ -1172,9 +1172,13 @@ async def test_bridge_error_codes_are_closed_content_free_categories(
 
 
 @pytest.mark.asyncio
-async def test_bridge_reconnect_logs_fixed_diagnostics_and_doubles_backoff(
+async def test_bridge_reconnect_logs_fixed_diagnostics_and_backs_off(
     tmp_path, monkeypatch, caplog,
 ):
+    """Connect failures: the first retry is immediate, the next is jittered
+    backoff (0.25–0.5 s); one ``bridge disconnected`` line for the outage
+    (fixed fields, exception class only), one ``bridge reconnected`` line on
+    recovery, and the exception TEXT never reaches the log."""
     sentinel = "BRIDGE_EXCEPTION_TEXT_SENTINEL"
     third_attempt = asyncio.Event()
 
@@ -1188,28 +1192,32 @@ async def test_bridge_reconnect_logs_fixed_diagnostics_and_doubles_backoff(
     bridge = FailingBridge()
     client = _bridge_client(tmp_path, bridge, db="bridge_reconnect.db")
     delays = []
+    real_sleep = asyncio.sleep
 
-    async def fake_sleep(delay):
+    async def fake_sleep(delay, *a, **k):
         delays.append(delay)
+        await real_sleep(0)
 
     monkeypatch.setattr(pcc_mod.asyncio, "sleep", fake_sleep)
-    with caplog.at_level(
-        logging.WARNING, logger="puffo_agent.agent.puffo_core_client"
-    ):
+    with caplog.at_level(logging.INFO):
         task = asyncio.create_task(client._listen_bridge())
         await asyncio.wait_for(third_attempt.wait(), timeout=1)
+        for _ in range(5):
+            await real_sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert delays == [pcc_mod.INITIAL_BACKOFF, pcc_mod.INITIAL_BACKOFF * 2]
+    bridge_delays = [d for d in delays if d > 0.1]
+    assert len(bridge_delays) == 1 and 0.25 <= bridge_delays[0] < 0.5
     assert bridge.connect_count >= 3
     assert bridge.close_count == bridge.connect_count
     assert "bot-0001" in caplog.text
+    assert caplog.text.count("bridge disconnected cause=bridge_transport") == 1
     assert "category=bridge_transport" in caplog.text
     assert "exception=RuntimeError" in caplog.text
-    assert "retry_delay=1s" in caplog.text
-    assert "retry_delay=2s" in caplog.text
+    assert "retry_delay_ms=" in caplog.text
+    assert "bridge reconnected delay_ms=" in caplog.text
     assert sentinel not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
     await client.store.close()

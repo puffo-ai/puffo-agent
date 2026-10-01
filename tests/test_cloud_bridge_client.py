@@ -490,6 +490,11 @@ class _ScriptedWs:
     async def __anext__(self):
         return await self._inbox.get()
 
+    async def receive(self, timeout=None):
+        # Same contract as aiohttp: an empty read slice raises TimeoutError and
+        # leaves the socket usable (``frames()`` reads in timed slices).
+        return await asyncio.wait_for(self._inbox.get(), timeout)
+
     async def close(self):
         self.closed = True
 
