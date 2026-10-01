@@ -111,6 +111,11 @@ async def test_a_wall_clock_jump_ends_the_stream_as_clock_jump(monkeypatch):
     app.router.add_get("/v2/cloud-agents/subscribe", relay.handler)
     async with TestClient(TestServer(app)) as tc:
         c = await _connected_client(relay, tc)
+        # Isolate the WALL signal: hold the boot-clock signal flat. Without this,
+        # on Linux (where CLOCK_BOOTTIME exists) the boottime path would call
+        # ``clock_gettime`` on the fake module above — CI caught it, macOS
+        # cannot, because the branch never runs there.
+        monkeypatch.setattr(bc_mod, "_boot_minus_mono", lambda: 0.0)
         monkeypatch.setattr(bc_mod, "time", _Clock)
         await asyncio.wait_for(_drain(c), timeout=2)
         assert c.last_disconnect_cause == bc_mod.CAUSE_CLOCK_JUMP
@@ -143,6 +148,21 @@ async def test_a_boot_clock_jump_is_detected_and_labelled_boottime(monkeypatch):
         assert c.last_clock_jump_source == "boottime"
         assert c.last_clock_jump_s == pytest.approx(40.0)
         await c.close()
+
+
+def test_boot_minus_mono_reads_the_real_clocks_on_this_platform():
+    """Production path, unstubbed: on Linux it reads CLOCK_BOOTTIME against
+    CLOCK_MONOTONIC (≥ 0, roughly constant while nothing is suspended); where
+    CLOCK_BOOTTIME does not exist it is a constant 0 and only the wall signal
+    runs. Runs on both CI (Linux) and macOS."""
+    first = bc_mod._boot_minus_mono()
+    second = bc_mod._boot_minus_mono()
+    assert isinstance(first, float)
+    if bc_mod._HAS_BOOTTIME:
+        assert first >= -0.01
+        assert abs(second - first) < bc_mod._CLOCK_JUMP_SECONDS
+    else:
+        assert first == second == 0.0
 
 
 def test_the_read_deadline_tolerates_one_missed_server_ping():
