@@ -205,6 +205,7 @@ async def test_rotation_during_non_success_refresh_is_not_lost(
 
 def _daemon_harness(monkeypatch, tmp_path, health: str):
     from puffo_agent.portal import daemon as daemon_module
+    from puffo_agent.portal import worker as worker_module
     from puffo_agent.portal.state import RuntimeState
 
     flag = tmp_path / "refresh_provider_auth.flag"
@@ -239,8 +240,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         agent_cfg = _StubAgentCfg()
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
+        _auth_failed_episode = 0
         _refresh_success_callback = None
         refresh_notifications = 0
+        end_auth_failed_episode = worker_module.Worker.end_auth_failed_episode
 
         @classmethod
         def notify_refresh(cls):

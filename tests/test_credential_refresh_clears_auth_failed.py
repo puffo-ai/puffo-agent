@@ -364,6 +364,11 @@ def _make_fake_worker():
     worker = type("FakeWorker", (), {})()
     worker.runtime = _FakeRuntime(health="auth_failed")
     worker.runtime.error = "pre-refresh auth error"
+    worker._auth_failed_notification_sent = True
+    worker._auth_failed_episode = 0
+    worker.end_auth_failed_episode = (
+        Worker.end_auth_failed_episode.__get__(worker)
+    )
     return worker
 
 

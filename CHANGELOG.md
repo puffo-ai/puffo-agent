@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **No more "my Claude sign-in has expired" DM for a credential that just
+  rotated fine.** A 401 on a turn and the rotation that fixes it are the same
+  event seen twice, so the refresh routinely recovered the agent *before* the
+  DM announcing the failure went out — the operator was told to run `claude
+  auth login` for a healthy agent, and the alert that matters stopped being
+  believable. The DM now waits briefly and checks that the failure is still
+  live before sending; a recovery in between drops it and logs why. A genuine
+  expiry still notifies, and a real failure after a recovered blip still
+  notifies.
+
 ## [2.0.13] - 2026-10-01
 
 ### Added

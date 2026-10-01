@@ -90,6 +90,7 @@ def test_worker_dedup_gate_fires_once(monkeypatch):
         agent_cfg = type("A", (), {"id": "t-agent"})()
         _client = None
         _auth_failed_notification_sent = False
+        _auth_failed_episode = 0
 
         _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
         _notify_operator_of_auth_failed_oauth = (
@@ -118,6 +119,7 @@ def test_worker_reset_arms_next_notify(monkeypatch):
         agent_cfg = type("A", (), {"id": "t-agent"})()
         _client = None
         _auth_failed_notification_sent = False
+        _auth_failed_episode = 0
 
         _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
         _notify_operator_of_auth_failed_oauth = (
@@ -257,6 +259,7 @@ def test_create_task_failure_broadly_caught(monkeypatch):
         agent_cfg = type("A", (), {"id": "t-agent"})()
         _client = None
         _auth_failed_notification_sent = False
+        _auth_failed_episode = 0
 
         _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
         _notify_operator_of_auth_failed_oauth = (
@@ -281,6 +284,7 @@ def test_workers_have_independent_dedup_flags(monkeypatch):
     class _StubWorker:
         _client = None
         _auth_failed_notification_sent = False
+        _auth_failed_episode = 0
 
         _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
         _notify_operator_of_auth_failed_oauth = (
@@ -322,6 +326,7 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
     unit-tested individually; this pins the wiring between
     ``daemon._register_with_refresher`` and Worker."""
     from puffo_agent.portal import daemon as daemon_module
+    from puffo_agent.portal import worker as worker_module
     from puffo_agent.portal.state import RuntimeState
 
     class _StubRefresher:
@@ -353,7 +358,9 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
         agent_cfg = _StubAgentCfg()
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
+        _auth_failed_episode = 7
         _refresh_success_callback = None
+        end_auth_failed_episode = worker_module.Worker.end_auth_failed_episode
 
         @staticmethod
         def notify_refresh():
@@ -382,6 +389,8 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
     d.refresher.callback()
     assert w.runtime.health == "ok"
     assert w._auth_failed_notification_sent is False
+    # the episode advanced, so a DM still in flight for episode 7 drops
+    assert w._auth_failed_episode == 8
 
 
 # ── re-arm on a transient failed send (PR #70 review) ──────────────
@@ -662,3 +671,135 @@ def test_harness_read_snapshots_before_dm_dispatch():
     # Harness was read exactly once during the call (the property
     # getter recorded the read on the sequence list).
     assert sequence == ["codex"]
+
+
+# ── the DM must describe state at SEND time, not at schedule time ──
+
+
+class _RecordingClient:
+    operator_slug = "@han-0001"
+
+    def __init__(self):
+        self.sent = []
+
+    async def _send_dm(self, recipient, text, root_id):
+        self.sent.append(recipient)
+        return {"envelope_id": "env-fake"}
+
+
+def _notifier(episode: int, client):
+    from puffo_agent.portal import worker as worker_module
+
+    class _StubWorker:
+        agent_cfg = type("A", (), {"id": "t-agent", "display_name": "P"})()
+
+    w = _StubWorker()
+    w._client = client
+    w._auth_failed_notification_sent = True
+    w._auth_failed_episode = episode
+    return w, worker_module.Worker._notify_operator_of_auth_failed_oauth
+
+
+def test_pending_dm_drops_when_the_credential_recovered_first(monkeypatch, caplog):
+    """The observed false alarm: a 401 on a turn and the rotation that fixes
+    it are the same event, so the refresh landed 0.8s before the DM was sent
+    and the operator was told to re-run `claude auth login` for nothing."""
+    import logging
+    from puffo_agent.portal import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "AUTH_FAILED_DM_DELAY_SECONDS", 0)
+    client = _RecordingClient()
+    w, notify = _notifier(5, client)
+
+    async def scenario():
+        task = asyncio.ensure_future(notify(w, 5))
+        w._auth_failed_episode = 6          # refresh-success recovered it
+        await task
+
+    with caplog.at_level(logging.INFO, logger="puffo_agent.portal.worker"):
+        asyncio.new_event_loop().run_until_complete(scenario())
+
+    assert client.sent == []
+    assert any("recovered before it was sent" in r.message for r in caplog.records)
+
+
+def test_pending_dm_is_sent_when_the_failure_outlives_the_delay(monkeypatch):
+    from puffo_agent.portal import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "AUTH_FAILED_DM_DELAY_SECONDS", 0)
+    client = _RecordingClient()
+    w, notify = _notifier(5, client)
+
+    asyncio.new_event_loop().run_until_complete(notify(w, 5))
+
+    assert client.sent == ["@han-0001"]
+
+
+def test_the_delay_is_what_gives_recovery_time_to_land(monkeypatch):
+    """The episode check only helps if the DM actually waits: recovery that
+    lands while the task sleeps must still suppress it."""
+    from puffo_agent.portal import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "AUTH_FAILED_DM_DELAY_SECONDS", 0.05)
+    client = _RecordingClient()
+    w, notify = _notifier(1, client)
+
+    async def scenario():
+        task = asyncio.ensure_future(notify(w, 1))
+        await asyncio.sleep(0.01)           # task is inside its wait
+        w.end_auth_failed_episode()         # refresh-success
+        await task
+
+    w.end_auth_failed_episode = worker_module.Worker.end_auth_failed_episode.__get__(w)
+    asyncio.new_event_loop().run_until_complete(scenario())
+
+    assert client.sent == []
+    assert w._auth_failed_notification_sent is False
+
+
+def test_enter_then_recovery_then_reenter_sends_exactly_one_dm(monkeypatch):
+    """A genuine expiry after a recovered blip still reaches the operator."""
+    from puffo_agent.portal import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "AUTH_FAILED_DM_DELAY_SECONDS", 0)
+    client = _RecordingClient()
+    w, notify = _notifier(0, client)
+    w._auth_failed_notification_sent = False
+    w.end_auth_failed_episode = worker_module.Worker.end_auth_failed_episode.__get__(w)
+    spawned = []
+    monkeypatch.setattr(
+        worker_module, "spawn",
+        lambda coro, name=None: spawned.append(coro) or None,
+    )
+    w._on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter.__get__(w)
+    w._notify_operator_of_auth_failed_oauth = (
+        worker_module.Worker._notify_operator_of_auth_failed_oauth.__get__(w)
+    )
+
+    w._on_auth_failed_enter()               # blip: episode 1
+    w.end_auth_failed_episode()             # recovered: episode 2
+    w._on_auth_failed_enter()               # genuine expiry: episode 3
+
+    async def drain():
+        for coro in spawned:
+            await coro
+
+    asyncio.new_event_loop().run_until_complete(drain())
+
+    assert len(spawned) == 2
+    assert client.sent == ["@han-0001"]     # only the live episode notifies
+
+
+def test_end_auth_failed_episode_rearms_and_advances():
+    from puffo_agent.portal import worker as worker_module
+
+    class _StubWorker:
+        _auth_failed_notification_sent = True
+        _auth_failed_episode = 3
+        end_auth_failed_episode = worker_module.Worker.end_auth_failed_episode
+
+    w = _StubWorker()
+    w.end_auth_failed_episode()
+
+    assert w._auth_failed_notification_sent is False
+    assert w._auth_failed_episode == 4

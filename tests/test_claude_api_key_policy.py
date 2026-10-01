@@ -231,12 +231,15 @@ def test_successful_key_retry_clears_auth_failure(tmp_path, monkeypatch):
     worker.runtime = RuntimeState(status="running", health="auth_failed")
     worker._api_key_auth_recovery_pending = True
     worker._auth_failed_notification_sent = True
+    episode_before = worker._auth_failed_episode
 
     worker._resolve_health_after_success(config.id)
 
     assert worker.runtime.health == "ok"
     assert worker._api_key_auth_recovery_pending is False
     assert worker._auth_failed_notification_sent is False
+    # a key retry that succeeded is a recovery too: retire a pending DM
+    assert worker._auth_failed_episode == episode_before + 1
 
 
 def test_local_gateway_caps_the_cli_retry_loop(tmp_path, monkeypatch):

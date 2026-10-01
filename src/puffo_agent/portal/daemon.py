@@ -692,9 +692,8 @@ class Daemon:
                 agent_id,
                 logger,
             )
-            # Re-arm the auth_failed DM dedup so a re-expiry this
-            # session re-notifies the operator.
-            worker._auth_failed_notification_sent = False
+            # re-arm the DM for a re-expiry; retire one still in flight
+            worker.end_auth_failed_episode()
             # Long-lived Claude/Codex subprocesses may retain the credential
             # they opened with. Reload only the provider runtime at the
             # worker's next idle boundary; keep the bridge connection and
