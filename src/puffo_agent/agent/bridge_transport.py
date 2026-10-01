@@ -129,8 +129,11 @@ async def listen_bridge(client) -> None:
     is scheduled. A fresh ``connect()`` drives ``send_fetch_pending()``
     once so a cold sandbox drains its server-side queue; the resulting
     ``pending_delivered`` marker re-issues the spaces refresh, so EVERY
-    reconnect re-seeds membership (closing gaps from membership events
-    that arrived while the socket was dead).
+    reconnect re-seeds membership STATE. It does not recover the durable
+    system messages for membership events that arrived while the socket was
+    dead — that follow-up stays open; the detectors only shrink the window
+    (from the 10–25 min a silent drop used to last to at most the read
+    deadline).
 
     Owns exactly one keyless invitation poller per connection: armed when
     the first ``pending_delivered`` marker proves the frame pump is live
@@ -191,12 +194,13 @@ async def listen_bridge(client) -> None:
             jump = getattr(bridge, "last_clock_jump_s", None)
             client._log.warning(
                 "agent %s: bridge disconnected cause=%s category=bridge_transport "
-                "exception=%s connected_for_s=%.1f clock_jump_s=%s",
+                "exception=%s connected_for_s=%.1f clock_jump_s=%s clock_source=%s",
                 client.slug,
                 cause,
                 exception or "-",
                 lived,
                 f"{jump:.1f}" if isinstance(jump, (int, float)) else "-",
+                getattr(bridge, "last_clock_jump_source", None) or "-",
             )
         delay = reconnect_delay(attempt)
         attempt += 1

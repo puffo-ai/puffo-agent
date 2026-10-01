@@ -36,20 +36,37 @@ logger = logging.getLogger(__name__)
 # short interval. Server recv-timeout is 90s.
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 
-# Liveness. The server pushes ``{"type":"ping"}`` every 30 s
-# (puffo-server ``cloud_agent/ws.rs`` PING_SECS) and every inbound frame
-# re-arms this deadline, so 45 s of silence means the socket is dead even
-# though TCP has not noticed. Without it a silently dropped socket parks
-# ``frames()`` until the kernel gives up, and messages wait for that.
-_READ_DEADLINE_SECONDS = 45.0
+# Liveness. The server pushes ``{"type":"ping"}`` every 30 s and culls at 90 s
+# (puffo-server ``cloud_agent/ws.rs`` PING_SECS / HEARTBEAT_TIMEOUT_SECS); every
+# inbound frame re-arms this deadline. 70 s tolerates one delayed or missed ping
+# and still notices before the server does. It covers silent socket death only —
+# the resume case is the clock check below, which fires in about a second.
+# Without it a dropped socket parks ``frames()`` until the kernel gives up.
+_READ_DEADLINE_SECONDS = 70.0
 # ``frames()`` reads in slices of this length so it can check its clocks
 # between frames without a second task tearing the socket down.
 _WATCH_TICK_SECONDS = 1.0
-# An E2B pause freezes the whole VM, event loop included. If one read slice
-# took this much longer than the slice in WALL time, the sandbox was frozen
-# and resumed: the socket is stale, reconnect now instead of waiting for
-# the read deadline. This is the 1–2 s resume path.
+# An E2B pause freezes the whole VM, event loop included. If one read slice took
+# this much longer than the slice, the sandbox was frozen and resumed: the socket
+# is stale, reconnect now instead of waiting for the read deadline. This is the
+# 1–2 s resume path. Two signals, recorded separately (``last_clock_jump_source``):
+#   * ``boottime`` — CLOCK_BOOTTIME advanced past CLOCK_MONOTONIC across the
+#     slice. Immune to NTP steps; Linux only, and it depends on the hypervisor
+#     advancing the guest's boot clock over the pause.
+#   * ``wall`` — the wall clock jumped. Catches a freeze whose boot clock did
+#     not advance, but a forward NTP step of the same size also trips it (one
+#     benign reconnect, labelled ``wall`` so it can be told apart). If E2B
+#     corrects the guest wall clock lazily, this can miss and the read deadline
+#     is the fallback.
 _CLOCK_JUMP_SECONDS = 5.0
+_HAS_BOOTTIME = hasattr(time, "CLOCK_BOOTTIME")
+
+
+def _boot_minus_mono() -> float:
+    """CLOCK_BOOTTIME − CLOCK_MONOTONIC: grows only across a suspend/freeze."""
+    if not _HAS_BOOTTIME:
+        return 0.0
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
 # Bound on ``close()`` of a dead socket (aiohttp's default waits 10 s for a
 # close handshake that will never arrive).
 _WS_CLOSE_TIMEOUT_SECONDS = 2.0
@@ -128,8 +145,10 @@ class CloudBridgeClient:
         # Why the last ``frames()`` ended (``clock_jump`` / ``read_timeout`` /
         # ``closed:<type>``); ``None`` while connected or never connected.
         self.last_disconnect_cause: str | None = None
-        # Wall-clock seconds the frozen read slice spanned, for the log line.
+        # Seconds the frozen read slice spanned and which clock showed it
+        # (``boottime`` / ``wall``), for the log line.
         self.last_clock_jump_s: float | None = None
+        self.last_clock_jump_source: str | None = None
 
     def add_connected_callback(
         self, callback: Callable[[], Awaitable[None]],
@@ -185,6 +204,7 @@ class CloudBridgeClient:
         logger.info("cloud bridge: WS connected (slug=%s)", self._slug)
         self.last_disconnect_cause = None
         self.last_clock_jump_s = None
+        self.last_clock_jump_source = None
         # Start the heartbeat only after a clean handshake so no failure
         # path leaves a live heartbeat task behind.
         self._heartbeat_task = spawn(self._heartbeat_loop(), name="heartbeat_loop")
@@ -201,10 +221,14 @@ class CloudBridgeClient:
         spaces routed to send_*() futures.
 
         Reads in ``_WATCH_TICK_SECONDS`` slices and, between slices, checks
-        two clocks (see the module constants): a WALL-clock jump across one
-        slice means the sandbox was frozen and resumed (``clock_jump``), and
-        ``_READ_DEADLINE_SECONDS`` without any inbound frame means the
-        socket died silently (``read_timeout``). Either ends the stream; the
+        the clocks (see the module constants): a boot-clock or wall-clock jump
+        across one slice means the sandbox was frozen and resumed
+        (``clock_jump``), and ``_READ_DEADLINE_SECONDS`` without any inbound
+        frame means the socket died silently (``read_timeout``). The idle cost
+        is one wakeup per second per agent (~86k/day) — negligible, not zero.
+        ``ws.close_code`` is not trustworthy after a timed-out read (aiohttp
+        sets ``ABNORMAL_CLOSURE`` internally on every timeout), so nothing
+        here reads it. Either ends the stream; the
         cause is left in ``last_disconnect_cause`` for the transport loop.
         Only the read itself is timed — time the consumer spends handling a
         yielded frame never counts as a freeze.
@@ -214,15 +238,22 @@ class CloudBridgeClient:
         last_frame = time.monotonic()
         while True:
             wall_before = time.time()
+            drift_before = _boot_minus_mono()
             try:
                 msg = await self._ws.receive(timeout=_WATCH_TICK_SECONDS)
             except asyncio.TimeoutError:
                 msg = None
             spanned = time.time() - wall_before
-            frozen = spanned > _WATCH_TICK_SECONDS + _CLOCK_JUMP_SECONDS
+            boot_gap = _boot_minus_mono() - drift_before
+            if boot_gap > _CLOCK_JUMP_SECONDS:
+                frozen, source, jump = True, "boottime", boot_gap
+            elif spanned > _WATCH_TICK_SECONDS + _CLOCK_JUMP_SECONDS:
+                frozen, source, jump = True, "wall", spanned
+            else:
+                frozen, source, jump = False, None, 0.0
             if msg is None:
                 if frozen:
-                    self._mark_disconnect(CAUSE_CLOCK_JUMP, spanned)
+                    self._mark_disconnect(CAUSE_CLOCK_JUMP, jump, source)
                     return
                 if time.monotonic() - last_frame > _READ_DEADLINE_SECONDS:
                     self._mark_disconnect(CAUSE_READ_TIMEOUT)
@@ -257,12 +288,18 @@ class CloudBridgeClient:
             # arrives first after resume: hand it on, then reconnect — the
             # socket it came over is stale either way.
             if frozen:
-                self._mark_disconnect(CAUSE_CLOCK_JUMP, spanned)
+                self._mark_disconnect(CAUSE_CLOCK_JUMP, jump, source)
                 return
 
-    def _mark_disconnect(self, cause: str, clock_jump_s: float | None = None) -> None:
+    def _mark_disconnect(
+        self,
+        cause: str,
+        clock_jump_s: float | None = None,
+        clock_jump_source: str | None = None,
+    ) -> None:
         self.last_disconnect_cause = cause
         self.last_clock_jump_s = clock_jump_s
+        self.last_clock_jump_source = clock_jump_source
 
     def _route_frame(self, kind: str, frame: dict) -> bool:
         """Route a correlated response/error frame to its waiter future.

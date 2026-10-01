@@ -4,8 +4,8 @@ the reconnect schedule in ``listen_bridge``.
 Background (measured on staging/prod): after an E2B resume the bridge WS
 reconnected only on its own schedule (19–21 s after resume), and a silently
 dropped socket left messages waiting for the next reconnect. ``frames()`` now
-ends the stream on a wall-clock jump across one read slice (the VM was frozen)
-or after ``_READ_DEADLINE_SECONDS`` without any inbound frame; ``listen_bridge``
+ends the stream on a boot-clock or wall-clock jump across one read slice (the VM
+was frozen) or after ``_READ_DEADLINE_SECONDS`` without any inbound frame; ``listen_bridge``
 reconnects immediately after a healthy connection is lost, then backs off with
 jitter from 0.5 s capped at 5 s.
 """
@@ -115,7 +115,40 @@ async def test_a_wall_clock_jump_ends_the_stream_as_clock_jump(monkeypatch):
         await asyncio.wait_for(_drain(c), timeout=2)
         assert c.last_disconnect_cause == bc_mod.CAUSE_CLOCK_JUMP
         assert c.last_clock_jump_s is not None and c.last_clock_jump_s >= 25
+        assert c.last_clock_jump_source == "wall"
         await c.close()
+
+
+@pytest.mark.asyncio
+async def test_a_boot_clock_jump_is_detected_and_labelled_boottime(monkeypatch):
+    """The NTP-immune signal: CLOCK_BOOTTIME pulls ahead of CLOCK_MONOTONIC
+    across one slice while the wall clock does not move."""
+    monkeypatch.setattr(bc_mod, "_WATCH_TICK_SECONDS", 0.05)
+    drift = {"n": 0}
+
+    def fake_boot_minus_mono() -> float:
+        drift["n"] += 1
+        # Sampled before and after each slice: calls 1–2 = slice 1, call 3 =
+        # before slice 2, call 4 = after it → 40 s suspended DURING slice 2.
+        return 0.0 if drift["n"] <= 3 else 40.0
+
+    monkeypatch.setattr(bc_mod, "_boot_minus_mono", fake_boot_minus_mono)
+    relay = _Relay()
+    app = web.Application()
+    app.router.add_get("/v2/cloud-agents/subscribe", relay.handler)
+    async with TestClient(TestServer(app)) as tc:
+        c = await _connected_client(relay, tc)
+        await asyncio.wait_for(_drain(c), timeout=2)
+        assert c.last_disconnect_cause == bc_mod.CAUSE_CLOCK_JUMP
+        assert c.last_clock_jump_source == "boottime"
+        assert c.last_clock_jump_s == pytest.approx(40.0)
+        await c.close()
+
+
+def test_the_read_deadline_tolerates_one_missed_server_ping():
+    # Server pings every 30 s and culls at 90 s: one missed ping must not
+    # reconnect, and the client should still notice before the server.
+    assert 60.0 < bc_mod._READ_DEADLINE_SECONDS < 90.0
 
 
 @pytest.mark.asyncio
@@ -204,6 +237,7 @@ class _OneShotBridge(FakeBridge):
         self.connect_count += 1
         self.last_disconnect_cause = None
         self.last_clock_jump_s = None
+        self.last_clock_jump_source = None
         if self.connect_count >= 2:
             self.second_connect.set()
 
@@ -212,6 +246,7 @@ class _OneShotBridge(FakeBridge):
         if self.connect_count == 1:
             self.last_disconnect_cause = self._cause
             self.last_clock_jump_s = self._jump
+            self.last_clock_jump_source = "boottime" if self._jump else None
             return
         await self._blocked.wait()
         yield {}  # pragma: no cover
@@ -232,7 +267,7 @@ async def test_a_detected_freeze_reconnects_immediately_and_logs_both_lines(
 
     assert bridge.connect_count == 2
     assert "bridge disconnected cause=clock_jump" in caplog.text
-    assert "clock_jump_s=31.7" in caplog.text
+    assert "clock_jump_s=31.7 clock_source=boottime" in caplog.text
     assert "bridge reconnected delay_ms=" in caplog.text
     assert "attempts=1 cause=clock_jump" in caplog.text
     # The first retry after losing a connection is immediate: no backoff line.
