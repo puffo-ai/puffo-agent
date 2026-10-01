@@ -34,3 +34,25 @@ async def _close_message_stores(monkeypatch):
     yield
     for store in reversed(stores):
         await store.close()
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
+
+import os
+import tempfile
+
+import pytest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _tempdirs_under_pytest_basetemp(tmp_path_factory):
+    base = str(tmp_path_factory.getbasetemp())
+    saved = (tempfile.tempdir, os.environ.get("TMP"), os.environ.get("TEMP"), os.environ.get("TMPDIR"))
+    tempfile.tempdir = base
+    os.environ["TMP"] = os.environ["TEMP"] = os.environ["TMPDIR"] = base
+    yield
+    tempfile.tempdir = saved[0]
+    for key, val in zip(("TMP", "TEMP", "TMPDIR"), saved[1:]):
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
