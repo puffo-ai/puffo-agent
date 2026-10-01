@@ -145,7 +145,7 @@ class PuffoRpcClient:
 
         Unlike other routes, a lost answer is not a failure: the daemon may
         already have sent it, so a hang-up, timeout or 5xx is "unknown" and
-        must never be retried (Jeff 227820).
+        must never be retried.
         """
         path = f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/gmail-send"
         payload = {"to": to, "subject": subject, "body": body}

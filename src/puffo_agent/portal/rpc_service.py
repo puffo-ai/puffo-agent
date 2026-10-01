@@ -538,7 +538,7 @@ async def gmail_send_route(request: web.Request) -> web.Response:
         )
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
-        # 409, not 503: a 5xx reads as "unknown" one hop up (Boris 227840).
+        # 409, not 503: a 5xx reads as "unknown" one hop up.
         return web.json_response(
             {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
             status=409,

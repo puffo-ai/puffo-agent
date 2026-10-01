@@ -174,7 +174,7 @@ async def test_reconcile_drops_the_absent_the_stale_and_the_inactivated(server, 
 
 @pytest.mark.asyncio
 async def test_offline_across_delete_and_recreate_the_old_secret_is_not_served(server, agent):
-    """Boris 226189 / 測試姬 226205: a recreated credential gets a new id."""
+    """With the index never reused, a recreated credential gets a new id."""
     server.row(0, b"old-secret")
     await agent.get(TYPE, 0)
     del server.rows[TYPE, 0]
@@ -203,8 +203,8 @@ async def test_a_failed_list_call_deletes_nothing(server, agent):
 
 @pytest.mark.asyncio
 async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent):
-    """Jeff 226108: revoking does not bump the version, so only the
-    generation fence can tell the response that crossed it is stale."""
+    """Revoking does not bump the version, so only the generation fence can
+    tell the response that crossed it is stale."""
     server.row(0, b"secret-0")
     server.hold = asyncio.Event()
     fetch = asyncio.create_task(agent.get(TYPE, 0))
@@ -221,7 +221,7 @@ async def test_a_fetch_in_flight_across_a_revocation_is_not_cached(server, agent
 async def test_a_genuine_row_for_another_credential_is_not_served_as_the_one_asked_for(
     server, agent
 ):
-    """Boris 226286: B's row opens under its own AAD; only the id says it is not A."""
+    """B's row opens under its own AAD; only the id says it is not A."""
     server.row(0, b"secret-A")
     server.row(1, b"secret-B")
     real_get = server.get
@@ -330,7 +330,7 @@ def test_an_agent_without_an_owner_or_keys_holds_no_credentials(server, owner, k
 
 @pytest.mark.asyncio
 async def test_registration_retries_failures_and_waits_out_a_server_without_v2(server, agent):
-    """Boris 227783: 404 is polled, so a running agent picks v2 up on deploy."""
+    """404 is polled, so a running agent picks v2 up on deploy."""
     from puffo_agent.portal.credentials import keep_registering
 
     answers = [HttpError(404, "{}"), HttpError(404, "{}"), HttpError(503, "{}"),

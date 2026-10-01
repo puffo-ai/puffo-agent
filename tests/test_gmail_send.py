@@ -2,7 +2,7 @@
 
 The cells that matter are the three outcomes: a request that went out and
 lost its answer reads as "unknown", exactly once, from the daemon and
-through the RPC hop alike (Jeff 227820).
+through the RPC hop alike.
 """
 
 import asyncio
@@ -124,7 +124,7 @@ async def test_a_lost_answer_is_unknown_and_never_resent(answer):
 
 @pytest.mark.asyncio
 async def test_gmail_taking_the_request_and_hanging_up_is_unknown(unused_tcp_port):
-    """Jeff 227820 through the real transport: read, then hang up."""
+    """Through the real transport: read the request, then hang up."""
     received = []
 
     async def swallow(request):
@@ -165,7 +165,6 @@ async def test_a_failure_before_the_request_goes_out_is_definite():
 
 @pytest.mark.asyncio
 async def test_with_two_accounts_it_asks_which_rather_than_guessing():
-    """Boris 227821."""
     wallet = Wallet(accounts=[(0, "a@example.com"), (3, "b@example.com")])
     with pytest.raises(GmailSendError, match="a@example.com, b@example.com") as exc:
         await _send(wallet, Gmail())
@@ -204,7 +203,6 @@ async def test_a_recipient_cannot_smuggle_in_a_header():
 
 @pytest.mark.asyncio
 async def test_the_log_carries_codes_and_ids_not_tokens_recipients_or_bodies(caplog):
-    """Boris 227821."""
     caplog.set_level(logging.DEBUG)
     await _send(Wallet(), Gmail(_sent("m-42")))
     with pytest.raises(GmailSendError):
@@ -253,7 +251,7 @@ async def test_the_rpc_hop_keeps_unknown_distinct_from_failure(unused_tcp_port, 
 
 @pytest.mark.asyncio
 async def test_no_running_worker_is_a_definite_failure_not_unknown():
-    """Boris 227840: 'no warm worker' must not read as 'may have been sent'."""
+    """'no warm worker' must not read as 'may have been sent'."""
     from aiohttp.test_utils import TestClient, TestServer
 
     from puffo_agent.portal import rpc_service

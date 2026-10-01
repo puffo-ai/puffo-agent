@@ -1,8 +1,8 @@
 """Send mail as a Google account shared with this agent.
 
-An agent that reads "failed" sends again, so three outcomes stay distinct
-(Jeff 227820): *sent*, *failed*, and *unknown* — went out, answer lost,
-never retried. Only ids and codes reach the log (Boris 227821).
+An agent that reads "failed" sends again, so three outcomes stay distinct:
+*sent*, *failed*, and *unknown* — went out, answer lost, never retried.
+Only ids and codes reach the log.
 """
 
 from __future__ import annotations
