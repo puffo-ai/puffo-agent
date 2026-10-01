@@ -275,10 +275,11 @@ async def dispatch_bridge_frame(
                 )
     elif kind == "runtime_command":
         return await _bridge_runtime_command(client, frame)
+    elif kind == "membership_event":
+        await _handle_bridge_membership_event(client, frame)
     elif kind == "added_to_space":
-        # Server push (AgentServerMsg::AddedToSpace) the moment this
-        # agent is added to a Space — refresh the known-spaces view
-        # eagerly instead of waiting for the next lazy list_spaces.
+        # Server push (AgentServerMsg::AddedToSpace) the moment this agent is
+        # added to a Space — refresh instead of waiting for lazy list_spaces.
         # Scheduled async, same shape as the F1 ack: awaiting
         # send_list_spaces inline would deadlock the frames() loop,
         # which must keep receiving to deliver the 'spaces' reply
@@ -315,6 +316,16 @@ async def dispatch_bridge_frame(
         )
     else:
         client._log.debug("bridge frame ignored: type=%s", kind)
+
+
+async def _handle_bridge_membership_event(client, frame: dict) -> None:
+    """Route a trusted Server membership push through native event policy."""
+    scope = frame.get("scope")
+    event = frame.get("event")
+    if not isinstance(scope, str) or not scope or not isinstance(event, dict):
+        client._log.warning("bridge: malformed membership_event frame ignored")
+        return
+    await client._handle_event(scope, event)
 
 
 async def _bridge_runtime_command(client, frame: dict) -> Any:

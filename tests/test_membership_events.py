@@ -765,6 +765,51 @@ async def test_other_member_leave_channel_still_announces_left():
 
 
 @pytest.mark.asyncio
+async def test_cloud_membership_frame_announces_other_member_leave():
+    """Keyless bridge membership frames must reach the native event policy."""
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._dispatch_bridge_frame({
+        "type": "membership_event",
+        "scope": "sp_1",
+        "event": {
+            "event_id": "ev_cloud_leave_1",
+            "kind": "leave_channel",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1", "channel_id": "ch_1"},
+        },
+    })
+
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "left",
+        "kicker_slug": "",
+        "inviter_slug": "",
+        "event_id": "ev_cloud_leave_1",
+    }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "membership_event", "event": {}},
+        {"type": "membership_event", "scope": "", "event": {}},
+        {"type": "membership_event", "scope": "sp_1", "event": "bad"},
+    ],
+)
+async def test_malformed_cloud_membership_frame_is_ignored(frame):
+    """A malformed server frame must not crash the cloud receive loop."""
+    client, announcements = _announce_client()
+
+    await client._dispatch_bridge_frame(frame)
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
 async def test_add_to_channel_miss_without_rewarm_callback_is_noop():
     """Callers that don't provide ``rewarm_channels`` keep the plain
     drop-on-miss behavior."""

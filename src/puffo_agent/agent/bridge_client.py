@@ -73,8 +73,8 @@ class CloudBridgeClient:
     """One-WS-per-agent plaintext bridge. ``send_*`` methods are
     request/response (correlated by ``client_ref`` or FIFO);
     ``frames()`` yields the inbound stream (``message`` /
-    ``pending_delivered`` / uncorrelated ``error``). A background
-    task pumps a heartbeat every 30s (server recv-timeout = 90s)."""
+    ``membership_event`` / ``pending_delivered`` / uncorrelated ``error``).
+    A background task pumps a heartbeat every 30s (server recv-timeout = 90s)."""
 
     def __init__(
         self, cloud_url: str, sandbox_token: str, agent_slug: str,
@@ -161,7 +161,8 @@ class CloudBridgeClient:
                 logger.warning("cloud bridge: connected callback failed: %s", exc)
 
     async def frames(self) -> AsyncIterator[dict]:
-        # Yields message / pending_delivered / uncorrelated error.
+        # Yields message / membership_event / pending_delivered /
+        # uncorrelated error.
         # ping swallowed (no reply per spec §5.1); ack / ack_result /
         # spaces routed to send_*() futures.
         if self._ws is None:
@@ -196,9 +197,10 @@ class CloudBridgeClient:
 
         Returns ``True`` when the frame was consumed by a waiter (or is a
         swallowed keepalive / uncorrelated diagnostic), so ``frames()``
-        yields only message / pending_delivered / uncorrelated error
-        frames. Sync (no awaits) so it can't interleave with a concurrent
-        ``send_*`` popping or finally-cleaning the same waiter maps.
+        yields only message / membership_event / pending_delivered /
+        uncorrelated error frames. Sync (no awaits) so it can't interleave
+        with a concurrent ``send_*`` popping or finally-cleaning the same
+        waiter maps.
         """
         if kind == "ping":
             # Server keepalive — no reply per spec §5.1.
