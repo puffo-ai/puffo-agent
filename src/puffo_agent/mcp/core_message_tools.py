@@ -36,6 +36,10 @@ def register_message_tools(
         ``channel:<space_id>:<channel_id>`` and its ``:thread:<root_id>`` form.
         Thread targets must resolve locally; conflicting ``root_id`` is rejected.
 
+        When replying to a person, explicitly set ``visibility_level="human"``,
+        including in threads. ``default`` can hide threaded replies;
+        ``root_id`` and ``covers`` do not make them human-visible.
+
         ``root_id`` is an optional thread root; ``visibility_level`` is
         ``human``, ``default`` (default), or ``agent_only``; ``send_anyway``
         is an explicit held-send flag. ``covers`` lists the inbound

@@ -53,6 +53,7 @@ from .state import (
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     request_failed_agent_restart,
+    restart_flag_path,
     shared_fs_dir,
     stop_requested_for,
     write_refresh_token_request,
@@ -704,7 +705,29 @@ def cmd_agent_show(args: argparse.Namespace) -> int:
         print(f"  updated_at:    {_format_ts(rs.updated_at)}")
         if rs.error:
             print(f"  error:         {rs.error}")
+    _print_recovery_gate(ac)
     return 0
+
+
+def _print_recovery_gate(cfg: AgentConfig) -> None:
+    """Show an open quarantine: nothing else tells the operator it is there."""
+    from ..agent.turn_recovery import read_recovery
+
+    record = read_recovery(cfg.resolve_workspace_dir())
+    if record is None or record.resolved:
+        return
+    print("recovery gate (agent is parked):")
+    print(f"  reason:              {record.reason}")
+    print(f"  session_ref:         {record.session_ref}")
+    print(f"  turn_ref:            {record.turn_ref}")
+    print(f"  provider_session_id: {record.provider_session_id}")
+    print(f"  durable_turn_id:     {record.durable_turn_id or '(unbound)'}")
+    print(f"  provider stopped:    {record.stopped}")
+    print(
+        f"  clear with:          puffo-agent agent restart {cfg.id}\n"
+        "  (that requeues the quarantined turn's messages, so anything it "
+        "already sent may repeat)"
+    )
 
 
 def cmd_agent_pause(args: argparse.Namespace) -> int:
@@ -713,6 +736,51 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
 
 def cmd_agent_resume(args: argparse.Namespace) -> int:
     return _set_agent_state(args.id, "running")
+
+
+def cmd_agent_restart(args: argparse.Namespace) -> int:
+    """Respawn one agent's worker, clearing an open recovery gate.
+
+    A quarantined turn parks its agent until an operator accepts that replay
+    may repeat external effects; typing this command for a named agent *is*
+    that acceptance. An unattended respawn never reaches here, so it still
+    cannot replay silently.
+    """
+    from ..agent.turn_recovery import authorize_retry
+
+    if not agent_yml_path(args.id).exists():
+        print(f"error: agent {args.id!r} not found", file=sys.stderr)
+        return 2
+    cfg = AgentConfig.load(args.id)
+    if cfg.state != "running":
+        print(
+            f"agent {args.id!r} is {cfg.state}; resume it instead",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        authorized = authorize_retry(cfg.resolve_workspace_dir())
+    except ValueError as exc:
+        print(
+            f"warning: {exc}; the quarantined turn stays parked after this "
+            "restart",
+            file=sys.stderr,
+        )
+        authorized = None
+    if authorized is not None:
+        print(
+            "clearing the recovery gate: the quarantined turn's messages are "
+            "requeued, so anything it already sent may repeat"
+        )
+    flag = restart_flag_path(args.id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    print(f"agent {args.id!r} restart requested")
+    if is_daemon_alive():
+        print("daemon will stop the worker and respawn it on the next tick.")
+    else:
+        print("daemon is not running — this happens at its next start.")
+    return 0
 
 
 def _summarise_credentials(path: Path) -> str:

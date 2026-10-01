@@ -223,6 +223,16 @@ def _add_agent_basic_commands(agent_sub, handlers: CommandHandlers) -> None:
     resume.add_argument("id")
     resume.set_defaults(func=handlers["cmd_agent_resume"])
 
+    restart = agent_sub.add_parser(
+        "restart",
+        help=(
+            "Respawn one agent's worker. Clears a recovery gate left by a "
+            "quarantined turn, requeueing its messages (see `agent show`)"
+        ),
+    )
+    restart.add_argument("id")
+    restart.set_defaults(func=handlers["cmd_agent_restart"])
+
     refresh_token = agent_sub.add_parser(
         "refresh-token",
         help=(

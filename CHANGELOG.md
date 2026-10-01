@@ -24,6 +24,39 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   may simply retry. An account connected before mailbox access was granted
   keeps its old permissions through every refresh; the error says to
   reconnect it. (#428)
+
+## [2.0.13] - 2026-10-01
+
+### Added
+
+- Successful send receipts report whether all human messages admitted to the
+  same active turn have been covered. LingTai can use this fact to complete a
+  genuinely empty continuation after a visible reply; absent or ambiguous
+  coverage keeps its existing retry behavior. (#437)
+
+### Fixed
+
+- Replies sent from restored history settle previously admitted, requeued
+  messages immediately and restore their model-visible timestamp. Fresh unread
+  messages remain pending. (#436)
+- Human-facing threaded reply examples explicitly request human visibility;
+  thread roots and covers alone do not make a reply visible. (#435)
+
+## [2.0.12] - 2026-09-30
+
+### Added
+
+- **`puffo-agent agent restart <id>` respawns one agent's worker, and unparks
+  an agent stuck on a recovery gate.** Restarting a single agent previously
+  meant `pause` then `resume`. A quarantined turn additionally parks its
+  agent until an operator accepts that replaying it may repeat external
+  effects, and only the operator's remote client could accept that — a local
+  deployment had to hand-edit `turn_recovery.json`. Restarting a named agent
+  is now that acceptance: it requeues the quarantined turn's messages and
+  says so. An unattended respawn still cannot replay silently, and the
+  command refuses to clear a gate whose provider stop is unconfirmed.
+  `agent show` reports an open gate, and the parked-state diagnostic names
+  the command instead of the internal wire ops.
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate
@@ -34,6 +67,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   fetched again after a restart; nothing is written to disk. Agents cannot
   use shared credentials yet, and there is no tool for it: the first consumer
   is the Google connector. (#426)
+
+### Fixed
+
+- Messages already covered by a reply, reminder or explicit disposition are
+  settled when their turn fails, rather than shown again on retry. Uncovered
+  messages remain queued for retry. This also applies to cancellation and
+  crash recovery. (#433)
 
 ## [2.0.11] - 2026-09-29
 

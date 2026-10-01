@@ -1131,26 +1131,57 @@ class InboxStoreMixin:
     ) -> TurnRun:
         ids = self._exact_ids(message_ids)
         db = await self._ensure_db()
-        placeholders = ",".join("?" for _ in ids)
         await db.execute("BEGIN IMMEDIATE")
         try:
             expected = await self._turn_message_ids(db, turn_id)
             if len(expected) != len(ids) or set(expected) != set(ids):
                 raise LifecycleConflict("requeue IDs do not exactly match the turn")
-            cursor = await db.execute(
-                f"""UPDATE messages
-                    SET processing_state = ?, processing_turn_id = NULL,
-                        model_visible_at = NULL, processed_at = NULL
-                    WHERE envelope_id IN ({placeholders})
-                      AND processing_state = ? AND processing_turn_id = ?""",
-                (
-                    ProcessingState.PENDING.value,
-                    *ids,
-                    ProcessingState.IN_TURN.value,
-                    turn_id,
-                ),
+            # A covered row was already answered before the turn failed; putting
+            # it back would present it again and invite a second reply. Settle
+            # it as processed and requeue only the rows nobody has covered.
+            covered = await _batched_select_ids(
+                db,
+                "SELECT DISTINCT covered_envelope_id FROM message_covers "
+                "WHERE covered_envelope_id IN ({ids})",
+                ids,
             )
-            if cursor.rowcount != len(ids):
+            settle = tuple(item for item in ids if item in covered)
+            requeue = tuple(item for item in ids if item not in covered)
+            changed = 0
+            if settle:
+                marks = ",".join("?" for _ in settle)
+                cursor = await db.execute(
+                    f"""UPDATE messages
+                        SET processing_state = ?, processing_turn_id = NULL,
+                            processed_at = ?
+                        WHERE envelope_id IN ({marks})
+                          AND processing_state = ? AND processing_turn_id = ?""",
+                    (
+                        ProcessingState.PROCESSED.value,
+                        _now_ms(),
+                        *settle,
+                        ProcessingState.IN_TURN.value,
+                        turn_id,
+                    ),
+                )
+                changed += cursor.rowcount
+            if requeue:
+                marks = ",".join("?" for _ in requeue)
+                cursor = await db.execute(
+                    f"""UPDATE messages
+                        SET processing_state = ?, processing_turn_id = NULL,
+                            model_visible_at = NULL, processed_at = NULL
+                        WHERE envelope_id IN ({marks})
+                          AND processing_state = ? AND processing_turn_id = ?""",
+                    (
+                        ProcessingState.PENDING.value,
+                        *requeue,
+                        ProcessingState.IN_TURN.value,
+                        turn_id,
+                    ),
+                )
+                changed += cursor.rowcount
+            if changed != len(ids):
                 raise LifecycleConflict("every exact message ID must be in this turn")
             cursor = await db.execute(
                 "UPDATE turn_runs SET state = ?, completed_at = ? "
@@ -1211,18 +1242,23 @@ class InboxStoreMixin:
                             for item in recorded
                         ],
                     )
-                    # A cover on a row that is sitting in its one-shot
-                    # redelivery window is the settlement the redelivery
-                    # asked for; without this, an explicitly settled row
-                    # would still be re-presented as uncovered.
+                    # Recovered sessions can answer an already-read input
+                    # from history before reading Inbox again. Settle that
+                    # pending row too, but preserve first presentation for
+                    # fresh inputs with no durable admission history.
                     placeholders = ",".join("?" for _ in recorded)
                     await db.execute(
                         f"""UPDATE messages SET processing_state = ?,
-                                processed_at = ?, processing_turn_id = NULL
+                                processed_at = ?, processing_turn_id = NULL,
+                                model_visible_at = COALESCE(model_visible_at, ?)
                             WHERE envelope_id IN ({placeholders})
-                              AND processing_state = ? AND renotified = 1""",
+                              AND processing_state = ?
+                              AND (renotified = 1 OR envelope_id IN (
+                                  SELECT envelope_id FROM turn_run_messages
+                              ))""",
                         (
                             ProcessingState.PROCESSED.value,
+                            now,
                             now,
                             *recorded,
                             ProcessingState.PENDING.value,

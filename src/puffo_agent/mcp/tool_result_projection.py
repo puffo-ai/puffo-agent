@@ -183,6 +183,8 @@ def _send_result_header(
                 "covers_recorded",
                 "covers_unknown",
                 "covers_dropped",
+                "coverage_turn_id",
+                "active_human_uncovered_count",
             ),
         )
     )

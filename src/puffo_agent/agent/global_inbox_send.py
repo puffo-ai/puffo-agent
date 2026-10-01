@@ -7,6 +7,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 
 from ._logging import log_runtime_event
 from .global_inbox_types import SendAttemptState, opt_str
+from .message_projection import sender_type
 
 if TYPE_CHECKING:
     from .global_inbox_runtime import GlobalInboxRuntime
@@ -23,6 +24,8 @@ class SendTrace:
     send_anyway: bool
     runtime: Any
     active: Any
+    origin_turn_id: str
+    origin_provider_session_id: str
     route: Any
     transport: str
     mode: str | None
@@ -120,6 +123,10 @@ class TrackingSendDelegate:
             send_anyway=send_anyway,
             runtime=runtime,
             active=active,
+            origin_turn_id=opt_str(getattr(active, "turn_id", "")),
+            origin_provider_session_id=opt_str(
+                getattr(active, "provider_session_id", "")
+            ),
             route=route,
             transport=transport,
             mode=mode,
@@ -319,8 +326,61 @@ class TrackingSendDelegate:
                 result["covers_dropped"] = [str(item) for item in held_covers]
         if state == "sent":
             await self._record_covers(request, kwargs, result)
+            await self._attest_active_human_covers(
+                result,
+                origin_turn_id=trace.origin_turn_id,
+                origin_provider_session_id=trace.origin_provider_session_id,
+            )
         self._log_result(trace, result, state, runtime)
         return result
+
+    async def _attest_active_human_covers(
+        self,
+        result: dict[str, Any],
+        *,
+        origin_turn_id: str,
+        origin_provider_session_id: str,
+    ) -> None:
+        """Attach a turn-bound coverage fact after a successful send's covers.
+
+        Omit the fact whenever the active turn or store view is ambiguous.
+        Consumers must treat an absent fact as unknown, never as complete.
+        """
+        if not result.get("covers_recorded"):
+            return
+        runtime = self.runtime
+        store = getattr(runtime, "store", None)
+        turn_lock = getattr(runtime, "_turn_state_lock", None)
+        if store is None or turn_lock is None:
+            return
+        async with turn_lock:
+            active = getattr(runtime, "active", None)
+            turn_id = opt_str(getattr(active, "turn_id", ""))
+            provider_session_id = opt_str(getattr(active, "provider_session_id", ""))
+            active_ids = tuple(getattr(active, "message_ids", ()) or ())
+            if not (turn_id and provider_session_id and active_ids):
+                return
+            if (
+                turn_id != origin_turn_id
+                or provider_session_id != origin_provider_session_id
+            ):
+                return
+            try:
+                rows = await store.get_in_turn_messages(turn_id, provider_session_id)
+                if {row.envelope_id for row in rows} != set(active_ids):
+                    return
+                human_ids = [
+                    row.envelope_id for row in rows
+                    if sender_type(
+                        row, current_agent_aliases=runtime.identity_aliases
+                    ) not in ("agent", "system")
+                ]
+                covered = await store.get_covered_ids(human_ids)
+            except Exception:
+                logger.exception("active human cover attestation failed")
+                return
+            result["coverage_turn_id"] = turn_id
+            result["active_human_uncovered_count"] = len(set(human_ids) - covered)
 
     async def _record_covers(
         self,
