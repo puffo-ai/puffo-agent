@@ -766,7 +766,6 @@ async def test_other_member_leave_channel_still_announces_left():
 
 @pytest.mark.asyncio
 async def test_cloud_membership_frame_announces_other_member_leave():
-    """Keyless bridge membership frames must reach the native event policy."""
     client, announcements = _announce_client()
     client._channel_space["ch_1"] = "sp_1"
 
@@ -801,7 +800,6 @@ async def test_cloud_membership_frame_announces_other_member_leave():
     ],
 )
 async def test_malformed_cloud_membership_frame_is_ignored(frame):
-    """A malformed server frame must not crash the cloud receive loop."""
     client, announcements = _announce_client()
 
     await client._dispatch_bridge_frame(frame)

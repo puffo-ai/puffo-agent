@@ -161,8 +161,6 @@ class CloudBridgeClient:
                 logger.warning("cloud bridge: connected callback failed: %s", exc)
 
     async def frames(self) -> AsyncIterator[dict]:
-        # Yields message / membership_event / pending_delivered /
-        # uncorrelated error.
         # ping swallowed (no reply per spec §5.1); ack / ack_result /
         # spaces routed to send_*() futures.
         if self._ws is None:
