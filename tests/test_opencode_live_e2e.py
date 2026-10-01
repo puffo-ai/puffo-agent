@@ -56,6 +56,14 @@ def _isolated_opencode_environment(tmp_path: Path) -> dict[str, str]:
     return environment
 
 
+# Real-CLI startup does not scale with host load: at timeout=30 these
+# cases flaked in loaded full-suite runs while passing standalone
+# (observed on two machines, 2026-09-18). 120s matches the live-CLI
+# timeout test_opencode_skill_projection already uses; a genuinely hung
+# CLI still fails, just later.
+_OPENCODE_CLI_TIMEOUT_S = 120
+
+
 @pytest.mark.skipif(shutil.which("opencode") is None, reason="OpenCode absent")
 @pytest.mark.parametrize("symlink_workspace", [False, True])
 def test_desired_skill_is_discoverable_by_real_opencode_cli(
@@ -104,8 +112,10 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(
         env=environment,
         check=True,
         capture_output=True,
-        text=True,
-        timeout=30,
+        # OpenCode emits UTF-8; text=True alone decodes with the ANSI
+        # codepage on Windows and crashes on CJK-locale hosts (cp936).
+        encoding="utf-8",
+        timeout=_OPENCODE_CLI_TIMEOUT_S,
     )
     skills = json.loads(result.stdout)
     sentinel = next(item for item in skills if item["name"] == "puffo-e2e")
@@ -123,8 +133,8 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(
         env=disabled_environment,
         check=True,
         capture_output=True,
-        text=True,
-        timeout=30,
+        encoding="utf-8",
+        timeout=_OPENCODE_CLI_TIMEOUT_S,
     )
     disabled_skills = json.loads(disabled.stdout)
     assert not any(item["name"] == "puffo-e2e" for item in disabled_skills)
