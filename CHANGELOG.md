@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.13] - 2026-10-01
+
+### Added
+
+- Successful send receipts report whether all human messages admitted to the
+  same active turn have been covered. LingTai can use this fact to complete a
+  genuinely empty continuation after a visible reply; absent or ambiguous
+  coverage keeps its existing retry behavior. (#437)
+
+### Fixed
+
+- Replies sent from restored history settle previously admitted, requeued
+  messages immediately and restore their model-visible timestamp. Fresh unread
+  messages remain pending. (#436)
+- Human-facing threaded reply examples explicitly request human visibility;
+  thread roots and covers alone do not make a reply visible. (#435)
+
 ## [2.0.12] - 2026-09-30
 
 ### Added
