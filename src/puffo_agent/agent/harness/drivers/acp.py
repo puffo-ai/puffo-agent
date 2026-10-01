@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import uuid
@@ -97,7 +98,39 @@ def _startup_diagnostic(stderr: bytes) -> tuple[str, bool]:
         or (lower.startswith("runtimeerror: working directory ")
             and "is already in use by another agent" in lower)
     )
+    reader_failure = _init_reader_failure(selected)
+    if reader_failure is not None:
+        return safe_provider_message(reader_failure, max_length=600), occupied
     return safe_provider_message(selected), occupied
+
+
+def _init_reader_failure(line: str) -> str | None:
+    """Summarise LingTai's ``error: {init reader JSON}`` line by its own fields.
+
+    The raw line leads with file paths and the effective config, so a bounded
+    prefix of it never reaches ``safe_excerpt`` — the part that tells the user
+    what to change. Only the reader's own safe fields are surfaced.
+    """
+    if not line.lower().startswith("error:"):
+        return None
+    try:
+        payload = json.loads(line[len("error:"):])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    excerpt = payload.get("safe_excerpt")
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        return None
+    status = payload.get("read_result") or payload.get("reader_status") or "READ_FAILED"
+    stage = payload.get("failure_stage")
+    head = f"LingTai init.json {status}" + (f" at {stage}" if isinstance(stage, str) and stage else "")
+    message = f"{head}: {excerpt.strip()}"
+    next_step = payload.get("next_step")
+    if isinstance(next_step, str) and next_step.strip():
+        message += f" Next: {next_step.strip()}"
+    # The caller appends its own sentence stop.
+    return message.rstrip(".")
 
 
 @dataclass(frozen=True, slots=True)

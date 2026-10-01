@@ -1104,6 +1104,61 @@ async def test_initialize_exit_preserves_safe_stderr(tmp_path, diagnostic, occup
 
 
 @pytest.mark.asyncio
+async def test_initialize_exit_surfaces_init_reader_fix_not_its_json_prefix(tmp_path):
+    """LingTai's READ_FAILED line leads with paths and config; the fix text is at the end.
+
+    Shape copied from LingTai 1.0.11 (#1784) for a retired daemon option. A
+    300-char prefix of the raw line used to end before ``safe_excerpt``.
+    """
+    long_dir = "/Users/someone/" + "nested-agent-home/" * 12
+    payload = {
+        "read_result": "READ_FAILED",
+        "file": long_dir + "init.json",
+        "reader_status": "READ_FAILED",
+        "shape_decision": "PASS",
+        "finding_decision": "UNKNOWN",
+        "failure_stage": "VALIDATE",
+        "ignored_paths": [], "compatibility_paths": [], "conflict_paths": [],
+        "behavior": "STOP",
+        "effective_config": {
+            "source": long_dir + "system/manifest.resolved.json",
+            "redacted": True,
+            "data": {"manifest": {"llm": {"provider": "minimax", "api_key": "private-test-value"},
+                                  "capabilities": {"daemon": {"max_emanations": 30}}}},
+        },
+        "safe_excerpt": (
+            "manifest.capabilities.daemon.max_emanations was retired; remove it, then "
+            "explicitly choose whether to use the default manager_pool_size=100 or set "
+            "daemon.manager_pool_size in init.json. These settings are not equivalent; "
+            "see migration/migration.md"
+        ),
+        "next_step": "Repair the reported schema/path conflict, then rerun the same reader.",
+    }
+    script = tmp_path / "reader_failed.py"
+    script.write_text(
+        "import json, sys\n"
+        "print('init.json reader: ' + 'synthetic normal output ' * 40, file=sys.stderr)\n"
+        f"print('error: ' + json.dumps({payload!r}), file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    driver = AcpDriver()
+    try:
+        with pytest.raises(Exception) as caught:
+            await driver.open(RuntimeSpec(
+                str(tmp_path), executable=sys.executable, launch_args=(str(script),),
+            ))
+        message = str(caught.value)
+        assert "LingTai init.json READ_FAILED at VALIDATE" in message
+        assert payload["safe_excerpt"] in message
+        assert payload["next_step"] in message
+        assert "nested-agent-home" not in message
+        assert "private-test-value" not in message
+        assert "Close the active LingTai" not in message
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_initialize_failure_does_not_wait_for_stderr_eof():
     """A child keeping stderr open cannot hang failure reporting or cancel its drainer."""
     harness = _Harness()
