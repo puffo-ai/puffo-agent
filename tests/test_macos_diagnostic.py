@@ -296,3 +296,20 @@ def test_refresh_flush_reports_fail_on_claude_nonzero_exit(monkeypatch):
 
     rpt = diag.probe_refresh_flush()
     assert rpt.overall() == diag.VERDICT_FAIL
+
+
+def test_keychain_write_skips_a_blob_it_cannot_write_safely(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(diag, "is_macos", lambda: True)
+    pretty = json.dumps(json.loads(_BLOB), indent=2)
+    monkeypatch.setattr(
+        diag, "read_keychain_blob",
+        lambda: cm.KeychainReadResult(True, pretty, None, None, "Claude Code"),
+    )
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a) or _FakeCompletedProcess(0))
+    rpt = diag.probe_keychain_write()
+    # Not a pass: the write path went untested, and the report must say so.
+    assert rpt.overall() == diag.VERDICT_NEEDS_ATTENTION
+    assert "writeback not attempted: unsupported_blob" in rpt.render_markdown()
+    assert calls == []
