@@ -146,7 +146,7 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
-    assert cli.cmd_link(_link_ns()) == 0
+    assert cli.cmd_link(_link_ns(no_autostart=True)) == 0
     assert spawned == [{}]
 
 
@@ -180,7 +180,7 @@ def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
-    cli.cmd_link(_link_ns())
+    cli.cmd_link(_link_ns(no_autostart=True))
     assert spawned == []
 
 
@@ -358,7 +358,7 @@ def test_cmd_link_passes_code_through(monkeypatch):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
-    assert cli.cmd_link(_link_ns(code="abcd-2345")) == 0
+    assert cli.cmd_link(_link_ns(code="abcd-2345", no_autostart=True)) == 0
     assert seen["code"] == "abcd-2345"
 
 
@@ -374,7 +374,7 @@ def test_cmd_link_defaults_code_to_none(monkeypatch):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
-    assert cli.cmd_link(_link_ns()) == 0
+    assert cli.cmd_link(_link_ns(no_autostart=True)) == 0
     assert seen["code"] is None
 
 

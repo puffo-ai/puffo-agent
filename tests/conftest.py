@@ -6,6 +6,7 @@ requiring ``pip install -e .``.
 import sys
 from pathlib import Path
 
+import pytest
 import pytest_asyncio
 
 _SRC = Path(__file__).resolve().parent.parent / "src"
@@ -34,3 +35,35 @@ async def _close_message_stores(monkeypatch):
     yield
     for store in reversed(stores):
         await store.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_autostart(monkeypatch):
+    """Keep tests from registering a real login item.
+
+    A successful ``machine link`` enables autostart, and
+    ``_enable_autostart_after_link`` turns any error into a warning. So a
+    link test that forgets to stub it writes the developer's real
+    ``~/Library/LaunchAgents/ai.puffo.agent.plist`` (pointing at the test's
+    temporary home) and bootstraps a daemon from it, and still passes.
+    The platform functions under test (``enable_macos`` etc.) take a fake
+    runner and are not affected; only the public dispatchers are blocked.
+    """
+    from puffo_agent.portal import autostart
+
+    reached: list[str] = []
+
+    def _blocked(name):
+        def call(*_args, **_kwargs):
+            reached.append(name)
+            raise RuntimeError(f"autostart.{name}() is blocked in tests")
+
+        return call
+
+    for name in ("enable", "disable", "status"):
+        monkeypatch.setattr(autostart, name, _blocked(name))
+    yield
+    assert not reached, (
+        f"test reached the real autostart.{reached[0]}(); stub it or pass "
+        "no_autostart=True"
+    )
