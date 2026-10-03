@@ -234,6 +234,7 @@ class OpenCodeDriver(Driver):
         self._turn_usage: dict[str, int] = {}
         self._context = ContextStatus(stale=True)
         self._context_window: int | None = None
+        self._context_window_rechecked = False
         self._compact_task: asyncio.Task[None] | None = None
         self._compact_ref = ""
         self._serve_proc: Any = None
@@ -380,6 +381,19 @@ class OpenCodeDriver(Driver):
         return CancelReceipt(True, turn)
 
     async def context_status(self):
+        if (
+            self._context.used_tokens is not None
+            and self._context_window is None
+            and not self._context_window_rechecked
+            and self._proc is None
+            and self._spec is not None
+            and self._spec.model
+        ):
+            # A fresh OpenCode cache can omit a newly published model until
+            # the first turn refreshes its registry. Retry once after the
+            # turn child exits, when the updated catalog is available.
+            self._context_window_rechecked = True
+            await self._resolve_context_window(self._spec)
         if self._context.used_tokens is not None and (
             self._context.context_window is None
             and self._context_window is not None
@@ -444,9 +458,10 @@ class OpenCodeDriver(Driver):
                     )
         finally:
             self._cleanup_child_temps(finished_spawn=scratch)
-        self._context_window = _window_from_models_output(
-            out.decode("utf-8", "replace"), model_id
-        )
+        if self._spec is spec:
+            self._context_window = _window_from_models_output(
+                out.decode("utf-8", "replace"), model_id
+            )
 
     def _absorb_turn_usage(self, usage: dict[str, Any]) -> None:
         """OpenCode reports usage once per step, and a turn runs several steps.
@@ -709,6 +724,7 @@ class OpenCodeDriver(Driver):
         # must not be paired with the new model's totals while the fresh
         # lookup is still running.
         self._context_window = None
+        self._context_window_rechecked = False
         await collect_cleanup_errors(
             self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )

@@ -147,6 +147,42 @@ async def test_step_finish_total_becomes_context_status_and_augments_event():
     assert closed.stale
 
 
+@pytest.mark.asyncio
+async def test_missing_window_rechecks_registry_after_first_turn(monkeypatch):
+    """A first turn can refresh a stale OpenCode model catalog."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, spec: proc)
+    calls = 0
+
+    async def lookup(_spec):
+        nonlocal calls
+        calls += 1
+        driver._context_window = 200000 if calls == 2 else None
+
+    monkeypatch.setattr(driver, "_resolve_context_window", lookup)
+    await driver.open(RuntimeSpec("/workspace", model="opencode/new-model"))
+    assert calls == 1
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hi")))
+    proc.feed({"type": "step_start", "sessionID": "ses_ctx",
+               "part": {"messageID": "msg_1"}})
+    await asyncio.wait_for(started, timeout=1)
+    proc.feed(_step_finish(total=9831))
+    proc.exit()
+    proc.eof()
+    async for event in driver.events():
+        if event.type is HarnessEventType.TURN_COMPLETED:
+            break
+
+    first = await driver.context_status()
+    second = await driver.context_status()
+    assert first.used_tokens == 9831
+    assert first.context_window == 200000
+    assert second.context_window == 200000
+    assert calls == 2
+    await driver.close()
+
+
 _MODELS_OUTPUT = """\
 opencode/big-pickle
 {
