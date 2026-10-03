@@ -308,19 +308,50 @@ async def _lingtai_latest() -> str:
                                          "https://gitee.com/huangzesen1997/lingtai-kernel/")):
                 raise ValueError("unexpected kernel manifest host")
             raw = await _fetch_bytes(asset_url, redirects=True)
-            data = json.loads(raw)
-            version = _version(data["kernel_version"])
-            if (data["schema"] != "lingtai.kernel.release/v1"
-                    or data["kernel_tag"] != "v" + version
-                    or Version(version).is_prerelease or not data["artifacts"]):
-                raise ValueError("invalid kernel manifest")
-            for artifact in data["artifacts"]:
-                if (not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
-                        or not artifact["filename"].startswith("lingtai-" + version)):
-                    raise ValueError("invalid kernel artifact metadata")
-            manifests.append((raw, version))
+            manifests.append((raw, _validated_lingtai_manifest(raw)))
         except (OSError, ValueError, KeyError, TypeError, TimeoutError, aiohttp.ClientError):
             continue
+    if not manifests:
+        # The GitHub release page is public even when its anonymous API quota
+        # is exhausted. Its redirect identifies the published stable release.
+        raw, tag = await _lingtai_public_latest()
+        version = _validated_lingtai_manifest(raw)
+        if tag != "v" + version:
+            raise ValueError("kernel release redirect and manifest disagree")
+        manifests.append((raw, version))
     if not manifests or any(item != manifests[0] for item in manifests[1:]):
         raise ValueError("kernel manifest mirrors unavailable or disagree")
     return manifests[0][1]
+
+
+def _validated_lingtai_manifest(raw: bytes) -> str:
+    data = json.loads(raw)
+    version = _version(data["kernel_version"])
+    if (data["schema"] != "lingtai.kernel.release/v1"
+            or data["kernel_tag"] != "v" + version
+            or Version(version).is_prerelease or not data["artifacts"]):
+        raise ValueError("invalid kernel manifest")
+    for artifact in data["artifacts"]:
+        if (not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+                or not artifact["filename"].startswith("lingtai-" + version)):
+            raise ValueError("invalid kernel artifact metadata")
+    return version
+
+
+async def _lingtai_public_latest() -> tuple[bytes, str]:
+    url = "https://github.com/Lingtai-AI/lingtai-kernel/releases/latest"
+    async with create_remote_http_session(url, timeout=aiohttp.ClientTimeout(total=15)) as session:
+        async with session.head(url, allow_redirects=False) as response:
+            if response.status not in (301, 302, 303, 307, 308):
+                raise ValueError("kernel release page did not redirect")
+            location = response.headers.get("Location", "")
+    match = re.fullmatch(
+        rf"https://github\.com/Lingtai-AI/lingtai-kernel/releases/tag/(v{_VERSION})",
+        location,
+    )
+    if not match or Version(_version(match[1])).is_prerelease:
+        raise ValueError("unexpected kernel release redirect")
+    tag = match[1]
+    asset = ("https://github.com/Lingtai-AI/lingtai-kernel/releases/download/"
+             f"{tag}/lingtai-kernel-release-manifest.json")
+    return await _fetch_bytes(asset, redirects=True), tag

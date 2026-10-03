@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
@@ -167,6 +168,47 @@ async def test_lingtai_mirror_disagreement_is_not_an_update(monkeypatch):
     monkeypatch.setattr(sources, "_fetch_bytes", AsyncMock(side_effect=manifests))
     with pytest.raises(ValueError, match="disagree"):
         await sources._lingtai_latest()
+
+
+@pytest.mark.asyncio
+async def test_lingtai_public_release_fallback_requires_matching_manifest(monkeypatch):
+    """Anonymous API failures may fall back to the published release page."""
+    raw = json.dumps({"schema": "lingtai.kernel.release/v1", "kernel_version": "1.0.5",
+                      "kernel_tag": "v1.0.5", "artifacts": [
+                          {"sha256": "a" * 64, "filename": "lingtai-1.0.5.tar.gz"}]}).encode()
+    monkeypatch.setattr(sources, "_fetch_json", AsyncMock(side_effect=ValueError("rate limited")))
+    public = AsyncMock(return_value=(raw, "v1.0.5"))
+    monkeypatch.setattr(sources, "_lingtai_public_latest", public)
+    assert await sources._lingtai_latest() == "1.0.5"
+    public.return_value = (raw, "v1.0.6")
+    with pytest.raises(ValueError, match="disagree"):
+        await sources._lingtai_latest()
+
+
+@pytest.mark.asyncio
+async def test_lingtai_public_release_rejects_unexpected_redirect(monkeypatch):
+    """Only the kernel repository's stable tag may select a manifest URL."""
+    class Response:
+        status = 302
+        headers = {"Location": "https://evil.invalid/Lingtai-AI/lingtai-kernel/releases/tag/v9.9.9"}
+
+    @asynccontextmanager
+    async def response_context(*_args, **_kwargs):
+        yield Response()
+
+    class Session:
+        head = staticmethod(response_context)
+
+    @asynccontextmanager
+    async def session_context(*_args, **_kwargs):
+        yield Session()
+
+    monkeypatch.setattr(sources, "create_remote_http_session", session_context)
+    fetch = AsyncMock()
+    monkeypatch.setattr(sources, "_fetch_bytes", fetch)
+    with pytest.raises(ValueError, match="unexpected kernel release redirect"):
+        await sources._lingtai_public_latest()
+    fetch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

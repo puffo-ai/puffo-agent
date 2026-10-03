@@ -99,6 +99,9 @@ def _prepare_cli_shared_workspace(cfg: AgentConfig) -> str:
 GITHUB_RELEASES_LATEST_URL = (
     "https://api.github.com/repos/puffo-ai/puffo-agent/releases/latest"
 )
+GITHUB_RELEASES_LATEST_PAGE = (
+    "https://github.com/puffo-ai/puffo-agent/releases/latest"
+)
 
 
 def get_local_version() -> str:
@@ -129,10 +132,15 @@ def is_source_install() -> bool:
 
 
 def fetch_latest_release_tag(timeout: float = 5.0) -> str | None:
-    """Fetch the latest GitHub release tag, leading ``v`` stripped.
-    Returns None on any failure so callers can fail-soft."""
+    """Fetch the latest release tag, falling back when GitHub API is limited.
+
+    GitHub's public ``/releases/latest`` page redirects to the tagged release
+    without consuming the anonymous REST API quota. Returns None if neither
+    route yields a tag so callers can fail soft.
+    """
     import json as _json
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     req = urllib.request.Request(
@@ -145,7 +153,34 @@ def fetch_latest_release_tag(timeout: float = 5.0) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
-        tag = (data.get("tag_name") or "").strip()
+        tag = (data.get("tag_name") or "").strip() if isinstance(data, dict) else ""
+        if tag:
+            return tag.lstrip("v") or None
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ):
+        pass
+
+    page = urllib.request.Request(
+        GITHUB_RELEASES_LATEST_PAGE,
+        headers={"User-Agent": "puffo-agent-cli"},
+        method="HEAD",
+    )
+    try:
+        with urllib.request.urlopen(page, timeout=timeout) as resp:
+            final_url = urllib.parse.urlsplit(resp.geturl())
+        prefix = "/puffo-ai/puffo-agent/releases/tag/"
+        if final_url.scheme != "https" or final_url.netloc != "github.com":
+            return None
+        if not final_url.path.startswith(prefix):
+            return None
+        tag = urllib.parse.unquote(final_url.path[len(prefix):])
+        if not tag or "/" in tag:
+            return None
         return tag.lstrip("v") or None
     except (
         urllib.error.URLError,
