@@ -132,6 +132,17 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(
     assert not any(item["name"] == "puffo-e2e" for item in disabled_skills)
 
 
+def _free_tier_denied(events) -> bool:
+    """OpenCode refuses its free models outside its own client on some
+    versions/accounts; that is an environment limit, not a driver failure."""
+    return any(
+        event.type is HarnessEventType.TURN_COMPLETED
+        and "free tier can only be used from within opencode"
+        in str(event.data.get("diagnostic") or "").lower()
+        for event in events
+    )
+
+
 @pytest.mark.skipif(
     os.environ.get("PUFFO_RUN_LIVE_OPENCODE_E2E") != "1",
     reason="set PUFFO_RUN_LIVE_OPENCODE_E2E=1 for a real model turn",
@@ -180,12 +191,7 @@ async def test_real_opencode_driver_loads_skill_and_reports_context(tmp_path: Pa
             if event.type is HarnessEventType.TURN_COMPLETED:
                 break
 
-        if any(
-            event.type is HarnessEventType.TURN_COMPLETED
-            and "free tier can only be used from within opencode" in
-                str(event.data.get("diagnostic") or "").lower()
-            for event in events
-        ):
+        if _free_tier_denied(events):
             pytest.skip("OpenCode free tier denies this host or account")
 
         assert any(

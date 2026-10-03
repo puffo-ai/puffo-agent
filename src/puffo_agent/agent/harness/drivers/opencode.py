@@ -386,6 +386,9 @@ class OpenCodeDriver(Driver):
             and self._context_window is None
             and not self._context_window_rechecked
             and self._proc is None
+            and (self._compact_task is None or self._compact_task.done())
+            and not self._temporary_children
+            and not self._child_spawns
             and self._spec is not None
             and self._spec.model
         ):

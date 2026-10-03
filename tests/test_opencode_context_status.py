@@ -16,6 +16,8 @@ import json
 import pytest
 
 from puffo_agent.agent.harness.driver import (
+    CompactRequest,
+    ContextStatus,
     ContextStatusCapability,
     HarnessEventType,
     RuntimeSpec,
@@ -179,6 +181,51 @@ async def test_missing_window_rechecks_registry_after_first_turn(monkeypatch):
     assert first.used_tokens == 9831
     assert first.context_window == 200000
     assert second.context_window == 200000
+    assert calls == 2
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_window_waits_for_compaction_before_recheck(monkeypatch):
+    """The registry child must not collide with an active summarize child."""
+    driver = OpenCodeDriver()
+    calls = 0
+
+    async def lookup(_spec):
+        nonlocal calls
+        assert not driver._temporary_children
+        calls += 1
+        driver._context_window = 200000 if calls == 2 else None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def summarize(_spec, _session_id):
+        driver._temporary_children["busy"] = None
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            driver._temporary_children.pop("busy")
+
+    monkeypatch.setattr(driver, "_resolve_context_window", lookup)
+    monkeypatch.setattr(driver, "_summarize_via_serve", summarize)
+    await driver.open(RuntimeSpec("/workspace", model="opencode/new-model"))
+    driver._native_session_id = "ses_ctx"
+    driver._context = ContextStatus(used_tokens=9831, stale=False)
+    await driver.compact(CompactRequest())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    during = await driver.context_status()
+    assert during.used_tokens == 9831
+    assert during.context_window is None
+    assert calls == 1
+    assert not driver._context_window_rechecked
+
+    release.set()
+    await asyncio.wait_for(driver._compact_task, timeout=1)
+    after = await driver.context_status()
+    assert after.context_window == 200000
     assert calls == 2
     await driver.close()
 
