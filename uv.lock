@@ -1088,7 +1088,7 @@ gui = [
 [package.metadata]
 requires-dist = [
     { name = "agent-client-protocol", specifier = "==0.10.1" },
-    { name = "aiohttp", specifier = ">=3.9" },
+    { name = "aiohttp", specifier = ">=3.11" },
     { name = "aiohttp-socks", specifier = ">=0.10" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "certifi", specifier = ">=2024.2.2" },
