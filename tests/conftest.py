@@ -67,3 +67,14 @@ def _no_real_autostart(monkeypatch):
         f"test reached the real autostart.{reached[0]}(); stub it or pass "
         "no_autostart=True"
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_codex_home(monkeypatch):
+    """Drop a host ``CODEX_HOME`` so Codex config writes stay in the test.
+
+    Run from an agent session that exports it, the Codex MCP install tests
+    appended their fixture servers to that agent's real ``config.toml``.
+    Tests that need it set it themselves.
+    """
+    monkeypatch.delenv("CODEX_HOME", raising=False)
