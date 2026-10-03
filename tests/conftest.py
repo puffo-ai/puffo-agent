@@ -70,11 +70,26 @@ def _no_real_autostart(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_codex_home(monkeypatch):
-    """Drop a host ``CODEX_HOME`` so Codex config writes stay in the test.
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """Give every test its own HOME and Puffo home.
 
-    Run from an agent session that exports it, the Codex MCP install tests
-    appended their fixture servers to that agent's real ``config.toml``.
-    Tests that need it set it themselves.
+    Without this the suite wrote into whatever home it ran under: agent
+    folders under ``~/.puffo-agent/agents`` (``a-1`` was then loaded by a
+    real daemon and failed on every start), ``runtime.json`` rewrites into
+    any existing folder with a fixture id, and the opencode/pi state the
+    spawned binaries create. Host overrides that point harness config at a
+    real location are dropped too; tests that need them set their own.
     """
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(home / ".puffo-agent"))
+    for name in (
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return home
