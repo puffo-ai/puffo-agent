@@ -544,6 +544,11 @@ async def reconcile_at_boot(
                     agent_id, type(exc).__name__)
         return False
     if not held_list:
+        # The common case on a fresh agent, and the one an operator reading the
+        # log after a rebuild needs to see: the server was asked and lists
+        # nothing, so the spawn falls through to the vault env var.
+        logger.info("agent %s: boot credential reconcile: server lists no %s for this agent; "
+                    "using the environment", agent_id, ctype)
         return False
     # The lowest index. Fine while a plan type is one-per-harness; a second
     # plan credential of the same type would need an explicit choice here.
@@ -558,7 +563,9 @@ async def reconcile_at_boot(
         return False
     current = read_store(agent_dir).get(ctype) or {}
     if current.get("version") == held.version and current.get("fingerprint") == fingerprint(held.value):
-        return False  # already placed at this version
+        logger.info("agent %s: boot credential reconcile: %s #%s v%s already placed (fp %s)",
+                    agent_id, ctype, index, held.version, fingerprint(held.value))
+        return False
     try:
         place(agent_dir=agent_dir, credential_type=held.type, index=held.index,
               version=held.version, value=held.value)
