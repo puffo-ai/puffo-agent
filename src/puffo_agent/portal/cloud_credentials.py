@@ -86,6 +86,20 @@ class CloudAgentCredentials:
         self._key_version = version
         return self._kem, version
 
+    async def ensure_registered(self) -> int:
+        """Make sure this agent HAS a credential key on the server; returns its version.
+
+        puffo-server registers a cloud agent's key eagerly at claim, or on the
+        agent's first POST to ``credential-kem-secret`` (#434: "boot once —
+        registers the key"). An agent claimed before that existed has neither,
+        and the owner cannot file a credential to an agent with no key. The
+        reconcile's list-first order never reaches the POST on an empty list,
+        so without this call a pre-#437 agent is stuck: no key → nothing to
+        file → empty list → no POST → no key. One POST, cached thereafter.
+        """
+        _, version = await self._ensure_kem()
+        return version
+
     async def get(self, credential_type: str, index: int) -> HeldCredential | None:
         """The current value, from memory or the server. None = not usable now."""
         cached = self._find(credential_type, index)
