@@ -348,14 +348,18 @@ async def test_boot_reconcile_says_so_on_every_branch(tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
         assert "server lists no PUFFO_CHATGPT_CREDENTIAL_JSON_v1" in caplog.text and "using the environment" in caplog.text
+        assert SECRET.decode() not in caplog.text
         caplog.clear()
         creds = FakeCredentials(listed=[0], held=_held(ctype=cr.TYPE_CHATGPT))
         assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is True
         assert "boot reconcile placed" in caplog.text
+        # the branch that handles the real value: checked BEFORE the clear, or
+        # the leak check never sees it (review of #454)
+        assert SECRET.decode() not in caplog.text and cr.fingerprint(SECRET) in caplog.text
         caplog.clear()
         assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is False
         assert "already placed" in caplog.text
-    assert SECRET.decode() not in caplog.text
+        assert SECRET.decode() not in caplog.text
 
 
 @pytest.mark.asyncio
