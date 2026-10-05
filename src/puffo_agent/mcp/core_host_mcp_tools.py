@@ -9,6 +9,14 @@ from mcp.server.fastmcp import FastMCP
 
 
 def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
+    """Register every host-side tool. One helper per tool group, so each stays
+    readable on its own and the structure hook's function-length limit holds."""
+    _register_install(mcp, cfg)
+    _register_credential_request(mcp, cfg)
+    _register_sync(mcp, cfg)
+
+
+def _register_install(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def install_host_mcp(
         name: str,
@@ -63,6 +71,9 @@ def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
             spec=spec,
         )
 
+
+def _register_credential_request(mcp: FastMCP, cfg: Any) -> None:
+    """``request_credential`` + ``credential_status`` (``credential_requests``)."""
     @mcp.tool()
     async def request_credential(type: str, reason: str, alias: str = "") -> str:
         """Ask your owner for a credential you need, through a secure form in
@@ -108,6 +119,8 @@ def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
             )
         return await cfg.rpc_client.credential_status(request_id=request_id)
 
+
+def _register_sync(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def sync_host_mcp(template_id: str) -> str:
         """Copy the operator's ``~/.claude.json#mcpServers[<id>]``

@@ -380,7 +380,13 @@ async def handle_filed_replies(
       check, so this is ENFORCED by puffo-server and ASSUMED here.
     * *Native*: verified locally against the cert cache before the message is
       stored (``inbound_receipts.py:238-253``). Enforced on this side.
+
+    The checks run in this order and the order is load-bearing: the cheap,
+    local refusals (wire, sender, shape, ledger, type) come before anything
+    that talks to the server, and the server is asked to CONFIRM (list) before
+    it is asked to HAND OVER (get).
     """
+    del harness  # reserved: placement is type-keyed today
     outcomes: list[FiledOutcome] = []
     for item in items:
         if getattr(item, "envelope_kind", "") != "dm":
@@ -403,62 +409,83 @@ async def handle_filed_replies(
             ledger.settle(rid, state="failed", detail="this agent cannot read credentials")
             outcomes.append(FiledOutcome(rid, "failed", "no credential reader"))
             continue
-        # Confirm against the SERVER before fetching: the reply says a wrap was
-        # filed for us; the list says what we actually hold. A reply naming an
-        # index the server does not list for us is not acted on.
-        try:
-            listed = await credentials.held(filed["type"])
-        except Exception as exc:  # noqa: BLE001 — never let a reply break the turn
-            ledger.settle(rid, state="failed", detail=f"list failed: {type(exc).__name__}")
-            outcomes.append(FiledOutcome(rid, "failed", f"list failed: {type(exc).__name__}"))
+        got = await _confirm_and_fetch(filed, credentials)
+        if isinstance(got, FiledOutcome):
+            if got.state == "failed":
+                ledger.settle(rid, state="failed", detail=got.detail)
+            outcomes.append(FiledOutcome(rid, got.state, got.detail))
             continue
-        if filed["index"] not in {i for i, _alias in listed}:
-            ledger.settle(rid, state="failed", detail="server does not list that credential for this agent")
-            outcomes.append(FiledOutcome(rid, "failed", "not listed for this agent"))
-            continue
-        # A filed reply is a one-off event about a NEW value: never serve it
-        # from memory, or a re-filed newer version reads as "server behind".
-        _forget(credentials, filed["type"], filed["index"])
-        try:
-            held = await credentials.get(filed["type"], filed["index"])
-        except Exception as exc:  # noqa: BLE001 — never let a reply break the turn
-            ledger.settle(rid, state="failed", detail=f"fetch failed: {type(exc).__name__}")
-            outcomes.append(FiledOutcome(rid, "failed", f"fetch failed: {type(exc).__name__}"))
-            continue
-        if held is None:
-            ledger.settle(rid, state="failed", detail="not distributed to this agent")
-            outcomes.append(FiledOutcome(rid, "failed", "not distributed"))
-            continue
-        if held.version < filed["version"]:
-            # The server is behind the reply; ask again next time rather than
-            # placing an older version under a newer label.
-            outcomes.append(FiledOutcome(rid, "ignored", "server version behind the reply"))
-            continue
-        try:
-            place(
-                agent_dir=agent_dir,
-                credential_type=held.type,
-                index=held.index,
-                version=held.version,
-                value=held.value,
-                alias=req.alias,
-            )
-        except Exception as exc:  # noqa: BLE001
-            ledger.settle(rid, state="failed", detail=f"placement failed: {type(exc).__name__}")
-            outcomes.append(FiledOutcome(rid, "failed", f"placement failed: {type(exc).__name__}"))
-            continue
-        ledger.settle(rid, state="placed", index=held.index, version=held.version)
-        logger.info(
-            "agent %s: placed %s #%s v%s (fp %s); provider reload requested",
-            agent_id, held.type, held.index, held.version, fingerprint(held.value),
+        outcomes.append(
+            _place_and_settle(got, req, ledger=ledger, agent_dir=agent_dir, workspace=workspace, agent_id=agent_id)
         )
-        try:
-            request_provider_reload(workspace, reason=f"credential placed: {held.type}")
-        except OSError as exc:
-            logger.warning("agent %s: could not request provider reload: %s", agent_id, exc)
-        outcomes.append(FiledOutcome(rid, "placed"))
     return outcomes
 
+
+async def _confirm_and_fetch(filed: dict[str, Any], credentials: Any) -> Any:
+    """CONFIRM against the server's list, then FETCH — in that order.
+
+    Returns the ``HeldCredential``, or a ``FiledOutcome`` (``failed`` /
+    ``ignored``) explaining why not. Never raises; never names a value.
+    """
+    rid, ctype, index = filed["request_id"], filed["type"], filed["index"]
+    # The reply says a wrap was filed for us; the list says what we actually
+    # hold. A reply naming an index the server does not list is not acted on.
+    try:
+        listed = await credentials.held(ctype)
+    except Exception as exc:  # noqa: BLE001 — never let a reply break the turn
+        return FiledOutcome(rid, "failed", f"list failed: {type(exc).__name__}")
+    if index not in {i for i, _alias in listed}:
+        return FiledOutcome(rid, "failed", "not listed for this agent by the server")
+    # A filed reply is a one-off event about a NEW value: never serve it from
+    # memory, or a re-filed newer version reads as "server behind".
+    _forget(credentials, ctype, index)
+    try:
+        held = await credentials.get(ctype, index)
+    except Exception as exc:  # noqa: BLE001
+        return FiledOutcome(rid, "failed", f"fetch failed: {type(exc).__name__}")
+    if held is None:
+        return FiledOutcome(rid, "failed", "not distributed to this agent")
+    if held.version < filed["version"]:
+        # The server is behind the reply; ask again next time rather than
+        # placing an older version under a newer label.
+        return FiledOutcome(rid, "ignored", "server version behind the reply")
+    return held
+
+
+def _place_and_settle(
+    held: Any,
+    req: CredentialRequest,
+    *,
+    ledger: RequestLedger,
+    agent_dir: Path,
+    workspace: Path,
+    agent_id: str,
+) -> FiledOutcome:
+    """PLACE the value, consume the request, ask for the provider reload.
+    The only caller of :func:`place` on this path."""
+    rid = req.request_id
+    try:
+        place(
+            agent_dir=agent_dir,
+            credential_type=held.type,
+            index=held.index,
+            version=held.version,
+            value=held.value,
+            alias=req.alias,
+        )
+    except Exception as exc:  # noqa: BLE001
+        ledger.settle(rid, state="failed", detail=f"placement failed: {type(exc).__name__}")
+        return FiledOutcome(rid, "failed", f"placement failed: {type(exc).__name__}")
+    ledger.settle(rid, state="placed", index=held.index, version=held.version)
+    logger.info(
+        "agent %s: placed %s #%s v%s (fp %s); provider reload requested",
+        agent_id, held.type, held.index, held.version, fingerprint(held.value),
+    )
+    try:
+        request_provider_reload(workspace, reason=f"credential placed: {held.type}")
+    except OSError as exc:
+        logger.warning("agent %s: could not request provider reload: %s", agent_id, exc)
+    return FiledOutcome(rid, "placed")
 
 def _forget(credentials: Any, credential_type: str, index: int) -> None:
     """Bypass the reader's cache for one credential, whichever reader it is.
