@@ -31,8 +31,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import psutil
 import yaml
+
+from . import daemon_identity as _daemon_identity
+from .daemon_identity import DaemonIdentity
 
 from ..limits import DEFAULT_CATCHUP_STALE_HOURS
 
@@ -1280,48 +1282,32 @@ def read_daemon_pid() -> int | None:
         return None
 
 
+def read_daemon_identity(pid: int | None = None) -> DaemonIdentity | None:
+    """Capture a verified process instance for a lifecycle operation."""
+    target = read_daemon_pid() if pid is None else pid
+    if target is None or read_daemon_pid() != target:
+        return None
+    return _daemon_identity.resolve_identity(home_dir(), target)
+
+
 def is_daemon_alive() -> bool:
-    """True iff ``daemon.pid``'s pid is live AND its cmdline matches
-    ``puffo-agent start``. The cmdline check guards against PID
-    reuse and excludes concurrent CLI invocations."""
-    pid = read_daemon_pid()
-    if pid is None:
-        return False
-    return _is_puffo_agent_process(pid)
+    return read_daemon_identity() is not None
 
 
-def is_pid_alive(pid: int) -> bool:
-    """True iff ``pid`` is a live puffo-agent daemon process.
-
-    Unlike ``is_daemon_alive()``, this checks a SPECIFIC pid the caller
-    holds — so a ``cmd_stop`` poll tracks the daemon it asked to stop
-    instead of whatever's in the pid file, which can swap mid-upgrade.
-    """
-    return _is_puffo_agent_process(pid)
-
-
-def _is_puffo_agent_process(pid: int) -> bool:
-    try:
-        proc = psutil.Process(pid)
-        tokens = [t or "" for t in proc.cmdline()]
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return False
-
-    # Match by token name prefix to cover script-shim, .exe, and
-    # ``python -m puffo_agent.portal.cli`` invocations.
-    def _is_ours(token: str) -> bool:
-        low = Path(token).name.lower()
-        return low.startswith("puffo-agent") or low.startswith("puffo_agent")
-
-    has_exe = any(_is_ours(t) for t in tokens)
-    has_start = any(t.lower() == "start" for t in tokens)
-    return has_exe and has_start
+def is_pid_alive(pid: int, *, identity: DaemonIdentity | None = None) -> bool:
+    """Check the captured instance, even if a successor replaced its PID file."""
+    if identity is not None:
+        return identity.pid == pid and _daemon_identity.identity_is_alive(home_dir(), identity)
+    return read_daemon_identity(pid) is not None
 
 
 def write_daemon_pid(pid: int) -> None:
     path = daemon_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(pid), encoding="utf-8")
+    _daemon_identity.publish_identity(home_dir(), pid)
+    temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    temporary.write_text(str(pid), encoding="utf-8")
+    temporary.replace(path)
 
 
 def is_daemon_startup_stalled(
@@ -1339,58 +1325,75 @@ def is_daemon_startup_stalled(
     return time.time() - started_at >= threshold
 
 
-def read_daemon_ready_pid() -> int | None:
-    path = daemon_ready_path()
-    if not path.exists():
-        return None
+def _read_ready_marker() -> object:
     try:
-        return int(path.read_text(encoding="utf-8").strip())
+        return json.loads(daemon_ready_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
 
+def read_daemon_ready_pid() -> int | None:
+    raw = _read_ready_marker()
+    if type(raw) is int:
+        return raw
+    identity = _daemon_identity.parse_identity(raw)
+    return identity.pid if identity else None
+
+
 def is_daemon_ready(pid: int | None = None) -> bool:
-    """True when one live daemon owns both the PID and ready markers."""
-    target_pid = read_daemon_pid() if pid is None else pid
-    return (
-        target_pid is not None
-        and read_daemon_pid() == target_pid
-        and read_daemon_ready_pid() == target_pid
-        and is_pid_alive(target_pid)
-    )
+    identity = read_daemon_identity(pid)
+    if identity is None:
+        return False
+    raw = _read_ready_marker()
+    if identity.instance != "legacy":
+        return _daemon_identity.parse_identity(raw) == identity
+    try:
+        return (raw == identity.pid
+                and daemon_ready_path().stat().st_mtime >= identity.create_time)
+    except OSError:
+        return False
 
 
-def write_daemon_ready(pid: int) -> None:
+def write_daemon_ready(pid: int, *, identity: DaemonIdentity | None = None) -> None:
+    current = _daemon_identity.read_identity(home_dir())
+    if identity is not None and identity != current:
+        raise RuntimeError("daemon ownership changed before readiness")
+    identity = identity or current
+    if identity is None or identity.pid != pid:
+        raise RuntimeError("cannot publish readiness without daemon identity")
     path = daemon_ready_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(str(pid), encoding="utf-8")
+    temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    temporary.write_text(json.dumps(_daemon_identity.identity_payload(identity)), encoding="utf-8")
     temporary.replace(path)
 
 
-def clear_daemon_ready(expected_pid: int | None = None) -> bool:
+def clear_daemon_ready(
+    expected_pid: int | None = None, *, identity: DaemonIdentity | None = None,
+) -> bool:
     if expected_pid is not None and read_daemon_ready_pid() != expected_pid:
+        return False
+    if identity is not None and _daemon_identity.parse_identity(_read_ready_marker()) != identity:
         return False
     try:
         daemon_ready_path().unlink()
         return True
-    except FileNotFoundError:
-        return False
     except OSError:
         return False
 
 
-def clear_daemon_pid(expected_pid: int | None = None) -> bool:
+def clear_daemon_pid(
+    expected_pid: int | None = None, *, identity: DaemonIdentity | None = None,
+) -> bool:
     if expected_pid is not None and read_daemon_pid() != expected_pid:
         return False
-    path = daemon_pid_path()
-    try:
-        path.unlink()
-        return True
-    except FileNotFoundError:
+    if identity is not None and _daemon_identity.read_identity(home_dir()) != identity:
         return False
+    try:
+        daemon_pid_path().unlink()
     except OSError:
         return False
+    _daemon_identity.identity_path(home_dir()).unlink(missing_ok=True)
+    return True
 
 
 def stop_request_path() -> Path:
@@ -1443,12 +1446,28 @@ def read_stop_request_pid() -> int | None:
     return pid if kind == "pid" else None
 
 
-def stop_requested_for(pid: int) -> bool:
-    """True when a stop is requested for ``pid``: the JSON sentinel
-    carries exactly ``pid``, or the sentinel is a timestamp-only legacy
-    request, which targets whichever daemon is running."""
+def _stop_matches_identity(identity: DaemonIdentity) -> bool:
+    try:
+        path = stop_request_path()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "identity" in raw:
+            return _daemon_identity.parse_identity(raw["identity"]) == identity
+        # Compatibility with old CLIs: a PID-only or scalar request must
+        # have been written after this daemon published its PID.
+        return path.stat().st_mtime_ns >= daemon_pid_path().stat().st_mtime_ns
+    except (OSError, ValueError):
+        return False
+
+
+def stop_requested_for(pid: int, *, identity: DaemonIdentity | None = None) -> bool:
     kind, target_pid = _classify_stop_request()
-    return (kind == "pid" and target_pid == pid) or kind == "legacy"
+    if not ((kind == "pid" and target_pid == pid) or kind == "legacy"):
+        return False
+    identity = identity or _daemon_identity.read_identity(home_dir())
+    if identity is not None:
+        return identity.pid == pid and _stop_matches_identity(identity)
+    # Only old daemons/legacy records accept the old unscoped format.
+    return not _daemon_identity.identity_path(home_dir()).exists()
 
 
 def is_daemon_stop_stalled(
@@ -1466,15 +1485,23 @@ def is_daemon_stop_stalled(
     return time.time() - requested_at >= threshold
 
 
-def write_stop_request(pid: int | None = None) -> None:
+def write_stop_request(
+    pid: int | None = None, *, identity: DaemonIdentity | None = None,
+) -> None:
     target_pid = read_daemon_pid() if pid is None else pid
     if target_pid is None:
         raise RuntimeError("cannot request stop without a daemon PID")
     path = stop_request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    identity = identity or read_daemon_identity(target_pid)
+    payload = {"pid": target_pid, "created_at": int(time.time())}
+    if identity is not None:
+        if identity.pid != target_pid:
+            raise ValueError("stop request identity does not match PID")
+        payload["identity"] = _daemon_identity.identity_payload(identity)
     temporary.write_text(
-        json.dumps({"pid": target_pid, "created_at": int(time.time())}),
+        json.dumps(payload),
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -1491,7 +1518,9 @@ def _unlink_stop_request() -> bool:
         return False
 
 
-def clear_stop_request(expected_pid: int | None = None) -> bool:
+def clear_stop_request(
+    expected_pid: int | None = None, *, identity: DaemonIdentity | None = None,
+) -> bool:
     """Remove the stop sentinel.
 
     JSON sentinels clear only when ``expected_pid`` matches their target
@@ -1507,6 +1536,8 @@ def clear_stop_request(expected_pid: int | None = None) -> bool:
     if kind == "malformed":
         return _unlink_stop_request() if expected_pid is None else False
     if kind == "pid" and expected_pid is not None and target_pid != expected_pid:
+        return False
+    if identity is not None and not _stop_matches_identity(identity):
         return False
     return _unlink_stop_request()
 

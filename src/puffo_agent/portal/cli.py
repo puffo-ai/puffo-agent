@@ -47,6 +47,7 @@ from .state import (
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
+    read_daemon_identity,
     refresh_agent_flag_path,
     refresh_host_sync_flag_path,
     refresh_model_flag_path,
@@ -371,18 +372,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if pid is None:
         print("daemon: not running")
         return 0
-    if not is_pid_alive(pid):
+    identity = read_daemon_identity(pid)
+    if not is_pid_alive(pid, identity=identity):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
         clear_daemon_pid(expected_pid=pid)
         clear_stop_request(expected_pid=pid)
         return 0
 
-    write_stop_request(pid)
+    write_stop_request(pid, identity=identity)
     print(f"requested daemon shutdown (pid={pid}); waiting up to {args.timeout}s...")
     deadline = time.time() + max(1, args.timeout)
     while time.time() < deadline:
-        if not is_pid_alive(pid):
-            clear_stop_request(expected_pid=pid)
+        if not is_pid_alive(pid, identity=identity):
+            clear_stop_request(expected_pid=pid, identity=identity)
             # A new daemon may have taken the pid file mid-poll — say so,
             # rather than a bare "stopped".
             new_pid = read_daemon_pid()
