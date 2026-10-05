@@ -370,6 +370,16 @@ async def handle_filed_replies(
     failure settles the request as ``failed`` with a reason the agent can
     read through ``credential_status``, and the message still reaches the
     model (it carries no secret).
+
+    **Why ``sender_slug`` can carry the owner check**, per wire:
+
+    * *Cloud (keyless bridge)*: puffo-server attests the sender at ingest —
+      ``messages.rs:519`` rejects an envelope whose declared sender does not
+      match the authenticated one — and delivers over this agent's
+      sandbox-token WebSocket. The keyless agent does NO local signature
+      check, so this is ENFORCED by puffo-server and ASSUMED here.
+    * *Native*: verified locally against the cert cache before the message is
+      stored (``inbound_receipts.py:238-253``). Enforced on this side.
     """
     outcomes: list[FiledOutcome] = []
     for item in items:
@@ -508,6 +518,8 @@ async def reconcile_at_boot(
         return False
     if not held_list:
         return False
+    # The lowest index. Fine while a plan type is one-per-harness; a second
+    # plan credential of the same type would need an explicit choice here.
     index = held_list[0][0]
     try:
         held = await credentials.get(ctype, index)

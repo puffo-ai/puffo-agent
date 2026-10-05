@@ -32,6 +32,7 @@ class FakeKeylessServer:
         self.rows = {}
         self.kem_posts = 0
         self.gets = []
+        self.hold = None  # an Event that GET one waits on, to open a race
 
     def row(self, index, value, *, version=1, state="ACTIVATED", sealed_under=None, expire_at=None):
         self.rows[TYPE, index] = dict(value=value, version=version, state=state,
@@ -57,7 +58,11 @@ class FakeKeylessServer:
                 for (t, i), r in self.rows.items() if t == wanted
             ] + [{"id": "x", "type": "OTHER_v1", "index": 0, "version": 1, "state": "ACTIVATED"}]}
         _, _, _, _, ctype, index = path.split("/")
+        # Read the row as the server would at request time, then let a test
+        # change the world before the response arrives.
         row = self.rows.get((ctype, int(index)))
+        if self.hold is not None:
+            await self.hold.wait()
         if row is None:
             raise HttpError(404, "{}")
         cid = credential_id(OWNER, ctype, int(index))
@@ -159,6 +164,42 @@ async def test_an_expired_credential_is_none():
     srv = FakeKeylessServer()
     srv.row(0, b"a", expire_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
     assert await CloudAgentCredentials(srv, SLUG, OWNER).get(TYPE, 0) is None
+
+
+@pytest.mark.asyncio
+async def test_an_older_version_landing_late_does_not_replace_a_newer_one():
+    """Ported from the native reader: nothing was invalidated, so the fence
+    cannot tell the two responses apart; the version has to."""
+    import asyncio
+
+    srv = FakeKeylessServer(); srv.row(0, b"secret-v1")
+    creds = CloudAgentCredentials(srv, SLUG, OWNER)
+    gate = srv.hold = asyncio.Event()
+    old = asyncio.create_task(creds.get(TYPE, 0))
+    await asyncio.sleep(0)                        # the old GET has read v1
+    srv.hold = None
+    srv.row(0, b"secret-v2", version=2)           # a new row; the old GET keeps v1
+    assert (await creds.get(TYPE, 0)).value == b"secret-v2"
+    gate.set()                                    # now v1 lands
+    assert (await old).value == b"secret-v2"      # the floor hands back the newer
+    assert (await creds.get(TYPE, 0)).value == b"secret-v2"
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_racing_a_forget_does_not_land():
+    """The generation fence: forget() during an in-flight GET means the value
+    that GET returns is one we have been told to stop trusting."""
+    import asyncio
+
+    srv = FakeKeylessServer(); srv.row(0, b"stale")
+    creds = CloudAgentCredentials(srv, SLUG, OWNER)
+    gate = srv.hold = asyncio.Event()
+    inflight = asyncio.create_task(creds.get(TYPE, 0))
+    await asyncio.sleep(0)
+    creds.forget(TYPE, 0)                         # fence goes up with nothing cached
+    gate.set()
+    assert await inflight is None
+    assert creds._find(TYPE, 0) is None
 
 
 def test_owner_is_required():

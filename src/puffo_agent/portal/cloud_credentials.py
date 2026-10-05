@@ -63,6 +63,10 @@ class CloudAgentCredentials:
         self._kem: KemKeyPair | None = None
         self._key_version: int | None = None
         self._held: dict[str, HeldCredential] = {}
+        # Bumped by every forget/drop so a fetch that raced it cannot land a
+        # value the caller has since asked us to stop trusting (amendment 10,
+        # same as AgentCredentials).
+        self._generation = 0
 
     async def _ensure_kem(self, *, refresh: bool = False) -> tuple[KemKeyPair, int]:
         """The KEM keypair at the version the server registered, cached.
@@ -87,6 +91,7 @@ class CloudAgentCredentials:
         cached = self._find(credential_type, index)
         if cached is not None and not _expired(cached):
             return cached
+        generation = self._generation
         try:
             data = await self._http.get_unsigned(f"{_LIST_ROUTE}/{credential_type}/{index}")
         except HttpError as exc:
@@ -102,8 +107,13 @@ class CloudAgentCredentials:
             # is at an older version than the server's. Re-ask once.
             await self._ensure_kem(refresh=True)
             held = await self._open(data, credential_type, index)
-        if _expired(held):
+        if generation != self._generation or _expired(held):
             return None
+        # Fetches can land out of order: keep the newer version, but not if it
+        # has since expired. Only forget/drop lower what is held.
+        current = self._held.get(held.id)
+        if current is not None and current.version > held.version:
+            return None if _expired(current) else current
         self._held[held.id] = held
         return held
 
@@ -158,8 +168,11 @@ class CloudAgentCredentials:
         return None
 
     def _drop(self, credential_type: str, index: int) -> None:
+        """Drop matching entries and fence off every fetch already in flight.
+        The fence goes up even when nothing was cached."""
         for key in [k for k, h in self._held.items() if h.type == credential_type and h.index == index]:
             del self._held[key]
+        self._generation += 1
 
 
 def _expired(held: HeldCredential) -> bool:
