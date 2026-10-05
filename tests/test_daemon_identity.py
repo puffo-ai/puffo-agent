@@ -238,3 +238,23 @@ def test_stale_stop_cleanup_preserves_successor_with_same_pid(
     assert cli.cmd_stop(Namespace(timeout=1)) == 0
     assert state.read_daemon_identity(4242) != old
     assert state.is_daemon_ready(4242)
+
+
+def test_stale_cli_does_not_erase_successor_stop_request(monkeypatch, process):
+    """A stop request arriving after stale PID cleanup belongs to the successor."""
+    from argparse import Namespace
+    from puffo_agent.portal import cli
+
+    state.write_daemon_pid(4242)
+    process.birth += 1
+    clear = state.clear_daemon_pid
+
+    def publish_after_cleanup(pid=None, *, expected_pid=None, identity=None):
+        removed = clear(expected_pid, identity=identity)
+        state.write_daemon_pid(4242)
+        state.write_stop_request(4242)
+        return removed
+
+    monkeypatch.setattr(cli, "clear_daemon_pid", publish_after_cleanup)
+    assert cli.cmd_stop(Namespace(timeout=1)) == 0
+    assert state.stop_requested_for(4242)
