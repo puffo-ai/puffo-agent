@@ -537,6 +537,18 @@ async def reconcile_at_boot(
     ctype = PLAN_TYPE_FOR_HARNESS.get(harness)
     if ctype is None or credentials is None:
         return False
+    # FIRST make sure the server holds a key for us (cloud readers only; the
+    # native reader registers via keep_registering). Without this, an agent
+    # claimed before puffo-server #437 can never be filed to — see
+    # CloudAgentCredentials.ensure_registered. Fail-open like every branch.
+    register = getattr(credentials, "ensure_registered", None)
+    if callable(register):
+        try:
+            version = await register()
+            logger.info("agent %s: boot credential reconcile: credential key registered (v%s)", agent_id, version)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("agent %s: boot credential reconcile: key registration unavailable (%s); continuing",
+                        agent_id, type(exc).__name__)
     try:
         held_list = await credentials.held(ctype)
     except Exception as exc:  # noqa: BLE001 — fail open to the env var

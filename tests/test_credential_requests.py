@@ -363,6 +363,37 @@ async def test_boot_reconcile_says_so_on_every_branch(tmp_path, caplog):
 
 
 @pytest.mark.asyncio
+async def test_boot_reconcile_registers_the_key_before_listing(tmp_path, caplog):
+    """A pre-#437 cloud agent has no key; the list-first order never reached
+    the POST that would create one. The register call must come FIRST, and an
+    empty list after it is still a clean fall-through."""
+    order = []
+
+    class Cloud(FakeCredentials):
+        async def ensure_registered(self):
+            order.append("register"); return 1
+
+        async def held(self, ctype):
+            order.append("list"); return await super().held(ctype)
+
+    with caplog.at_level(logging.INFO):
+        assert await cr.reconcile_at_boot(credentials=Cloud(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+    assert order == ["register", "list"]
+    assert "credential key registered (v1)" in caplog.text and "server lists no" in caplog.text
+
+    class Broken(Cloud):
+        async def ensure_registered(self):
+            raise RuntimeError("down")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert await cr.reconcile_at_boot(credentials=Broken(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+    assert "key registration unavailable" in caplog.text  # fail-open, still lists
+    # a native reader has no ensure_registered: untouched
+    assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex") is False
+
+
+@pytest.mark.asyncio
 async def test_boot_reconcile_fails_open(tmp_path):
     assert await cr.reconcile_at_boot(credentials=FakeCredentials(list_error=RuntimeError("down")), agent_dir=tmp_path, harness="codex") is False
     assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex") is False
