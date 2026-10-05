@@ -214,3 +214,27 @@ def test_marker_cleanup_serializes_successor_publication(
     state.write_daemon_pid(4242)
     state.write_daemon_ready(4242)
     assert state.is_daemon_ready(4242)
+
+
+@pytest.mark.parametrize("stale_birth", [False, True])
+def test_stale_stop_cleanup_preserves_successor_with_same_pid(
+    monkeypatch, process, stale_birth
+):
+    """A new owner published after a stale liveness result must retain its files."""
+    from argparse import Namespace
+    from puffo_agent.portal import cli
+
+    state.write_daemon_pid(4242)
+    old = state.read_daemon_identity(4242)
+    if stale_birth:
+        process.birth += 1
+
+    def publish_successor_then_report_stale(pid, *, identity):
+        state.write_daemon_pid(pid)
+        state.write_daemon_ready(pid)
+        return False
+
+    monkeypatch.setattr(cli, "is_pid_alive", publish_successor_then_report_stale)
+    assert cli.cmd_stop(Namespace(timeout=1)) == 0
+    assert state.read_daemon_identity(4242) != old
+    assert state.is_daemon_ready(4242)

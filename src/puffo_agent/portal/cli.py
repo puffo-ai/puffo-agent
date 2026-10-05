@@ -375,8 +375,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
     identity = read_daemon_identity(pid)
     if not is_pid_alive(pid, identity=identity):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
-        clear_daemon_pid(expected_pid=pid)
-        clear_stop_request(expected_pid=pid)
+        if clear_daemon_pid(expected_pid=pid, identity=identity):
+            clear_stop_request(expected_pid=pid, identity=identity)
         return 0
 
     write_stop_request(pid, identity=identity)

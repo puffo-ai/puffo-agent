@@ -1395,6 +1395,10 @@ def clear_daemon_pid(
             return False
         if identity is not None and _daemon_identity.read_identity(home_dir()) != identity:
             return False
+        if (identity is None and expected_pid is not None
+                and _daemon_identity.resolve_identity(home_dir(), expected_pid) is not None):
+            # A stale CLI observation cannot erase an owner published since.
+            return False
         try:
             daemon_pid_path().unlink()
         except OSError:

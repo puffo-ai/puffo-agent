@@ -31,8 +31,8 @@ class TestCmdStopOriginalPid:
              patch("puffo_agent.portal.cli.clear_stop_request") as clear_stop:
             rc = cli.cmd_stop(_args())
         assert rc == 0
-        clear.assert_called_once_with(expected_pid=1234)
-        clear_stop.assert_called_once_with(expected_pid=1234)
+        clear.assert_called_once_with(expected_pid=1234, identity=None)
+        clear_stop.assert_called_once_with(expected_pid=1234, identity=None)
         assert "stale pid" in capsys.readouterr().out
 
     def test_daemon_stops_within_timeout(self, capsys):
