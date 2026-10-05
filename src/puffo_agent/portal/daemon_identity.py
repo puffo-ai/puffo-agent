@@ -6,12 +6,15 @@ sidecar; readers never fall back to PID-only checks when that sidecar exists.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import math
+import ntpath
 import os
 from pathlib import Path
 import secrets
+import time
 
 import psutil
 
@@ -79,22 +82,50 @@ def publish_identity(home: Path, pid: int) -> DaemonIdentity:
     return identity
 
 
-def _process_home(proc: psutil.Process, pid: int) -> str | None:
+def _windows_user_home(environment: dict[str, str], user: str) -> str:
+    home = environment.get("USERPROFILE")
+    if home is None:
+        tail = environment.get("HOMEPATH")
+        home = environment.get("HOMEDRIVE", "") + tail if tail is not None else None
+    if home is None:
+        raise RuntimeError("cannot resolve daemon user home")
+    if user and user != environment.get("USERNAME"):
+        if environment.get("USERNAME") != ntpath.basename(home):
+            raise RuntimeError("cannot resolve daemon user home")
+        home = ntpath.join(ntpath.dirname(home), user)
+    return home
+
+
+def _user_home(
+    proc: psutil.Process, environment: dict[str, str], user: str = ""
+) -> str:
+    if os.name == "nt":
+        return _windows_user_home(environment, user)
+    if not user and "HOME" in environment:
+        return environment["HOME"]
+    import pwd
+
+    try:
+        return (
+            pwd.getpwnam(user).pw_dir if user else pwd.getpwuid(proc.uids().real).pw_dir
+        )
+    except KeyError as exc:
+        raise RuntimeError("cannot resolve daemon user home") from exc
+
+
+def _process_home(proc: psutil.Process, pid: int) -> str:
     environment = dict(os.environ) if pid == os.getpid() else proc.environ()
     override = environment.get("PUFFO_AGENT_HOME")
-    user_home = (
-        environment.get("USERPROFILE") if os.name == "nt" else environment.get("HOME")
-    )
     if override:
-        if override == "~" or override.startswith("~/"):
-            if not user_home:
-                return None
-            override = str(Path(user_home) / override[2:])
+        if override.startswith("~"):
+            suffix = (
+                override[1:].replace("\\", "/") if os.name == "nt" else override[1:]
+            )
+            user, _, tail = suffix.partition("/")
+            override = str(Path(_user_home(proc, environment, user)) / tail)
         home = Path(override)
-    elif user_home:
-        home = Path(user_home) / ".puffo-agent"
     else:
-        return None
+        home = Path(_user_home(proc, environment)) / ".puffo-agent"
     if not home.is_absolute():
         home = Path(proc.cwd()) / home
     return normalized_home(home)
@@ -154,3 +185,42 @@ def identity_is_alive(home: Path, identity: DaemonIdentity) -> bool:
         identity.home == normalized_home(home)
         and inspect_process(home, identity.pid) == identity.create_time
     )
+
+
+@contextmanager
+def marker_lock(home: Path):
+    """Serialize short marker transactions; never delete the lock inode."""
+    home.mkdir(parents=True, exist_ok=True)
+    fd = os.open(home / "daemon.markers.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"0")
+        else:
+            import fcntl
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("daemon marker lock timed out")
+                time.sleep(0.01)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)

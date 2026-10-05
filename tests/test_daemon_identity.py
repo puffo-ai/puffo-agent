@@ -140,3 +140,77 @@ def test_copied_identity_does_not_claim_another_home(monkeypatch, process, tmp_p
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(other))
     process.home = str(other)
     assert not state.is_daemon_alive()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX passwd home fallback")
+def test_legacy_home_without_HOME_or_with_named_tilde(monkeypatch, tmp_path):
+    """Legacy daemons started without HOME or with ~user must remain visible."""
+    import pwd
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / ".puffo-agent"))
+    state.home_dir().mkdir()
+    state.daemon_pid_path().write_text("4242")
+    environment = {}
+    proc = SimpleNamespace(
+        cmdline=lambda: ["puffo-agent", "start"],
+        create_time=lambda: 100.0,
+        environ=lambda: environment,
+        uids=lambda: SimpleNamespace(real=123),
+    )
+    monkeypatch.setattr(daemon_identity.psutil, "Process", lambda _: proc)
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda _: SimpleNamespace(pw_dir=str(tmp_path))
+    )
+    monkeypatch.setattr(
+        pwd, "getpwnam", lambda _: SimpleNamespace(pw_dir=str(tmp_path))
+    )
+    assert state.is_daemon_alive()
+    environment["PUFFO_AGENT_HOME"] = "~operator/.puffo-agent"
+    assert state.is_daemon_alive()
+
+
+def test_windows_home_fallback_matches_expanduser():
+    """HOMEDRIVE/HOMEPATH is a supported default when USERPROFILE is absent."""
+    environment = {"HOMEDRIVE": "C:", "HOMEPATH": r"\Users\owner", "USERNAME": "owner"}
+    assert daemon_identity._windows_user_home(environment, "") == r"C:\Users\owner"
+    assert daemon_identity._windows_user_home(environment, "other") == r"C:\Users\other"
+    with pytest.raises(RuntimeError, match="cannot resolve"):
+        daemon_identity._windows_user_home({}, "")
+
+
+def test_marker_cleanup_serializes_successor_publication(
+    monkeypatch, process, tmp_path
+):
+    """A successor cannot acquire the marker lock between old file removals."""
+    from pathlib import Path
+
+    state.write_daemon_pid(4242)
+    original = state.read_daemon_identity(4242)
+    unlink = Path.unlink
+    checked = []
+
+    def observe_unlink(path, *args, **kwargs):
+        if path in (state.daemon_pid_path(), daemon_identity.identity_path(tmp_path)):
+            fd = os.open(tmp_path / "daemon.markers.lock", os.O_RDWR)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    with pytest.raises((BlockingIOError, PermissionError)):
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                checked.append(path.name)
+            finally:
+                os.close(fd)
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", observe_unlink)
+    assert state.clear_daemon_pid(4242, identity=original)
+    assert len(checked) == 2
+    state.write_daemon_pid(4242)
+    state.write_daemon_ready(4242)
+    assert state.is_daemon_ready(4242)

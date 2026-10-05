@@ -15,7 +15,8 @@ New daemons publish these local markers:
 
 Process checks verify the daemon command, process creation time and process home.
 The process home comes from its environment (`PUFFO_AGENT_HOME`, or the platform
-home plus `.puffo-agent`), with relative overrides resolved against its cwd.
+home plus `.puffo-agent`), with relative overrides resolved against its cwd. POSIX password-database and
+Windows HOMEDRIVE/HOMEPATH fallbacks follow the producer's home resolution.
 An inaccessible process raises an ownership verification error rather than being
 reported absent and allowing an unverified second daemon to start.
 
@@ -42,6 +43,8 @@ Old CLIs do not understand the structured ready marker. Use the upgraded CLI to
 observe readiness. Before downgrading, stop the daemon with the current CLI;
 normal shutdown removes the identity sidecar along with the PID file.
 
-This change does not add a cross-process startup lock or defend marker files
+Short marker transactions and identity reads share a cross-process file lock so
+old cleanup cannot remove a successor's sidecar. The lock file stays in place.
+This change does not add a lock covering the entire startup lifecycle or defend marker files
 against a malicious process with the same filesystem permissions. It prevents
 accidental PID reuse and cross-home ownership confusion.
