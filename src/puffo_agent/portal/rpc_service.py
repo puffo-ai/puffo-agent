@@ -215,6 +215,22 @@ async def leave_request_route(request: web.Request) -> web.Response:
     )
 
 
+async def request_credential_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/request-credential — ``{type, reason, alias?}``."""
+    return await _dispatch(
+        request, host_mcp_handler.request_credential,
+        body_keys=("type", "reason", "alias"),
+    )
+
+
+async def credential_status_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/credential-status — ``{request_id}``."""
+    return await _dispatch(
+        request, host_mcp_handler.credential_status,
+        body_keys=("request_id",),
+    )
+
+
 async def permission_request_route(request: web.Request) -> web.Response:
     """POST /v1/rpc/{agent_id}/permission-request —
     ``{tool_name, summary, timeout_s}``. Long-poll; ``message`` is
@@ -821,6 +837,14 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/sync-mcp",
         sync_host_mcp_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/request-credential",
+        request_credential_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/credential-status",
+        credential_status_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/leave-request",

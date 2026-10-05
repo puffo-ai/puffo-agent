@@ -64,6 +64,51 @@ def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
         )
 
     @mcp.tool()
+    async def request_credential(type: str, reason: str, alias: str = "") -> str:
+        """Ask your owner for a credential you need, through a secure form in
+        your DM. The value is encrypted to you and filed through the
+        credentials API — it is NEVER sent as a message and you never see it.
+
+        ``type``: one of
+          - ``PUFFO_CHATGPT_CREDENTIAL_JSON_v1`` — a ChatGPT plan (Codex) credential
+          - ``PUFFO_CLAUDE_CODE_TOKEN_v1`` — a Claude Code plan token (Linux/cloud only)
+          - ``CUSTOMIZED`` — any other secret; give it an ``alias`` (an env
+            var name, e.g. ``GITHUB_TOKEN``) and you will find it in your
+            environment under that name after placement.
+        ``reason``: one plain line the owner reads on the form.
+
+        What happens next: the owner's reply arrives in the DM as a
+        ``puffo-credential-filed`` block. The daemon places the credential
+        BEFORE you see that message and restarts your CLI to pick it up —
+        your session and transcript survive. Then call ``credential_status``
+        with the request_id and, only when it says ``placed``, tell the owner
+        in plain words that it is done. Never ask the owner to paste a secret
+        into chat.
+        """
+        if cfg.rpc_client is None:
+            raise RuntimeError(
+                "request_credential unavailable — PUFFO_RPC_URL not set "
+                "on this MCP runtime, so the puffo-agent daemon's "
+                "rpc_service isn't reachable."
+            )
+        return await cfg.rpc_client.request_credential(
+            type=type, reason=reason, alias=alias,
+        )
+
+    @mcp.tool()
+    async def credential_status(request_id: str) -> str:
+        """Where a ``request_credential`` stands: ``pending``, ``placed <type>
+        #<index> v<version>; restarting my CLI to pick it up``, or
+        ``failed: <reason>``. Never contains the value."""
+        if cfg.rpc_client is None:
+            raise RuntimeError(
+                "credential_status unavailable — PUFFO_RPC_URL not set "
+                "on this MCP runtime, so the puffo-agent daemon's "
+                "rpc_service isn't reachable."
+            )
+        return await cfg.rpc_client.credential_status(request_id=request_id)
+
+    @mcp.tool()
     async def sync_host_mcp(template_id: str) -> str:
         """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
         entry into your own ``<agent>/.claude.json``. Pair with

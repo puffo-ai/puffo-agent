@@ -627,6 +627,14 @@ class StandardWorkerRun:
         outbox_ref: list[Any] = [None]
         try:
             paths = self._prepare_paths()
+            # The client before the adapter: a plan credential the owner filed
+            # must be PLACED before the first spawn, because placement is
+            # spawn-time (an env var / a file the CLI reads at start). The
+            # client depends on nothing the adapter builds.
+            client = worker._build_wired_client()
+            worker._client = client
+            worker._credentials = self._build_credentials(client, agent_id)
+            await self._reconcile_credentials_at_boot(paths)
             outbox, session_ref, prepared = await self._prepare_adapter(
                 paths, outbox_ref
             )
@@ -638,8 +646,6 @@ class StandardWorkerRun:
                 claude_dir=paths.claude_path,
                 agent_id=agent_id,
             )
-            client = worker._build_wired_client()
-            worker._client = client
             return WorkerRunContext(
                 paths=paths,
                 puffo=puffo,
@@ -651,6 +657,53 @@ class StandardWorkerRun:
         except Exception as exc:
             await self._fail_initialization(agent_id, outbox_ref[0], exc)
             return None
+
+    async def _reconcile_credentials_at_boot(self, paths: WorkerRunPaths) -> None:
+        """One bounded, fail-open attempt to place a server-held plan
+        credential before the first spawn (``credential_requests``)."""
+        from .credential_requests import reconcile_at_boot
+
+        worker = self.worker
+        if worker.agent_cfg.runtime.auth_mode != "subscription":
+            return
+        try:
+            await reconcile_at_boot(
+                credentials=worker._credentials,
+                agent_dir=agent_dir(paths.agent_id),
+                harness=paths.effective_harness,
+                agent_id=paths.agent_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block a boot on this
+            logger.info("agent %s: boot credential reconcile skipped: %s",
+                        paths.agent_id, type(exc).__name__)
+
+    async def _handle_credential_replies(self, context: WorkerRunContext, planned) -> None:
+        """Act on the owner's ``puffo-credential-filed`` replies in this batch
+        BEFORE the model sees it. Never raises."""
+        from .credential_requests import RequestLedger, handle_filed_replies
+
+        worker = self.worker
+        items = getattr(planned, "items", None) or ()
+        if not items:
+            return
+        try:
+            ledger = getattr(worker, "_credential_ledger", None)
+            if ledger is None:
+                ledger = RequestLedger(agent_dir(context.paths.agent_id) / "credential_requests.json")
+                worker._credential_ledger = ledger
+            await handle_filed_replies(
+                items,
+                owner_slug=worker.agent_cfg.puffo_core.operator_slug,
+                ledger=ledger,
+                credentials=getattr(worker, "_credentials", None),
+                agent_dir=agent_dir(context.paths.agent_id),
+                workspace=Path(context.paths.workspace_path),
+                harness=context.paths.effective_harness,
+                agent_id=context.paths.agent_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: credential reply handling failed: %s",
+                           context.paths.agent_id, type(exc).__name__)
 
     async def _fail_initialization(
         self, agent_id: str, outbox: Any, exc: Exception
@@ -857,6 +910,10 @@ class StandardWorkerRun:
         worker = self.worker
         worker._turn_active = True
         try:
+            # A filed credential is placed here, before the provider sees the
+            # batch, so the reload flag it writes is consumed by _apply_refresh
+            # on the NEXT turn — and the model only ever sees "placed".
+            await self._handle_credential_replies(context, planned)
             async with worker._reload_lock:
                 await self._apply_refresh(context)
             worker._maybe_wake_refresher_if_auth_failed(context.paths.agent_id)
@@ -1129,8 +1186,9 @@ class StandardWorkerRun:
             )
         heartbeat_task = spawn(self._heartbeat(context.paths.agent_id), name="heartbeat")
         credential_key_task = None
-        worker._credentials = self._build_credentials(context)
-        if worker._credentials is not None:
+        if getattr(worker, "_credentials", None) is None:
+            worker._credentials = self._build_credentials(context.client, context.paths.agent_id)
+        if worker._credentials is not None and not getattr(context.client.http, "keyless", False):
             credential_key_task = spawn(
                 keep_registering(worker._credentials), name="credentials.keep_registering"
             )
@@ -1156,24 +1214,29 @@ class StandardWorkerRun:
             runtime_upload_task=upload_task,
         )
 
-    def _build_credentials(self, context: WorkerRunContext) -> AgentCredentials | None:
+    def _build_credentials(self, client: Any, agent_id: str) -> Any:
         """This agent's credential-v2 view, or None if it cannot hold any.
 
         ids derive from the operator in agent.yml (``AgentCredentials._open``).
+        A keyless (cloud) agent gets ``CloudAgentCredentials``: it holds no
+        keys, so the server hands it the KEM secret over the sandbox-token
+        surface and the unwrap happens here (puffo-server #434/#437). The
+        server registers that agent's key itself, so no ``keep_registering``.
         """
-        client = context.client
         owner = self.worker.agent_cfg.puffo_core.operator_slug
-        if not owner or getattr(client.http, "keyless", False):
+        if not owner:
             return None
+        if getattr(client.http, "keyless", False):
+            from .cloud_credentials import CloudAgentCredentials
+
+            return CloudAgentCredentials(client.http, client.slug, owner)
         try:
             identity = client.keystore.load_identity(client.slug)
             return AgentCredentials(
                 client.http, client.slug, owner, decode_secret(identity.root_secret_key)
             )
         except Exception as exc:  # noqa: BLE001 - credentials are optional
-            logger.warning(
-                "agent %s: no credential key: %s", context.paths.agent_id, exc
-            )
+            logger.warning("agent %s: no credential key: %s", agent_id, exc)
             return None
 
     async def _report_listener_error(

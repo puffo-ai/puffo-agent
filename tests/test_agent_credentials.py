@@ -315,17 +315,30 @@ async def test_the_worker_registers_the_agents_own_key_at_start(server):
     from puffo_agent.portal.credentials import keep_registering
 
     run, context = _run_with(server)
-    assert await keep_registering(run._build_credentials(context))
+    assert await keep_registering(run._build_credentials(context.client, context.paths.agent_id))
     root_pk = Ed25519KeyPair.from_secret_bytes(ROOT).public_key_bytes()
     assert verify_credential_key_cert(
         server.put_body["cert_json"], root_public_key=root_pk, slug=SLUG, key_version=1
     ) == server.recipient
 
 
-@pytest.mark.parametrize("owner, keyless", [("", False), (OWNER, True)])
-def test_an_agent_without_an_owner_or_keys_holds_no_credentials(server, owner, keyless):
-    run, context = _run_with(server, owner=owner, keyless=keyless)
-    assert run._build_credentials(context) is None
+@pytest.mark.parametrize("keyless", [False, True])
+def test_an_agent_without_an_owner_holds_no_credentials(server, keyless):
+    """ids derive from the owner; without one there is nothing to open."""
+    run, context = _run_with(server, owner="", keyless=keyless)
+    assert run._build_credentials(context.client, context.paths.agent_id) is None
+
+
+def test_a_keyless_agent_with_an_owner_reads_through_the_cloud_surface(server):
+    """Changed by the agentic-credential PR: a sandbox agent holds no keys,
+    so it reads via the server-held KEM secret (puffo-server #434/#437)
+    instead of holding nothing. The server registers its key, so the worker
+    must NOT run keep_registering for it (gated inline in worker_run)."""
+    from puffo_agent.portal.cloud_credentials import CloudAgentCredentials
+
+    run, context = _run_with(server, owner=OWNER, keyless=True)
+    creds = run._build_credentials(context.client, context.paths.agent_id)
+    assert isinstance(creds, CloudAgentCredentials)
 
 
 @pytest.mark.asyncio
@@ -530,7 +543,7 @@ async def test_an_unreadable_identity_leaves_the_agent_without_credentials(serve
         raise OSError("keystore is unreadable")
 
     context.client.keystore.load_identity = unreadable
-    assert run._build_credentials(context) is None
+    assert run._build_credentials(context.client, context.paths.agent_id) is None
 
 
 @pytest.mark.asyncio

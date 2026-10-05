@@ -433,6 +433,7 @@ class LocalRuntimePreparer:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
                 opencode_config
             )
+        controlled.update(self._customized_env())
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
@@ -705,6 +706,16 @@ class LocalRuntimePreparer:
         ):
             strip_claude_api_key_from_settings(settings_path)
 
+    def _customized_env(self) -> dict[str, str]:
+        """``{ALIAS: value}`` for every CUSTOMIZED credential the owner filed
+        for this agent (``credential_requests``). Injected through
+        ``controlled`` — the one channel by which a secret may reach a child —
+        and never read from the ambient environment."""
+        from ....portal.credential_requests import customized_env
+        from ....portal.state import agent_dir
+
+        return customized_env(agent_dir(self.agent_id))
+
     def _claude_llm_credentials(self) -> tuple[dict[str, str], tuple[str, ...]]:
         """The claude child's LLM credential env, plus any extra allowances.
 
@@ -721,7 +732,7 @@ class LocalRuntimePreparer:
             creds = resolve_subscription_credentials(
                 runtime.harness,
                 agent_home=self.agent_home,
-                token=subscription_token(self.daemon_cfg, runtime.harness),
+                token=subscription_token(self.daemon_cfg, runtime.harness, agent_id=self.agent_id),
             )
             for path, content in creds.files.items():
                 atomic_write_private(path, content)
@@ -803,6 +814,7 @@ class LocalRuntimePreparer:
             controlled={
                 "HOME": str(self.agent_home),
                 "USERPROFILE": str(self.agent_home),
+                **self._customized_env(),
                 **llm_env,
             },
             extra_allowed=extra_allowed,
@@ -871,7 +883,7 @@ class LocalRuntimePreparer:
             creds = resolve_subscription_credentials(
                 "codex",
                 agent_home=self.agent_home,
-                token=subscription_token(self.daemon_cfg, "codex"),
+                token=subscription_token(self.daemon_cfg, "codex", agent_id=self.agent_id),
             )
             for path, content in creds.files.items():
                 atomic_write_private(path, content)
@@ -898,6 +910,7 @@ class LocalRuntimePreparer:
                 "PUFFO_CODEX_BIN=/absolute/path/to/codex."
             )
         self._ensure_codex_self_invoke(executable)
+        controlled.update(self._customized_env())
         environment = build_child_environment(
             overrides=self.agent_cfg.env_overrides,
             controlled=controlled,

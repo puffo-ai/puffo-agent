@@ -496,14 +496,20 @@ def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
     return getattr(anthropic, "api_key", "")
 
 
-def subscription_token(daemon_cfg: DaemonConfig | None, harness: str) -> str:
+def subscription_token(
+    daemon_cfg: DaemonConfig | None, harness: str, *, agent_id: str = ""
+) -> str:
     """The operator's plan credential for ``harness``, or "".
 
-    Read from the environment the agent process was started with -- which is how
-    a cloud sandbox receives it: the provisioner sets it at sandbox creation and
-    it is never written to agent.yml. ``daemon_cfg`` is accepted for symmetry
-    with :func:`claude_cli_api_key` and as the seam for a future configured
-    source; nothing reads it yet.
+    Two sources, in order. FIRST the daemon-side store under ``agent_dir`` --
+    a credential the owner filed through the secure-form flow
+    (``credential_requests``), placed by the daemon. SECOND the environment the
+    agent process was started with -- how a cloud sandbox receives the vault
+    value: the provisioner sets it at sandbox creation and it is never written
+    to agent.yml. The store wins because it is the newer, user-chosen value;
+    the env var is AIM's injection and goes stale the moment the owner files a
+    replacement. ``daemon_cfg`` stays accepted for symmetry with
+    :func:`claude_cli_api_key`; nothing reads it yet.
 
     This lives in ``portal`` rather than the harness tree on purpose. The harness
     boundary is forbidden from reading ambient environment (see
@@ -518,6 +524,13 @@ def subscription_token(daemon_cfg: DaemonConfig | None, harness: str) -> str:
     )
 
     del daemon_cfg  # reserved; see docstring
+    if agent_id:
+        from .credential_requests import PLAN_TYPE_FOR_HARNESS, stored_value
+
+        ctype = PLAN_TYPE_FOR_HARNESS.get("codex" if harness == "codex" else "claude-code")
+        placed = stored_value(agent_dir(agent_id), ctype or "") if ctype else ""
+        if placed:
+            return placed
     name = CODEX_SUBSCRIPTION_ENV if harness == "codex" else CLAUDE_SUBSCRIPTION_ENV
     return (os.environ.get(name, "") or "").strip()
 

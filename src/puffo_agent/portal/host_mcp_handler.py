@@ -662,6 +662,85 @@ async def send_message(
     return result
 
 
+async def request_credential(
+    ctx: HostMcpContext,
+    *,
+    type: str = "",
+    reason: str = "",
+    alias: str = "",
+) -> str:
+    """Ask the owner for a credential over DM (``credential_requests``).
+
+    Posts the pinned request message to ``@<operator>`` through the worker's
+    send coordinator, which works on both transports (native signs, keyless
+    bridges). Records the request so the owner's filed reply can be checked
+    against it. Returns a line for the model; never a value.
+    """
+    from .credential_requests import (
+        REQUESTABLE_TYPES,
+        TYPE_CLAUDE_TOKEN,
+        TYPE_CUSTOMIZED,
+        _ALIAS,
+        _REASON_MAX,
+        build_request_message,
+    )
+    from ..macos.keychain import is_macos
+
+    ctype = (type or "").strip()
+    reason = " ".join((reason or "").split())
+    alias = (alias or "").strip()
+    if ctype not in REQUESTABLE_TYPES:
+        raise RuntimeError(f"type must be one of {', '.join(sorted(REQUESTABLE_TYPES))}; got {ctype!r}")
+    if not reason or len(reason) > _REASON_MAX:
+        raise RuntimeError(f"reason must be one line, 1..{_REASON_MAX} characters")
+    if ctype == TYPE_CUSTOMIZED and not _ALIAS.fullmatch(alias):
+        raise RuntimeError("a CUSTOMIZED credential needs an alias usable as an environment variable name")
+    if ctype != TYPE_CUSTOMIZED and alias:
+        raise RuntimeError("alias is only for CUSTOMIZED credentials")
+    if ctype == TYPE_CLAUDE_TOKEN and is_macos():
+        # subscription_credentials refuses this on macOS: with
+        # CLAUDE_CODE_OAUTH_TOKEN set the CLI deletes the OPERATOR'S OWN
+        # Keychain login on exit (anthropics/claude-code#37512). Refuse at the
+        # ask, not after the owner has typed a token in.
+        raise RuntimeError(
+            "a Claude Code plan token cannot be placed on a macOS host: the CLI would delete "
+            "the operator's own login on exit (anthropics/claude-code#37512). Only a Linux "
+            "sandbox (cloud agent) can use this type."
+        )
+    ledger = _ledger(ctx)
+    req = ledger.issue(credential_type=ctype, reason=reason, alias=alias)
+    body = build_request_message(
+        request_id=req.request_id, credential_type=ctype, reason=reason, alias=alias
+    )
+    result = await send_message(ctx, channel=f"@{ctx.operator_slug}", text=body)
+    if result.get("state") == "failed":
+        ledger.settle(req.request_id, state="failed", detail="the request DM could not be sent")
+        raise RuntimeError(f"could not DM @{ctx.operator_slug}: {result.get('error') or 'send failed'}")
+    return (
+        f"requested {ctype} (request_id {req.request_id}). The owner sees a secure form in our DM; "
+        "the value is encrypted to me and never sent as a message. When their reply arrives I place "
+        "it and restart my CLI to pick it up — call credential_status to confirm before relying on it."
+    )
+
+
+async def credential_status(ctx: HostMcpContext, *, request_id: str = "") -> str:
+    """``placed <type> #<index> v<version>; restarting my CLI`` / ``pending`` /
+    ``failed: <reason>``. Never the value."""
+    from .credential_requests import status_line
+
+    rid = (request_id or "").strip()
+    if not rid:
+        raise RuntimeError("request_id is required")
+    return status_line(_ledger(ctx).get(rid))
+
+
+def _ledger(ctx: HostMcpContext):
+    from .credential_requests import RequestLedger
+    from .state import agent_dir
+
+    return RequestLedger(agent_dir(ctx.agent_id) / "credential_requests.json")
+
+
 async def stage_model_visible_read(
     ctx: HostMcpContext,
     *,

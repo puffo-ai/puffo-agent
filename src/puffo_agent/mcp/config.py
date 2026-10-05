@@ -122,6 +122,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "list_mcp_servers",
     "install_host_mcp",
     "sync_host_mcp",
+    "request_credential",
+    "credential_status",
     "leave_space",
     "leave_channel",
     "get_dm_allowlists",

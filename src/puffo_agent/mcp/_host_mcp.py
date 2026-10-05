@@ -479,6 +479,16 @@ class PuffoRpcClient:
             {"name": name, "template_id": template_id, "spec": spec},
         )
 
+    async def request_credential(
+        self, *, type: str, reason: str, alias: str = ""
+    ) -> str:
+        return await self._post(
+            "request-credential", {"type": type, "reason": reason, "alias": alias},
+        )
+
+    async def credential_status(self, *, request_id: str) -> str:
+        return await self._post("credential-status", {"request_id": request_id})
+
     async def sync_mcp(self, *, template_id: str) -> str:
         return await self._post(
             "sync-mcp", {"template_id": template_id},
