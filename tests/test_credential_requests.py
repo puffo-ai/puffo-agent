@@ -341,6 +341,28 @@ async def test_boot_reconcile_places_what_the_server_holds(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_boot_reconcile_says_so_on_every_branch(tmp_path, caplog):
+    """Found on the first staging rebuild: with nothing in CCS the fall-through
+    was SILENT, so the log could not distinguish "asked, nothing listed" from
+    "never ran". Every branch now leaves one INFO line; none carries a value."""
+    with caplog.at_level(logging.INFO):
+        assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+        assert "server lists no PUFFO_CHATGPT_CREDENTIAL_JSON_v1" in caplog.text and "using the environment" in caplog.text
+        assert SECRET.decode() not in caplog.text
+        caplog.clear()
+        creds = FakeCredentials(listed=[0], held=_held(ctype=cr.TYPE_CHATGPT))
+        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is True
+        assert "boot reconcile placed" in caplog.text
+        # the branch that handles the real value: checked BEFORE the clear, or
+        # the leak check never sees it (review of #454)
+        assert SECRET.decode() not in caplog.text and cr.fingerprint(SECRET) in caplog.text
+        caplog.clear()
+        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+        assert "already placed" in caplog.text
+        assert SECRET.decode() not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_boot_reconcile_fails_open(tmp_path):
     assert await cr.reconcile_at_boot(credentials=FakeCredentials(list_error=RuntimeError("down")), agent_dir=tmp_path, harness="codex") is False
     assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex") is False
