@@ -43,9 +43,10 @@ def test_posix_stop_handlers_skipped_off_main_thread():
 def test_daemon_signal_stop_publishes_owned_sentinel(monkeypatch):
     daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
     daemon._stop = asyncio.Event()
+    daemon._identity = None
     writes = []
     monkeypatch.setattr(daemon_mod, "read_daemon_pid", lambda: os.getpid())
-    monkeypatch.setattr(daemon_mod, "write_stop_request", writes.append)
+    monkeypatch.setattr(daemon_mod, "write_stop_request", lambda pid, **kw: writes.append(pid))
 
     daemon.request_stop()
 

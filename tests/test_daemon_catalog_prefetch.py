@@ -46,6 +46,7 @@ async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
     daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
     daemon.daemon_cfg = DaemonConfig()
     daemon._stop = asyncio.Event()
+    daemon._identity = None
     monkeypatch.setattr(daemon_mod.Daemon, "_start_runtime", start_runtime)
     monkeypatch.setattr(daemon_mod.Daemon, "_run_reconcile_loop", reconcile)
     monkeypatch.setattr(daemon_mod.Daemon, "_shutdown_runtime", shutdown)
@@ -63,7 +64,7 @@ async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
     monkeypatch.setattr(
         daemon_mod,
         "write_daemon_ready",
-        lambda _pid: events.append("ready"),
+        lambda _pid, **kw: events.append("ready"),
     )
 
     await daemon.run()
@@ -212,6 +213,7 @@ async def test_daemon_run_cleans_partial_services_before_readiness(
     daemon = daemon_mod.Daemon(DaemonConfig())
     daemon.ws_local_hub = object()
     daemon._stop = asyncio.Event()
+    daemon._identity = None
     daemon._stop.set()
     daemon.workers = {}
     daemon.refresher = Refresher()

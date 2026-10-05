@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from ..macos.keychain import CredentialCache, is_macos
+from . import daemon_identity as _daemon_identity
 from .ws_local.hub import WsLocalHub
 from .ws_local.server import start_ws_local_server, stop_ws_local_server
 from .credential_refresh import (
@@ -140,6 +141,7 @@ def _is_subscription(agent_cfg) -> bool:
 class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
+        self._identity = _daemon_identity.read_identity(home_dir())
         self.workers: dict[str, Worker] = {}
         # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
@@ -213,7 +215,7 @@ class Daemon:
                 logger.info("stop requested during startup; shutting down")
                 self._stop.set()
             else:
-                write_daemon_ready(pid)
+                write_daemon_ready(pid, identity=self._identity)
                 logger.info(
                     "startup: control plane ready; elapsed_ms=%d",
                     int((time.perf_counter() - startup_started) * 1000),
@@ -302,7 +304,7 @@ class Daemon:
                 external_stop_requested is not None
                 and external_stop_requested.is_set()
             )
-            or stop_requested_for(pid)
+            or stop_requested_for(pid, identity=self._identity)
         )
 
     async def _run_reconcile_loop(
@@ -374,7 +376,7 @@ class Daemon:
                 await stop_service(runner)
             except Exception:
                 logger.exception("shutdown: failed to stop %s service", name)
-        clear_daemon_ready(expected_pid=pid)
+        clear_daemon_ready(expected_pid=pid, identity=self._identity)
         logger.info("puffo-agent portal stopped")
 
     def request_stop(self) -> None:
@@ -383,7 +385,7 @@ class Daemon:
         if read_daemon_pid() != pid:
             return
         try:
-            write_stop_request(pid)
+            write_stop_request(pid, identity=self._identity)
         except Exception:  # noqa: BLE001 - the in-process event still stops us
             logger.exception("failed to persist signal stop request")
 
@@ -1689,12 +1691,14 @@ async def run_daemon(
 
     daemon_cfg = DaemonConfig.load()
     pid = os.getpid()
+    identity = None
     try:
         # With no live daemon proven above, a leftover stop sentinel
         # (old-CLI timestamp-only or stale JSON) must not kill the new
         # process — clear it before publishing our own pid.
         clear_stop_request()
         write_daemon_pid(pid)
+        identity = _daemon_identity.read_identity(home_dir())
         daemon = Daemon(daemon_cfg)
         loop = asyncio.get_running_loop()
 
@@ -1741,9 +1745,9 @@ async def run_daemon(
                     sum(1 for task in survivors if not task.done()),
                 )
     finally:
-        clear_daemon_ready(expected_pid=pid)
-        clear_stop_request(expected_pid=pid)
-        clear_daemon_pid(expected_pid=pid)
+        clear_daemon_ready(expected_pid=pid, identity=identity)
+        clear_stop_request(expected_pid=pid, identity=identity)
+        clear_daemon_pid(expected_pid=pid, identity=identity)
 
     # Hard exit avoids loop.close() hangs on leftover subprocess
     # transports; workers + adapters are already torn down.

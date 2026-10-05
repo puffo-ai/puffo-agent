@@ -44,6 +44,10 @@ jobs:
           tests/test_keystore_and_certs.py
           tests/test_reminder_sync.py
           tests/test_background.py
+          tests/test_daemon_identity.py
+          tests/test_cmd_stop_specific_pid.py
+          tests/test_daemon_signal_handlers.py
+          tests/test_daemon_catalog_prefetch.py
           tests/test_windows_harness_launch.py
           tests/test_child_env_allowlist.py
           tests/test_control_client.py
