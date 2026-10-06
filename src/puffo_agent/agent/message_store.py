@@ -607,6 +607,10 @@ class MessageStore(
 
         # The tree's tracked spawn (a task that dies unclaimed logs instead of
         # vanishing); its registry is weak, so the strong reference stays here.
+        # NOTE: _run() catches inside the task body, so spawn's "worker task
+        # died" line never fires for an observer failure — the line to grep is
+        # this module's "on_receipt_stored failed" (and, for the credential
+        # handler, worker_run's "credential reply (arrival) failed").
         task = spawn(_run(), name="store.on_receipt_stored")
         self.observer_tasks.add(task)
         task.add_done_callback(self.observer_tasks.discard)

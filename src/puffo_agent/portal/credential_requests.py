@@ -255,6 +255,19 @@ class RequestLedger:
             req.state = "pending"
             self._save()
 
+    def recover_in_flight(self) -> int:
+        """At BOOT only: give back every claim left by a process that died between
+        claim and settle/release (OOM, a rebuild kill mid-handler, SIGTERM). Safe
+        then because no handler can be running yet. Without this a stranded
+        in_flight row refuses every claim forever — #242's lock-without-a-lease,
+        in miniature. Returns how many were released."""
+        stale = [r for r in self._items.values() if r.state == "in_flight"]
+        for r in stale:
+            r.state = "pending"
+        if stale:
+            self._save()
+        return len(stale)
+
     def settle(self, request_id: str, *, state: str, index: int | None = None,
                version: int | None = None, detail: str = "") -> None:
         """Finish a claimed request as ``placed`` or ``failed``. Never back to pending."""
@@ -417,6 +430,8 @@ async def handle_filed_replies(
     """
     del harness  # reserved: placement is type-keyed today
     outcomes: list[FiledOutcome] = []
+    if not ledger.pending():
+        return outcomes  # no open request: an owner DM costs nothing here
     for item in items:
         # Three paths feed this (turn scan, arrival hook, boot sweep) and all
         # must hand over the store's own row type. A different class would make
@@ -551,12 +566,14 @@ async def sweep_stored_replies(
     pending = ledger.pending()
     if not pending:
         return []
-    # Bounded in TIME as well as count: only DMs that arrived after the oldest
-    # pending request was issued can answer it (a minute of clock slack).
+    # Bounded in TIME: everything since the oldest pending request was issued
+    # (a minute of clock slack). The store pages newest-first by sent_at keyset;
+    # the floor compares received_at — the slack covers that skew. We page
+    # BACKWARD until a row older than the floor appears, so a chatty owner
+    # cannot push the receipt past a single page. Hard cap: `max_pages` pages.
     floor_ms = (min(r.issued_at for r in pending) - 60) * 1000
     try:
-        rows = [r for r in await store.get_dm_history(owner_slug, limit=limit)
-                if int(getattr(r, "received_at", 0) or 0) >= floor_ms]
+        rows = await _dm_rows_since(store, owner_slug, floor_ms, page=limit, max_pages=20)
     except Exception as exc:  # noqa: BLE001 — fail open, like every boot step
         logger.info("agent %s: credential reply sweep skipped: %s", agent_id, type(exc).__name__)
         return []
@@ -568,6 +585,29 @@ async def sweep_stored_replies(
         logger.info("agent %s: credential reply sweep: %s", agent_id,
                     ", ".join(f"{o.request_id[:8]}={o.state}" for o in outcomes))
     return outcomes
+
+
+async def _dm_rows_since(store: Any, peer: str, floor_ms: int, *, page: int, max_pages: int) -> list[Any]:
+    """Owner DMs received at or after ``floor_ms``, paging backward through the
+    store's newest-first keyset until the floor (or the cap) is reached."""
+    out: list[Any] = []
+    before: str | None = None
+    for _ in range(max_pages):
+        batch = await store.get_dm_history(peer, limit=page, before_envelope_id=before)
+        if not batch:
+            break
+        hit_floor = False
+        for r in batch:
+            if int(getattr(r, "received_at", 0) or 0) >= floor_ms:
+                out.append(r)
+            else:
+                hit_floor = True
+        if hit_floor or len(batch) < page:
+            break
+        before = getattr(batch[-1], "envelope_id", None)
+        if not before:
+            break
+    return out
 
 
 def _forget(credentials: Any, credential_type: str, index: int) -> None:

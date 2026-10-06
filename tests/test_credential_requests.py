@@ -192,9 +192,9 @@ async def test_owner_reply_places_consumes_and_requests_a_reload(env, caplog):
     assert SECRET.decode() not in caplog.text
     assert all(SECRET.decode() not in (o.detail or "") for o in out)
     assert cr.fingerprint(SECRET) in caplog.text
-    # replay: consumed once
+    # replay: consumed once — and with nothing pending the handler does no work at all
     out2 = await _run(env, [_dm(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN))], creds)
-    assert out2[0].state == "ignored" and len(creds.get_calls) == 1
+    assert out2 == [] and len(creds.get_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -548,8 +548,10 @@ async def test_claim_makes_consume_once_a_race_safe_claim_not_a_check(env):
     assert cr.status_line(env.ledger.get(env.req.request_id)).startswith("pending: placing")
     gate.set()
     ra, rb = await a, await b
+    # the winner places; the loser either saw in_flight ("ignored") or, having
+    # started after the claim, saw nothing pending and did no work at all
     states = sorted(o.state for o in ra + rb)
-    assert states == ["ignored", "placed"]
+    assert states in (["ignored", "placed"], ["placed"])
     assert creds.get_calls == [(cr.TYPE_CLAUDE_TOKEN, 0)]  # ONE fetch, one placement
 
 
@@ -581,15 +583,27 @@ async def test_an_unexpected_row_type_is_logged_not_silently_skipped(env, caplog
 
 
 class FakeStore:
-    def __init__(self, rows):
-        self.rows = rows; self.calls = 0
+    """Newest-first keyset paging like the real store (before_envelope_id)."""
 
-    async def get_dm_history(self, peer, limit=50):
-        self.calls += 1; return list(self.rows)[:limit]
+    def __init__(self, rows):
+        self.rows = sorted(rows, key=lambda r: -r.received_at); self.calls = 0
+
+    async def get_dm_history(self, peer, limit=50, before_envelope_id=None):
+        self.calls += 1
+        rows = self.rows
+        if before_envelope_id is not None:
+            idx = next(i for i, r in enumerate(rows) if r.envelope_id == before_envelope_id)
+            rows = rows[idx + 1:]
+        return rows[:limit]
+
+
+_rown = [0]
 
 
 def _row(sender, text, received_at_ms, kind="dm"):
-    return SimpleNamespace(envelope_kind=kind, sender_slug=sender, content={"text": text}, received_at=received_at_ms)
+    _rown[0] += 1
+    return SimpleNamespace(envelope_id=f"msg_{_rown[0]}", envelope_kind=kind, sender_slug=sender,
+                           content={"text": text}, received_at=received_at_ms)
 
 
 async def _sweep(env, store, creds):
@@ -618,6 +632,45 @@ async def test_sweep_is_bounded_to_dms_newer_than_the_oldest_pending_request(env
     store = FakeStore([_row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), old_ms)])
     assert await _sweep(env, store, creds) == []
     assert creds.get_calls == [] and env.ledger.get(env.req.request_id).state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_finds_a_receipt_buried_under_newer_owner_chatter(env):
+    """limit truncates BEFORE the floor filter; a chatty owner must not push the
+    receipt out of the first page. The sweep pages back until the floor."""
+    now_ms = int(time.time() * 1000)
+    receipt = _row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), now_ms)
+    chatter = [_row(OWNER, f"hi {i}", now_ms + 1000 + i) for i in range(450)]  # newer than the receipt
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore(chatter + [receipt])
+    out = await _sweep(env, store, creds)
+    assert [o.state for o in out] == ["placed"]
+    assert store.calls >= 3  # paged past two full pages of 200
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_in_flight_claim_is_recovered_at_boot_and_placed(env):
+    """A death between claim and settle must not strand the request forever."""
+    assert env.ledger.claim(env.req.request_id) is True
+    # "the process died here" — a fresh process reloads the ledger from disk
+    reloaded = cr.RequestLedger(env.agent_dir / "credential_requests.json")
+    assert reloaded.get(env.req.request_id).state == "in_flight"
+    assert reloaded.claim(env.req.request_id) is False  # stranded: refuses forever without recovery
+    assert reloaded.recover_in_flight() == 1
+    env.ledger = reloaded
+    creds = FakeCredentials(listed=[0], held=_held())
+    out = await _sweep(env, FakeStore([_row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), int(time.time() * 1000))]), creds)
+    assert [o.state for o in out] == ["placed"]
+
+
+@pytest.mark.asyncio
+async def test_owner_dms_cost_nothing_when_no_request_is_open(tmp_path):
+    ledger = cr.RequestLedger(tmp_path / "l.json")  # nothing pending
+    creds = FakeCredentials(listed=[0], held=_held())
+    out = await cr.handle_filed_replies([_dm(OWNER, _filed(str(uuid.uuid4()), cr.TYPE_CLAUDE_TOKEN))],
+                                        owner_slug=OWNER, ledger=ledger, credentials=creds, agent_dir=tmp_path,
+                                        workspace=tmp_path, harness="claude-code")
+    assert out == [] and creds.held_calls == []
 
 
 @pytest.mark.asyncio

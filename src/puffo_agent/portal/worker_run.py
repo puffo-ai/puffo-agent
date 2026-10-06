@@ -722,7 +722,13 @@ class StandardWorkerRun:
         from .credential_requests import sweep_stored_replies
 
         try:
-            await sweep_stored_replies(store, **self._credential_kwargs(paths))
+            kwargs = self._credential_kwargs(paths)
+            # Boot: no handler runs yet, so any in_flight is a claim a dead
+            # process left behind. Give it back before sweeping.
+            released = kwargs["ledger"].recover_in_flight()
+            if released:
+                logger.info("agent %s: credential requests: released %d stranded claim(s)", paths.agent_id, released)
+            await sweep_stored_replies(store, **kwargs)
         except Exception as exc:  # noqa: BLE001 — never block a boot on this
             logger.info("agent %s: credential reply sweep failed: %s", paths.agent_id, type(exc).__name__)
 
