@@ -865,3 +865,46 @@ def test_the_pending_status_never_invites_a_resubmission():
     in_flight = cr.status_line(cr.CredentialRequest(request_id="x", type=cr.TYPE_CHATGPT, reason="r", state="in_flight"))
     assert in_flight.startswith("placing") and "HAS already filed" in in_flight
     assert "Do NOT ask them to submit it again" in in_flight
+
+
+# ── review notes on #460 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_boot_reconcile_forgets_the_cache_before_replacing_a_version(tmp_path):
+    """The cloud reader serves memory while unexpired, so a warm cache would
+    place the OLD bytes under the NEW version label."""
+    forgotten = []
+
+    class Caching(FakeCredentials):
+        def forget(self, ctype, index):
+            forgotten.append((ctype, index))
+
+    creds = Caching(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT, version=1, value=b"v1"))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert forgotten == [(cr.TYPE_CHATGPT, 0)]
+    creds.rows_all = [_srv(cr.TYPE_CHATGPT, version=2)]
+    creds.held_value = _held(ctype=cr.TYPE_CHATGPT, version=2, value=b"v2")
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert forgotten == [(cr.TYPE_CHATGPT, 0)] * 2, "forgotten again before the replacing fetch"
+    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == "v2"
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_store_row_at_the_right_version_is_repaired(tmp_path):
+    """Version + index matching is not enough: a row whose value no longer
+    hashes to its recorded fingerprint must be refetched, or the agent runs on
+    bad bytes forever because the version "matches"."""
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert len(creds.get_calls) == 1
+    # corrupt the value in place, leaving version/index/fingerprint untouched
+    raw = json.loads(cr.store_path(tmp_path).read_text())
+    raw["credentials"][cr.TYPE_CHATGPT]["value"] = "truncated"
+    cr.store_path(tmp_path).write_text(json.dumps(raw))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert len(creds.get_calls) == 2, "the corrupt row was refetched"
+    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == SECRET.decode()
+    # and an intact row at the same version is still skipped
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 0
+    assert len(creds.get_calls) == 2

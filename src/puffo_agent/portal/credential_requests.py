@@ -852,9 +852,15 @@ async def reconcile_at_boot(
         else:
             key = ctype
         current = stored.get(key) or {}
-        if current.get("version") == version and current.get("index") == index:
+        if _already_placed(current, index, version):
             logger.info("agent %s: boot credential reconcile: %s #%s v%s already placed", agent_id, ctype, index, version)
             continue
+        # The version on the server differs from (or is missing locally) what we
+        # hold, so we are about to replace it — drop any cached copy first. The
+        # cloud reader serves memory while the held value is unexpired, so a warm
+        # cache would hand back the OLD bytes and place them under the NEW
+        # version label. Same reason the arrival handler forgets before fetching.
+        _forget(credentials, ctype, index)
         try:
             held = await credentials.get(ctype, index)
         except Exception as exc:  # noqa: BLE001
@@ -875,6 +881,23 @@ async def reconcile_at_boot(
         placed += 1
         _record_placement(ledger, held, ctype=ctype, alias=alias, label=label, agent_id=agent_id)
     return placed
+
+
+def _already_placed(current: dict, index: int, version: int) -> bool:
+    """Is the stored row this exact credential AND internally intact?
+
+    Version and index alone are not enough: a row whose ``value`` no longer
+    hashes to its recorded ``fingerprint`` is corrupt (a truncated write, a
+    hand-edit), and skipping it would leave the agent running on bad bytes
+    forever because the version "matches". Checked locally — no fetch needed to
+    know a row disagrees with itself.
+    """
+    if current.get("version") != version or current.get("index") != index:
+        return False
+    value = current.get("value")
+    if not isinstance(value, str):
+        return False
+    return current.get("fingerprint") == fingerprint(value.encode("utf-8"))
 
 
 def _record_placement(ledger: Any, held: Any, *, ctype: str, alias: str, label: str, agent_id: str) -> None:
