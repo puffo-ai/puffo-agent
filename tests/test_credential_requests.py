@@ -35,7 +35,8 @@ def _filed(request_id: str, ctype: str, index: int = 0, version: int = 1) -> str
 class FakeCredentials:
     """What handle_filed_replies needs of AgentCredentials / CloudAgentCredentials."""
 
-    def __init__(self, *, listed=(), held=None, get_error=None, list_error=None):
+    def __init__(self, *, listed=(), held=None, get_error=None, list_error=None, rows_all=()):
+        self.rows_all = list(rows_all)
         self.listed = list(listed)
         self.held_value = held
         self.get_error = get_error
@@ -49,11 +50,28 @@ class FakeCredentials:
             raise self.list_error
         return [(i, "") for i in self.listed]
 
+    async def held_all(self):
+        """The unfiltered list the boot reconcile works from."""
+        self.held_calls.append("*")
+        if self.list_error:
+            raise self.list_error
+        return list(self.rows_all)
+
     async def get(self, ctype, index):
+        """Answers with a credential OF THE TYPE ASKED FOR, as the real readers
+        do — their _open() refuses a response whose type/index differ from the
+        request. A fake that ignored the type let two listed rows collapse onto
+        one store key and hid it."""
         self.get_calls.append((ctype, index))
         if self.get_error:
             raise self.get_error
-        return self.held_value
+        if self.held_value is None:
+            return None
+        v = self.held_value
+        if v.type == ctype and v.index == index:
+            return v
+        return HeldCredential(id=f"cid-{ctype}-{index}", type=ctype, index=index,
+                              version=v.version, expire_at=v.expire_at, value=v.value)
 
 
 def _held(ctype=cr.TYPE_CLAUDE_TOKEN, index=0, version=1, value=SECRET):
@@ -152,8 +170,14 @@ def test_customized_is_keyed_by_alias_and_exposed_as_env(tmp_path):
     cr.place(agent_dir=tmp_path, credential_type=cr.TYPE_CUSTOMIZED, index=0, version=1, value=b"a", alias="GITHUB_TOKEN")
     cr.place(agent_dir=tmp_path, credential_type=cr.TYPE_CUSTOMIZED, index=1, version=1, value=b"b", alias="NPM_TOKEN")
     assert cr.customized_env(tmp_path) == {"GITHUB_TOKEN": "a", "NPM_TOKEN": "b"}
-    with pytest.raises(ValueError):
-        cr.place(agent_dir=tmp_path, credential_type=cr.TYPE_CUSTOMIZED, index=2, version=1, value=b"c", alias="bad name")
+    # an alias that is not a usable variable name is HELD, not refused and not
+    # normalised: the value survives, nothing invents a name (issue #457)
+    key = cr.place(agent_dir=tmp_path, credential_type=cr.TYPE_CUSTOMIZED, index=2, version=1,
+                   value=b"c", alias="Youtube access")
+    assert key == f"{cr.HELD_PREFIX}{cr.TYPE_CUSTOMIZED}:2"
+    row = cr.read_store(tmp_path)[key]
+    assert row["value"] == "c" and row["label"] == "Youtube access" and row["exported"] is False
+    assert cr.customized_env(tmp_path) == {"GITHUB_TOKEN": "a", "NPM_TOKEN": "b"}  # still not exported
 
 
 # ── the untrusted filed reply ────────────────────────────────────────────────
@@ -331,56 +355,122 @@ def test_status_line_never_carries_the_value():
 # ── boot reconcile ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_boot_reconcile_places_what_the_server_holds(tmp_path):
-    creds = FakeCredentials(listed=[0], held=_held(ctype=cr.TYPE_CHATGPT))
-    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") is True
-    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == SECRET.decode()
-    assert creds.held_calls == [cr.TYPE_CHATGPT]
-    # idempotent at the same version
-    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") is False
+def _srv(ctype, index=0, version=1, alias=""):
+    return {"type": ctype, "index": index, "version": version, "alias": alias}
 
 
 @pytest.mark.asyncio
-async def test_boot_reconcile_says_so_on_every_branch(tmp_path, caplog):
-    """Found on the first staging rebuild: with nothing in CCS the fall-through
-    was SILENT, so the log could not distinguish "asked, nothing listed" from
-    "never ran". Every branch now leaves one INFO line; none carries a value."""
+async def test_boot_reconcile_places_every_type_the_server_lists(tmp_path, caplog):
+    """The server list is the source of truth — including CUSTOMIZED, which a
+    per-type ask never saw (issue #457, staging 2026-10-06)."""
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CHATGPT), _srv(cr.TYPE_CUSTOMIZED, index=1, alias="TEST_API_KEY")],
+                            held=_held(ctype=cr.TYPE_CHATGPT))
     with caplog.at_level(logging.INFO):
-        assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
-        assert "server lists no PUFFO_CHATGPT_CREDENTIAL_JSON_v1" in caplog.text and "using the environment" in caplog.text
-        assert SECRET.decode() not in caplog.text
+        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") == 2
+    store = cr.read_store(tmp_path)
+    assert cr.TYPE_CHATGPT in store and "alias:TEST_API_KEY" in store
+    assert cr.customized_env(tmp_path) == {"TEST_API_KEY": SECRET.decode()}
+    assert creds.held_calls == ["*"], "one unfiltered list, not one call per type"
+    assert SECRET.decode() not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_boot_reconcile_skips_what_is_already_placed_at_that_version(tmp_path):
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert len(creds.get_calls) == 1
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 0
+    assert len(creds.get_calls) == 1, "already placed at that version → no refetch"
+
+
+@pytest.mark.asyncio
+async def test_boot_reconcile_replaces_a_newer_version(tmp_path):
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT, version=1))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    creds.rows_all = [_srv(cr.TYPE_CHATGPT, version=2)]
+    creds.held_value = _held(ctype=cr.TYPE_CHATGPT, version=2, value=b"newer")
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == "newer"
+
+
+@pytest.mark.asyncio
+async def test_a_label_that_is_not_a_variable_name_is_held_not_exported(tmp_path, caplog):
+    """"Youtube access" is a human label from the Apps tab. Never normalised: a
+    derived name reads as success while the agent cannot find what it asked for."""
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CUSTOMIZED, alias="Youtube access")],
+                            held=_held(ctype=cr.TYPE_CUSTOMIZED))
+    with caplog.at_level(logging.WARNING):
+        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="claude-code", agent_id="a1") == 1
+    assert cr.customized_env(tmp_path) == {}, "nothing exported"
+    held = cr.read_store(tmp_path)[f"{cr.HELD_PREFIX}{cr.TYPE_CUSTOMIZED}:0"]
+    assert held["value"] == SECRET.decode() and held["exported"] is False
+    assert "exported NO variable" in caplog.text and "Youtube access" in caplog.text
+    assert "YOUTUBE_ACCESS" not in caplog.text, "no derived name anywhere"
+    assert SECRET.decode() not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_agents_own_request_alias_wins_over_the_server_label(tmp_path):
+    """The agent reads the variable, so its request names it."""
+    ledger = cr.RequestLedger(tmp_path / "l.json")
+    ledger.issue(credential_type=cr.TYPE_CUSTOMIZED, reason="r", alias="TEST_API_KEY")
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CUSTOMIZED, alias="Youtube access")],
+                            held=_held(ctype=cr.TYPE_CUSTOMIZED))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="claude-code", ledger=ledger) == 1
+    assert cr.customized_env(tmp_path) == {"TEST_API_KEY": SECRET.decode()}
+    req = ledger.pending()
+    assert req == [] and [r.state for r in ledger._items.values()] == ["placed"]
+
+
+@pytest.mark.asyncio
+async def test_status_tells_the_owner_when_nothing_was_exported(tmp_path):
+    """So the agent says this precisely instead of "pending"."""
+    ledger = cr.RequestLedger(tmp_path / "l.json")
+    req = ledger.issue(credential_type=cr.TYPE_CUSTOMIZED, reason="r", alias="WANTED_NAME")
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CUSTOMIZED, alias="Youtube access")],
+                            held=_held(ctype=cr.TYPE_CUSTOMIZED))
+    # the ledger's alias is valid, so this one DOES export; now the other way round
+    ledger.settle(req.request_id, state="failed", detail="x") if False else None
+    ledger2 = cr.RequestLedger(tmp_path / "l2.json")
+    r2 = ledger2.issue(credential_type=cr.TYPE_CUSTOMIZED, reason="r", alias="")  # no usable alias
+    await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="claude-code", ledger=ledger2)
+    line = cr.status_line(ledger2.get(r2.request_id))
+    assert "no variable exported" in line and "Youtube access" in line
+    assert "pending" not in line
+
+
+@pytest.mark.asyncio
+async def test_boot_reconcile_fails_open(tmp_path, caplog):
+    with caplog.at_level(logging.INFO):
+        assert await cr.reconcile_at_boot(credentials=FakeCredentials(list_error=RuntimeError("down")),
+                                          agent_dir=tmp_path, harness="codex", agent_id="a1") == 0
+        assert "list unavailable" in caplog.text and "using the environment" in caplog.text
         caplog.clear()
-        creds = FakeCredentials(listed=[0], held=_held(ctype=cr.TYPE_CHATGPT))
-        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is True
-        assert "boot reconcile placed" in caplog.text
-        # the branch that handles the real value: checked BEFORE the clear, or
-        # the leak check never sees it (review of #454)
-        assert SECRET.decode() not in caplog.text and cr.fingerprint(SECRET) in caplog.text
-        caplog.clear()
-        assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex", agent_id="a1") is False
-        assert "already placed" in caplog.text
-        assert SECRET.decode() not in caplog.text
+        assert await cr.reconcile_at_boot(credentials=FakeCredentials(rows_all=[]), agent_dir=tmp_path,
+                                          harness="codex", agent_id="a1") == 0
+        assert "lists no credentials" in caplog.text
+    assert await cr.reconcile_at_boot(credentials=None, agent_dir=tmp_path, harness="codex") == 0
+    assert cr.read_store(tmp_path) == {}
 
 
 @pytest.mark.asyncio
 async def test_boot_reconcile_registers_the_key_before_listing(tmp_path, caplog):
-    """A pre-#437 cloud agent has no key; the list-first order never reached
-    the POST that would create one. The register call must come FIRST, and an
-    empty list after it is still a clean fall-through."""
+    """A pre-#437 cloud agent has no key; the list cannot find anything without
+    one, so registration comes FIRST."""
     order = []
 
     class Cloud(FakeCredentials):
         async def ensure_registered(self):
             order.append("register"); return 1
 
-        async def held(self, ctype):
-            order.append("list"); return await super().held(ctype)
+        async def held_all(self):
+            order.append("list"); return await super().held_all()
 
     with caplog.at_level(logging.INFO):
-        assert await cr.reconcile_at_boot(credentials=Cloud(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+        assert await cr.reconcile_at_boot(credentials=Cloud(rows_all=[]), agent_dir=tmp_path,
+                                          harness="codex", agent_id="a1") == 0
     assert order == ["register", "list"]
-    assert "credential key registered (v1)" in caplog.text and "server lists no" in caplog.text
+    assert "credential key registered (v1)" in caplog.text
 
     class Broken(Cloud):
         async def ensure_registered(self):
@@ -388,19 +478,9 @@ async def test_boot_reconcile_registers_the_key_before_listing(tmp_path, caplog)
 
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        assert await cr.reconcile_at_boot(credentials=Broken(listed=[]), agent_dir=tmp_path, harness="codex", agent_id="a1") is False
+        assert await cr.reconcile_at_boot(credentials=Broken(rows_all=[]), agent_dir=tmp_path,
+                                          harness="codex", agent_id="a1") == 0
     assert "key registration unavailable" in caplog.text  # fail-open, still lists
-    # a native reader has no ensure_registered: untouched
-    assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex") is False
-
-
-@pytest.mark.asyncio
-async def test_boot_reconcile_fails_open(tmp_path):
-    assert await cr.reconcile_at_boot(credentials=FakeCredentials(list_error=RuntimeError("down")), agent_dir=tmp_path, harness="codex") is False
-    assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[]), agent_dir=tmp_path, harness="codex") is False
-    assert await cr.reconcile_at_boot(credentials=None, agent_dir=tmp_path, harness="codex") is False
-    assert await cr.reconcile_at_boot(credentials=FakeCredentials(listed=[0], held=_held()), agent_dir=tmp_path, harness="acp") is False
-    assert cr.read_store(tmp_path) == {}
 
 
 # ── subscription_token prefers the store, then the environment ───────────────
@@ -785,3 +865,46 @@ def test_the_pending_status_never_invites_a_resubmission():
     in_flight = cr.status_line(cr.CredentialRequest(request_id="x", type=cr.TYPE_CHATGPT, reason="r", state="in_flight"))
     assert in_flight.startswith("placing") and "HAS already filed" in in_flight
     assert "Do NOT ask them to submit it again" in in_flight
+
+
+# ── review notes on #460 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_boot_reconcile_forgets_the_cache_before_replacing_a_version(tmp_path):
+    """The cloud reader serves memory while unexpired, so a warm cache would
+    place the OLD bytes under the NEW version label."""
+    forgotten = []
+
+    class Caching(FakeCredentials):
+        def forget(self, ctype, index):
+            forgotten.append((ctype, index))
+
+    creds = Caching(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT, version=1, value=b"v1"))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert forgotten == [(cr.TYPE_CHATGPT, 0)]
+    creds.rows_all = [_srv(cr.TYPE_CHATGPT, version=2)]
+    creds.held_value = _held(ctype=cr.TYPE_CHATGPT, version=2, value=b"v2")
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert forgotten == [(cr.TYPE_CHATGPT, 0)] * 2, "forgotten again before the replacing fetch"
+    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == "v2"
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_store_row_at_the_right_version_is_repaired(tmp_path):
+    """Version + index matching is not enough: a row whose value no longer
+    hashes to its recorded fingerprint must be refetched, or the agent runs on
+    bad bytes forever because the version "matches"."""
+    creds = FakeCredentials(rows_all=[_srv(cr.TYPE_CHATGPT)], held=_held(ctype=cr.TYPE_CHATGPT))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert len(creds.get_calls) == 1
+    # corrupt the value in place, leaving version/index/fingerprint untouched
+    raw = json.loads(cr.store_path(tmp_path).read_text())
+    raw["credentials"][cr.TYPE_CHATGPT]["value"] = "truncated"
+    cr.store_path(tmp_path).write_text(json.dumps(raw))
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 1
+    assert len(creds.get_calls) == 2, "the corrupt row was refetched"
+    assert cr.stored_value(tmp_path, cr.TYPE_CHATGPT) == SECRET.decode()
+    # and an intact row at the same version is still skipped
+    assert await cr.reconcile_at_boot(credentials=creds, agent_dir=tmp_path, harness="codex") == 0
+    assert len(creds.get_calls) == 2

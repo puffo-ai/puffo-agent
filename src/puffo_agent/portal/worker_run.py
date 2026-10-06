@@ -677,11 +677,14 @@ class StandardWorkerRun:
         if worker.agent_cfg.runtime.auth_mode != "subscription":
             return
         try:
+            from .credential_requests import ledger_for
+
             await reconcile_at_boot(
                 credentials=worker._credentials,
                 agent_dir=agent_dir(paths.agent_id),
                 harness=paths.effective_harness,
                 agent_id=paths.agent_id,
+                ledger=ledger_for(agent_dir(paths.agent_id) / "credential_requests.json"),
             )
         except Exception as exc:  # noqa: BLE001 — never block a boot on this
             logger.info("agent %s: boot credential reconcile skipped: %s",
