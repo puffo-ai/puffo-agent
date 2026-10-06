@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import stat
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -191,9 +192,9 @@ async def test_owner_reply_places_consumes_and_requests_a_reload(env, caplog):
     assert SECRET.decode() not in caplog.text
     assert all(SECRET.decode() not in (o.detail or "") for o in out)
     assert cr.fingerprint(SECRET) in caplog.text
-    # replay: consumed once
+    # replay: consumed once — and with nothing pending the handler does no work at all
     out2 = await _run(env, [_dm(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN))], creds)
-    assert out2[0].state == "ignored" and len(creds.get_calls) == 1
+    assert out2 == [] and len(creds.get_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -442,3 +443,257 @@ def test_kem_derivation_matches_the_server_and_web_known_answers(version, okm_he
     ikm = bytes(range(32))
     expected = KemKeyPair.from_secret_bytes(bytes.fromhex(okm_hex)).public_key_bytes()
     assert derive_credential_kem_keypair(ikm, version).public_key_bytes() == expected
+
+
+# ── the arrival seam: a notice turn admits nothing, so act when the row LANDS ──
+#
+# Found live on staging (codex4, 2026-10-06 01:28Z): the owner's filed reply was
+# stored correctly, the turn was admitted with message_count 0, and the row joined
+# the turn only when the model called read_inbox — after the turn-start scan had
+# run on an empty batch. The daemon never acted. These tests go through the REAL
+# MessageStore with the hook attached and NOTHING else (no turn scan, no sweep),
+# so removing the hook fails them and nothing can mask its absence.
+
+import asyncio
+
+import pytest_asyncio
+
+from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_store_models import ReceiptDisposition, StoredMessage
+
+
+async def _settle_tasks(store):
+    """Join the store's observer tasks — a real aiosqlite round-trip, not a tick."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+        if store.observer_tasks:
+            await asyncio.gather(*list(store.observer_tasks), return_exceptions=True)
+
+
+def _dm_payload(envelope_id, seq, sender, text, *, root=None):
+    return {
+        "envelope_id": envelope_id, "envelope_kind": "dm", "sender_slug": sender,
+        "recipient_slug": "bot", "channel_id": None, "space_id": None,
+        "content": {"text": text}, "content_type": "text/plain", "sent_at": seq,
+        "is_encrypted": True, "thread_root_id": root,
+    }
+
+
+@pytest_asyncio.fixture
+async def real_store(tmp_path):
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    yield store
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_filed_reply_is_placed_on_arrival_with_no_turn_at_all(env, real_store, caplog):
+    """The notice-turn case, end to end through the store: nothing admits the
+    row to a turn; the hook alone must place it."""
+    creds = FakeCredentials(listed=[1], held=_held(index=1))
+    seen = []
+
+    async def on_stored(row):
+        assert isinstance(row, StoredMessage)  # the store's own type, never a duck
+        seen.append(row.envelope_id)
+        await cr.handle_filed_replies([row], owner_slug=OWNER, ledger=env.ledger, credentials=creds,
+                                      agent_dir=env.agent_dir, workspace=env.workspace, harness="claude-code", agent_id="a1")
+
+    real_store.on_receipt_stored = on_stored
+    with caplog.at_level(logging.INFO):
+        res = await real_store.store_receipt(
+            _dm_payload("msg_filed", 10, OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN, index=1), root="msg_card"),
+            server_seq=10, disposition=ReceiptDisposition.ELIGIBLE, reason="test",
+        )
+        await _settle_tasks(real_store)
+    assert res.status.value == "committed" and seen == ["msg_filed"]
+    assert env.ledger.get(env.req.request_id).state == "placed"
+    assert cr.stored_value(env.agent_dir, cr.TYPE_CLAUDE_TOKEN) == SECRET.decode()
+    assert SECRET.decode() not in caplog.text and cr.fingerprint(SECRET) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_hook_fires_once_per_committed_receipt_and_never_raises_into_delivery(real_store):
+    calls = []
+
+    async def boom(row):
+        calls.append(row.envelope_id); raise RuntimeError("observer bug")
+
+    real_store.on_receipt_stored = boom
+    p = _dm_payload("msg_1", 1, OWNER, "hi")
+    r1 = await real_store.store_receipt(p, server_seq=1, disposition=ReceiptDisposition.ELIGIBLE, reason="t")
+    r2 = await real_store.store_receipt(p, server_seq=1, disposition=ReceiptDisposition.ELIGIBLE, reason="t")  # replay
+    await _settle_tasks(real_store)
+    assert r1.status.value == "committed" and r2.status.value != "committed"
+    assert calls == ["msg_1"]  # once, not on the idempotent replay; the raise stayed inside the task
+
+
+@pytest.mark.asyncio
+async def test_claim_makes_consume_once_a_race_safe_claim_not_a_check(env):
+    """Three paths can see one reply. The guard is a synchronous claim before the
+    first await, so of two racing handlers exactly one places."""
+    gate = asyncio.Event()
+
+    class Slow(FakeCredentials):
+        async def held(self, ctype):
+            await gate.wait(); return await super().held(ctype)
+
+    creds = Slow(listed=[0], held=_held())
+    item = _dm(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN))
+    a = asyncio.create_task(_run(env, [item], creds))
+    b = asyncio.create_task(_run(env, [item], creds))
+    await asyncio.sleep(0); await asyncio.sleep(0)
+    assert env.ledger.get(env.req.request_id).state == "in_flight"
+    assert cr.status_line(env.ledger.get(env.req.request_id)).startswith("pending: placing")
+    gate.set()
+    ra, rb = await a, await b
+    # the winner places; the loser either saw in_flight ("ignored") or, having
+    # started after the claim, saw nothing pending and did no work at all
+    states = sorted(o.state for o in ra + rb)
+    assert states in (["ignored", "placed"], ["placed"])
+    assert creds.get_calls == [(cr.TYPE_CLAUDE_TOKEN, 0)]  # ONE fetch, one placement
+
+
+def test_failed_is_terminal_and_pending_is_never_restored(tmp_path):
+    ledger = cr.RequestLedger(tmp_path / "l.json")
+    req = ledger.issue(credential_type=cr.TYPE_CHATGPT, reason="r")
+    assert ledger.claim(req.request_id) is True
+    assert ledger.claim(req.request_id) is False  # the loser
+    ledger.release(req.request_id)  # a release only moves in_flight → pending
+    assert ledger.get(req.request_id).state == "pending"
+    assert ledger.claim(req.request_id) is True
+    ledger.settle(req.request_id, state="failed", detail="x")
+    assert ledger.get(req.request_id).state == "failed"
+    assert ledger.claim(req.request_id) is False
+    ledger.release(req.request_id)  # failed is terminal: release does nothing
+    assert ledger.get(req.request_id).state == "failed"
+    with pytest.raises(AssertionError):
+        ledger.settle(req.request_id, state="pending")
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_row_type_is_logged_not_silently_skipped(env, caplog):
+    with caplog.at_level(logging.WARNING):
+        out = await _run(env, ["not a row", 42], FakeCredentials(listed=[0], held=_held()))
+    assert out == [] and "unexpected row type str" in caplog.text
+
+
+# ── the boot sweep ───────────────────────────────────────────────────────────
+
+
+class FakeStore:
+    """Newest-first keyset paging like the real store (before_envelope_id)."""
+
+    def __init__(self, rows):
+        self.rows = sorted(rows, key=lambda r: -r.sent_at); self.calls = 0  # newest first, like the SELECT
+        self.pages: list[set] = []
+
+    async def get_dm_history(self, peer, limit=50, before_envelope_id=None):
+        """Mirrors production: SELECT sent_at DESC, keyset on before_envelope_id,
+        then the page is returned OLDEST-FIRST (message_store.py selected_oldest_first)."""
+        self.calls += 1
+        rows = self.rows
+        if before_envelope_id is not None:
+            idx = next(i for i, r in enumerate(rows) if r.envelope_id == before_envelope_id)
+            rows = rows[idx + 1:]
+        page = list(reversed(rows[:limit]))
+        self.pages.append({r.envelope_id for r in page})
+        return page
+
+
+_rown = [0]
+
+
+def _row(sender, text, received_at_ms, kind="dm"):
+    _rown[0] += 1
+    return SimpleNamespace(envelope_id=f"msg_{_rown[0]}", envelope_kind=kind, sender_slug=sender,
+                           content={"text": text}, received_at=received_at_ms, sent_at=received_at_ms - 5)
+
+
+async def _sweep(env, store, creds):
+    return await cr.sweep_stored_replies(store, owner_slug=OWNER, ledger=env.ledger, credentials=creds,
+                                         agent_dir=env.agent_dir, workspace=env.workspace, harness="claude-code", agent_id="a1")
+
+
+@pytest.mark.asyncio
+async def test_sweep_places_a_reply_stored_before_boot_and_is_idempotent(env):
+    now_ms = int(time.time() * 1000)
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore([_row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), now_ms)])
+    out = await _sweep(env, store, creds)
+    assert [o.state for o in out] == ["placed"] and store.calls == 1
+    # second boot: nothing pending → no query at all
+    assert await _sweep(env, store, creds) == [] and store.calls == 1
+    assert creds.get_calls == [(cr.TYPE_CLAUDE_TOKEN, 0)]
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_bounded_to_dms_newer_than_the_oldest_pending_request(env):
+    """A stale DM carrying a valid-looking fence for a current request id must not
+    be acted on: only rows that arrived after the request was issued can answer it."""
+    old_ms = (env.req.issued_at - 3600) * 1000
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore([_row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), old_ms)])
+    assert await _sweep(env, store, creds) == []
+    assert creds.get_calls == [] and env.ledger.get(env.req.request_id).state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_finds_a_receipt_buried_under_newer_owner_chatter(env):
+    """limit truncates BEFORE the floor filter; a chatty owner must not push the
+    receipt out of the first page. The sweep pages back until the floor."""
+    now_ms = int(time.time() * 1000)
+    receipt = _row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), now_ms)
+    chatter = [_row(OWNER, f"hi {i}", now_ms + 1000 + i) for i in range(450)]  # newer than the receipt
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore(chatter + [receipt])
+    out = await _sweep(env, store, creds)
+    assert [o.state for o in out] == ["placed"]
+    assert store.calls == 3  # two full pages of 200, then the page holding the receipt
+    # consecutive pages are disjoint: the cursor moved a whole page, not one row
+    for a, b in zip(store.pages, store.pages[1:]):
+        assert not (a & b)
+
+
+@pytest.mark.asyncio
+async def test_sweep_warns_instead_of_silently_giving_up_when_the_cap_is_hit(env, caplog):
+    now_ms = int(time.time() * 1000)
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore([_row(OWNER, f"hi {i}", now_ms + 1000 + i) for i in range(5000)])  # all newer than the floor
+    with caplog.at_level(logging.WARNING):
+        assert await _sweep(env, store, creds) == []
+    assert "without reaching the time floor" in caplog.text and "4000 owner DMs" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_in_flight_claim_is_recovered_at_boot_and_placed(env):
+    """A death between claim and settle must not strand the request forever."""
+    assert env.ledger.claim(env.req.request_id) is True
+    # "the process died here" — a fresh process reloads the ledger from disk
+    reloaded = cr.RequestLedger(env.agent_dir / "credential_requests.json")
+    assert reloaded.get(env.req.request_id).state == "in_flight"
+    assert reloaded.claim(env.req.request_id) is False  # stranded: refuses forever without recovery
+    assert reloaded.recover_in_flight() == 1
+    env.ledger = reloaded
+    creds = FakeCredentials(listed=[0], held=_held())
+    out = await _sweep(env, FakeStore([_row(OWNER, _filed(env.req.request_id, cr.TYPE_CLAUDE_TOKEN), int(time.time() * 1000))]), creds)
+    assert [o.state for o in out] == ["placed"]
+
+
+@pytest.mark.asyncio
+async def test_owner_dms_cost_nothing_when_no_request_is_open(tmp_path):
+    ledger = cr.RequestLedger(tmp_path / "l.json")  # nothing pending
+    creds = FakeCredentials(listed=[0], held=_held())
+    out = await cr.handle_filed_replies([_dm(OWNER, _filed(str(uuid.uuid4()), cr.TYPE_CLAUDE_TOKEN))],
+                                        owner_slug=OWNER, ledger=ledger, credentials=creds, agent_dir=tmp_path,
+                                        workspace=tmp_path, harness="claude-code")
+    assert out == [] and creds.held_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_fails_open_when_the_store_cannot_be_read(env):
+    class Broken:
+        async def get_dm_history(self, *a, **k): raise RuntimeError("db")
+    assert await _sweep(env, Broken(), FakeCredentials(listed=[0], held=_held())) == []
+    assert env.ledger.get(env.req.request_id).state == "pending"
