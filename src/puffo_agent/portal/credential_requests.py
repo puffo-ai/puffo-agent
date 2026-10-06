@@ -364,6 +364,36 @@ def _write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+#: Store key prefix for a CUSTOMIZED credential we hold but CANNOT export: its
+#: alias is a human label, not a usable variable name. The value is kept (so
+#: nothing the owner filed is lost and a tool can report it) and no variable is
+#: invented — a derived name reads as success in the log while the agent still
+#: cannot find the name it asked for.
+HELD_PREFIX = "held:"
+
+
+def _alias_from_ledger(ledger: Any, credential_type: str, index: int) -> str:
+    """The ENV VAR NAME the agent asked for, from its own request, or "".
+
+    The agent is what reads the variable, so its request is authoritative over
+    the server's label. Matched by index once a request is settled; before that,
+    only an unambiguous single open request of that type is used — two open
+    requests cannot be told apart, and guessing would export the wrong name.
+    """
+    if ledger is None:
+        return ""
+    try:
+        items = list(ledger._items.values())  # noqa: SLF001 — same module's type
+    except Exception:  # noqa: BLE001
+        return ""
+    settled = [r for r in items if r.type == credential_type and r.index == index and _ALIAS.fullmatch(r.alias or "")]
+    if settled:
+        return settled[0].alias
+    open_ = [r for r in items if r.type == credential_type and r.state in ("pending", "in_flight")
+             and _ALIAS.fullmatch(r.alias or "")]
+    return open_[0].alias if len(open_) == 1 else ""
+
+
 def place(
     *,
     agent_dir: Path,
@@ -380,9 +410,13 @@ def place(
     ``alias:<name>`` so several can coexist and the child sees each as the
     environment variable named by its alias.
     """
-    key = f"alias:{alias}" if credential_type == TYPE_CUSTOMIZED else credential_type
-    if credential_type == TYPE_CUSTOMIZED and not _ALIAS.fullmatch(alias or ""):
-        raise ValueError("a CUSTOMIZED credential needs an alias usable as an env var name")
+    if credential_type != TYPE_CUSTOMIZED:
+        key = credential_type
+    elif _ALIAS.fullmatch(alias or ""):
+        key = f"alias:{alias}"
+    else:
+        # Held, not exported. See HELD_PREFIX.
+        key = f"{HELD_PREFIX}{credential_type}:{index}"
     items = read_store(agent_dir)
     items[key] = {
         "type": credential_type,
@@ -391,6 +425,8 @@ def place(
         "value": value.decode("utf-8"),
         "fingerprint": fingerprint(value),
         "placed_at": int(time.time()),
+        "label": alias or "",
+        "exported": not key.startswith(HELD_PREFIX),
     }
     _write_private(store_path(agent_dir), json.dumps({"version": 1, "credentials": items}, indent=2))
     return key
@@ -725,6 +761,10 @@ def status_line(req: CredentialRequest | None) -> str:
             "Do NOT ask them to submit it again; check again in a moment."
         )
     if req.state == "placed":
+        if req.detail:
+            # e.g. "no variable exported (label 'Youtube access')" — tell the
+            # owner precisely instead of leaving the agent to say "pending".
+            return f"placed {req.type} #{req.index} v{req.version}, but {req.detail}"
         return (
             f"placed {req.type} #{req.index} v{req.version}; "
             "restarting my CLI to pick it up"
@@ -751,22 +791,27 @@ async def reconcile_at_boot(
     agent_dir: Path,
     harness: str,
     agent_id: str = "",
-) -> bool:
-    """Before the first spawn: if the server holds a plan credential for this
-    harness, fetch and place it. One bounded attempt, fail-open.
+    ledger: Any = None,
+) -> int:
+    """Before the first spawn: place every credential the SERVER says this agent
+    holds and that is not already placed at that version. Returns how many.
 
-    Why: a rebuild or resume-recreate re-injects the OLD vault value into the
-    environment and the store is not carried. Re-deriving from the server
-    makes a filed credential survive without carrying a secret file around.
-    Returns whether something was placed.
+    **The server list is the source of truth** — not the local ledger, not a
+    stored receipt. Neither survives a rebuild: ``agent_dir``'s ledger and
+    ``messages.db`` are not in the carry-over allowlist, so a credential the
+    owner filed before a rebuild was invisible to the old per-type reconcile and
+    stayed unplaced while the grant sat ACTIVATED on the server (staging
+    2026-10-06, issue #457). Listing everything removes that dependency: a
+    rebuilt, resumed or freshly provisioned agent converges on what it has been
+    granted, with no local state at all.
+
+    One bounded attempt, fail-open: a reconcile that cannot reach the server
+    leaves the environment's vault value in place and says so.
     """
-    ctype = PLAN_TYPE_FOR_HARNESS.get(harness)
-    if ctype is None or credentials is None:
-        return False
-    # FIRST make sure the server holds a key for us (cloud readers only; the
-    # native reader registers via keep_registering). Without this, an agent
-    # claimed before puffo-server #437 can never be filed to — see
-    # CloudAgentCredentials.ensure_registered. Fail-open like every branch.
+    if credentials is None:
+        return 0
+    # The key must exist before anything can be wrapped TO us (#455); the list
+    # and the fetches below both need it.
     register = getattr(credentials, "ensure_registered", None)
     if callable(register):
         try:
@@ -775,41 +820,86 @@ async def reconcile_at_boot(
         except Exception as exc:  # noqa: BLE001
             logger.info("agent %s: boot credential reconcile: key registration unavailable (%s); continuing",
                         agent_id, type(exc).__name__)
+    lister = getattr(credentials, "held_all", None)
+    if not callable(lister):
+        return 0
     try:
-        held_list = await credentials.held(ctype)
-    except Exception as exc:  # noqa: BLE001 — fail open to the env var
-        logger.info("agent %s: boot credential list unavailable (%s); using the environment",
+        rows = await lister()
+    except Exception as exc:  # noqa: BLE001 — fail open to the environment
+        logger.info("agent %s: boot credential reconcile: list unavailable (%s); using the environment",
                     agent_id, type(exc).__name__)
-        return False
-    if not held_list:
-        # The common case on a fresh agent, and the one an operator reading the
-        # log after a rebuild needs to see: the server was asked and lists
-        # nothing, so the spawn falls through to the vault env var.
-        logger.info("agent %s: boot credential reconcile: server lists no %s for this agent; "
-                    "using the environment", agent_id, ctype)
-        return False
-    # The lowest index. Fine while a plan type is one-per-harness; a second
-    # plan credential of the same type would need an explicit choice here.
-    index = held_list[0][0]
-    try:
-        held = await credentials.get(ctype, index)
-    except Exception as exc:  # noqa: BLE001
-        logger.info("agent %s: boot credential fetch failed (%s); using the environment",
-                    agent_id, type(exc).__name__)
-        return False
-    if held is None:
-        return False
-    current = read_store(agent_dir).get(ctype) or {}
-    if current.get("version") == held.version and current.get("fingerprint") == fingerprint(held.value):
-        logger.info("agent %s: boot credential reconcile: %s #%s v%s already placed (fp %s)",
-                    agent_id, ctype, index, held.version, fingerprint(held.value))
-        return False
-    try:
-        place(agent_dir=agent_dir, credential_type=held.type, index=held.index,
-              version=held.version, value=held.value)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("agent %s: boot placement failed: %s", agent_id, type(exc).__name__)
-        return False
-    logger.info("agent %s: boot reconcile placed %s #%s v%s (fp %s)",
-                agent_id, held.type, held.index, held.version, fingerprint(held.value))
-    return True
+        return 0
+    if not rows:
+        logger.info("agent %s: boot credential reconcile: the server lists no credentials for this agent; "
+                    "using the environment", agent_id)
+        return 0
+    stored = read_store(agent_dir)
+    placed = 0
+    for row in rows:
+        ctype, index, version = row["type"], row["index"], row["version"]
+        alias = row["alias"]
+        label = alias
+        if ctype == TYPE_CUSTOMIZED:
+            # The alias IS the variable name the agent will read, so it must be
+            # usable as one. Order: the agent's own request (authoritative — it
+            # is the reader), else the server's row if that happens to be a
+            # valid name (which it is for a request-driven filing, since the web
+            # sends the requested alias). A free-text label from the Apps tab is
+            # NEVER normalised into a name: a derived name reads as success
+            # while the agent still cannot find what it asked for.
+            alias = _alias_from_ledger(ledger, ctype, index) or (alias if _ALIAS.fullmatch(alias or "") else "")
+            key = f"alias:{alias}" if alias else f"{HELD_PREFIX}{ctype}:{index}"
+        else:
+            key = ctype
+        current = stored.get(key) or {}
+        if current.get("version") == version and current.get("index") == index:
+            logger.info("agent %s: boot credential reconcile: %s #%s v%s already placed", agent_id, ctype, index, version)
+            continue
+        try:
+            held = await credentials.get(ctype, index)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("agent %s: boot credential reconcile: fetch of %s #%s failed (%s); skipping",
+                        agent_id, ctype, index, type(exc).__name__)
+            continue
+        if held is None:
+            logger.info("agent %s: boot credential reconcile: %s #%s not distributed to this agent",
+                        agent_id, ctype, index)
+            continue
+        try:
+            place(agent_dir=agent_dir, credential_type=held.type, index=held.index,
+                  version=held.version, value=held.value, alias=alias)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: boot credential reconcile: placement of %s #%s failed: %s",
+                           agent_id, ctype, index, type(exc).__name__)
+            continue
+        placed += 1
+        _record_placement(ledger, held, ctype=ctype, alias=alias, label=label, agent_id=agent_id)
+    return placed
+
+
+def _record_placement(ledger: Any, held: Any, *, ctype: str, alias: str, label: str, agent_id: str) -> None:
+    """Log the placement honestly and settle the agent's own request, if any."""
+    if ctype == TYPE_CUSTOMIZED and not alias:
+        logger.warning(
+            "agent %s: boot reconcile placed %s #%s v%s (fp %s) but exported NO variable: its label "
+            "%r is not usable as an environment variable name. The value is held; re-file it from the "
+            "agent's own request so the alias is the name it reads.",
+            agent_id, held.type, held.index, held.version, fingerprint(held.value), label,
+        )
+    else:
+        logger.info("agent %s: boot reconcile placed %s #%s v%s (fp %s)%s",
+                    agent_id, held.type, held.index, held.version, fingerprint(held.value),
+                    f" as {alias}" if ctype == TYPE_CUSTOMIZED else "")
+    if ledger is None:
+        return
+    match = _alias_from_ledger(ledger, ctype, held.index)
+    for req in list(getattr(ledger, "_items", {}).values()):
+        if req.type == ctype and req.state in ("pending", "in_flight") and (
+            ctype != TYPE_CUSTOMIZED or req.alias == match
+        ):
+            if req.state == "pending":
+                ledger.claim(req.request_id)
+            ledger.settle(req.request_id, state="placed", index=held.index, version=held.version,
+                          detail="" if alias or ctype != TYPE_CUSTOMIZED
+                          else f"no variable exported (label {label!r})")
+            break

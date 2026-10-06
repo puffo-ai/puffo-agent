@@ -141,6 +141,22 @@ class CloudAgentCredentials:
             if item["type"] == credential_type and item["state"] == "ACTIVATED"
         )
 
+    async def held_all(self) -> list[dict]:
+        """Every ACTIVATED credential this agent holds, unfiltered.
+
+        ``{type, index, version, alias}`` per row. The boot reconcile needs the
+        whole list, not one type: a CUSTOMIZED grant is invisible to a per-type
+        ask, which is how a filed credential survived a rebuild server-side and
+        was never placed (staging 2026-10-06, issue #457).
+        """
+        data = await self._http.get_unsigned(_LIST_ROUTE)
+        return [
+            {"type": item["type"], "index": item["index"],
+             "version": item["version"], "alias": item.get("alias") or ""}
+            for item in data.get("credentials", [])
+            if item.get("state") == "ACTIVATED"
+        ]
+
     async def _open(self, data: dict, credential_type: str, index: int) -> HeldCredential:
         """Open as the credential ASKED FOR, or refuse — ids and AAD come from
         the request, not the response, so another row cannot answer for it."""
