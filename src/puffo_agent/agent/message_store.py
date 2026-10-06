@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import sqlite3
 import time
@@ -57,6 +58,8 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
 # The row stays so envelope accounting and redelivery dedupe still work; the
 # plaintext the operator refused does not.
 DENIED_DM_PLACEHOLDER = "[message from a denied sender was discarded]"
+logger = logging.getLogger(__name__)
+
 _CONTENT_JSON_PREFIX = "\x1ePUFFO_CONTENT_JSON_V1:"
 
 # A held foreign DM is withheld from the model on the push path, so every
@@ -339,6 +342,18 @@ class MessageStore(
         # aiosqlite multiplexes one connection. Keep every Inbox transaction
         # and lifecycle-sensitive read outside another coroutine's transaction.
         self._inbox_lock = asyncio.Lock()
+        # Called with the StoredMessage after a receipt is COMMITTED — the one
+        # seam every inbound path shares (native receipts and bridge payloads
+        # both land here). Spawned after the lock is released, never awaited
+        # by the receipt path, never allowed to raise into it. The daemon uses
+        # it for work that must happen on ARRIVAL rather than on admission —
+        # a notice turn admits rows only when the model reads the inbox, so a
+        # turn-start scan can run on an empty batch (credential_requests).
+        self.on_receipt_stored: Any = None
+        # Strong references to in-flight observer tasks: asyncio keeps only weak
+        # ones, so an unreferenced task can be collected mid-flight. Also the
+        # join point for tests (``await asyncio.gather(*store.observer_tasks)``).
+        self.observer_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def for_agent(agent_id: str) -> MessageStore:
@@ -562,13 +577,36 @@ class MessageStore(
         received_at: int | None = None,
     ) -> ReceiptResult:
         async with self._inbox_lock:
-            return await self._store_receipt_unlocked(
+            result = await self._store_receipt_unlocked(
                 payload,
                 server_seq=server_seq,
                 disposition=disposition,
                 reason=reason,
                 received_at=received_at,
             )
+        if result.status == ReceiptWriteStatus.COMMITTED and self.on_receipt_stored is not None:
+            self._notify_receipt_stored(payload)
+        return result
+
+    def _notify_receipt_stored(self, payload: Any) -> None:
+        envelope_id = getattr(payload, "envelope_id", None)
+        if not envelope_id and isinstance(payload, dict):
+            envelope_id = payload.get("envelope_id")
+        if not isinstance(envelope_id, str) or not envelope_id:
+            return
+        callback = self.on_receipt_stored
+
+        async def _run() -> None:
+            try:
+                row = await self.get_message_by_envelope(envelope_id)
+                if row is not None:
+                    await callback(row)
+            except Exception:  # noqa: BLE001 - an observer must never break delivery
+                logger.exception("on_receipt_stored failed (envelope_id=%s)", envelope_id)
+
+        task = asyncio.get_running_loop().create_task(_run(), name="store.on_receipt_stored")
+        self.observer_tasks.add(task)
+        task.add_done_callback(self.observer_tasks.discard)
 
     async def _store_receipt_unlocked(
         self,

@@ -157,8 +157,10 @@ class CredentialRequest:
     reason: str
     alias: str = ""
     issued_at: int = 0
-    #: ``pending`` → ``placed`` | ``failed``. Set once; a consumed request
-    #: never goes back to pending, so a replayed reply does nothing.
+    #: ``pending`` → ``in_flight`` → ``placed`` | ``failed``. ``in_flight`` is a
+    #: CLAIM taken synchronously before the first await, so two coroutines that
+    #: see the same reply (arrival hook, boot sweep, turn scan) cannot both
+    #: place it. A request never returns to ``pending``; ``failed`` is terminal.
     state: str = "pending"
     index: int | None = None
     version: int | None = None
@@ -228,10 +230,37 @@ class RequestLedger:
     def pending(self) -> list[CredentialRequest]:
         return [r for r in self._items.values() if r.state == "pending"]
 
-    def settle(self, request_id: str, *, state: str, index: int | None = None,
-               version: int | None = None, detail: str = "") -> None:
+    def claim(self, request_id: str) -> bool:
+        """Atomically take a pending request for processing (pending → in_flight).
+
+        Synchronous on purpose: on single-threaded asyncio nothing can interleave
+        between the read and the write, so of several coroutines racing on the
+        same reply exactly one gets ``True``. A check-then-await would let all
+        of them through.
+        """
         req = self._items.get(request_id)
         if req is None or req.state != "pending":
+            return False
+        req.state = "in_flight"
+        self._save()
+        return True
+
+    def release(self, request_id: str) -> None:
+        """Give a claim back (in_flight → pending). The ONE transition back, for a
+        reply the server is not ready to honour yet (version behind): the request
+        stays open so the next sighting of the reply retries. ``failed`` never
+        comes back through here."""
+        req = self._items.get(request_id)
+        if req is not None and req.state == "in_flight":
+            req.state = "pending"
+            self._save()
+
+    def settle(self, request_id: str, *, state: str, index: int | None = None,
+               version: int | None = None, detail: str = "") -> None:
+        """Finish a claimed request as ``placed`` or ``failed``. Never back to pending."""
+        assert state in ("placed", "failed"), state
+        req = self._items.get(request_id)
+        if req is None or req.state not in ("pending", "in_flight"):
             return
         req.state, req.index, req.version, req.detail = state, index, version, detail
         self._save()
@@ -389,6 +418,13 @@ async def handle_filed_replies(
     del harness  # reserved: placement is type-keyed today
     outcomes: list[FiledOutcome] = []
     for item in items:
+        # Three paths feed this (turn scan, arrival hook, boot sweep) and all
+        # must hand over the store's own row type. A different class would make
+        # every getattr below answer "" and skip silently — the #247 inert-
+        # feature failure — so an unexpected type is logged, not ignored.
+        if not _is_stored_row(item):
+            logger.warning("credential replies: unexpected row type %s; skipping", type(item).__name__)
+            continue
         if getattr(item, "envelope_kind", "") != "dm":
             continue
         if getattr(item, "sender_slug", "") != owner_slug:
@@ -398,7 +434,8 @@ async def handle_filed_replies(
             continue
         rid = filed["request_id"]
         req = ledger.get(rid)
-        if req is None or req.state != "pending":
+        # CLAIM before the first await: the loser of a race sees in_flight.
+        if req is None or not ledger.claim(rid):
             outcomes.append(FiledOutcome(rid, "ignored", "unknown or already consumed request_id"))
             continue
         if req.type != filed["type"]:
@@ -413,6 +450,8 @@ async def handle_filed_replies(
         if isinstance(got, FiledOutcome):
             if got.state == "failed":
                 ledger.settle(rid, state="failed", detail=got.detail)
+            else:
+                ledger.release(rid)  # transient (server behind): keep it open for a retry
             outcomes.append(FiledOutcome(rid, got.state, got.detail))
             continue
         outcomes.append(
@@ -487,6 +526,50 @@ def _place_and_settle(
         logger.warning("agent %s: could not request provider reload: %s", agent_id, exc)
     return FiledOutcome(rid, "placed")
 
+async def sweep_stored_replies(
+    store: Any,
+    *,
+    owner_slug: str,
+    ledger: RequestLedger,
+    credentials: Any,
+    agent_dir: Path,
+    workspace: Path,
+    harness: str,
+    agent_id: str = "",
+    limit: int = 200,
+) -> list[FiledOutcome]:
+    """At boot: act on owner replies that were STORED before this process
+    existed — a reply that landed while the agent was paused, or one an
+    older build admitted to a turn without acting on it.
+
+    Bounded (the newest ``limit`` DMs with the owner) and idempotent (the
+    ledger consumes a request once, so a second boot is a no-op). Funnels
+    into :func:`handle_filed_replies`, so the owner / DM / list-confirm /
+    version-floor chain is the same one seam. Skipped entirely when nothing is
+    pending, so a settled agent costs no query.
+    """
+    pending = ledger.pending()
+    if not pending:
+        return []
+    # Bounded in TIME as well as count: only DMs that arrived after the oldest
+    # pending request was issued can answer it (a minute of clock slack).
+    floor_ms = (min(r.issued_at for r in pending) - 60) * 1000
+    try:
+        rows = [r for r in await store.get_dm_history(owner_slug, limit=limit)
+                if int(getattr(r, "received_at", 0) or 0) >= floor_ms]
+    except Exception as exc:  # noqa: BLE001 — fail open, like every boot step
+        logger.info("agent %s: credential reply sweep skipped: %s", agent_id, type(exc).__name__)
+        return []
+    outcomes = await handle_filed_replies(
+        rows, owner_slug=owner_slug, ledger=ledger, credentials=credentials,
+        agent_dir=agent_dir, workspace=workspace, harness=harness, agent_id=agent_id,
+    )
+    if outcomes:
+        logger.info("agent %s: credential reply sweep: %s", agent_id,
+                    ", ".join(f"{o.request_id[:8]}={o.state}" for o in outcomes))
+    return outcomes
+
+
 def _forget(credentials: Any, credential_type: str, index: int) -> None:
     """Bypass the reader's cache for one credential, whichever reader it is.
 
@@ -502,10 +585,25 @@ def _forget(credentials: Any, credential_type: str, index: int) -> None:
         invalidate(lambda c: c.type == credential_type and c.index == index)
 
 
+def _is_stored_row(item: Any) -> bool:
+    """The store's row type, or a duck close enough to carry the three fields
+    the chain reads. Tests use plain namespaces; production passes StoredMessage."""
+    try:
+        from ..agent.message_store_models import StoredMessage
+
+        if isinstance(item, StoredMessage):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return all(hasattr(item, a) for a in ("envelope_kind", "sender_slug", "content"))
+
+
 def status_line(req: CredentialRequest | None) -> str:
     """What the model is told. Never the value."""
     if req is None:
         return "unknown request_id"
+    if req.state == "in_flight":
+        return f"pending: placing {req.type} now"
     if req.state == "placed":
         return (
             f"placed {req.type} #{req.index} v{req.version}; "
