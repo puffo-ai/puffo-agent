@@ -12,6 +12,7 @@ from typing import Any, Optional
 import aiosqlite
 
 from ..portal.state import home_dir
+from ..tasks import spawn
 from . import message_store_models as _models
 from .inbox_store import InboxStoreMixin
 from .processing_receipts import (
@@ -604,7 +605,9 @@ class MessageStore(
             except Exception:  # noqa: BLE001 - an observer must never break delivery
                 logger.exception("on_receipt_stored failed (envelope_id=%s)", envelope_id)
 
-        task = asyncio.get_running_loop().create_task(_run(), name="store.on_receipt_stored")
+        # The tree's tracked spawn (a task that dies unclaimed logs instead of
+        # vanishing); its registry is weak, so the strong reference stays here.
+        task = spawn(_run(), name="store.on_receipt_stored")
         self.observer_tasks.add(task)
         task.add_done_callback(self.observer_tasks.discard)
 
