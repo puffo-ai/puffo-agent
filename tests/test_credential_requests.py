@@ -545,7 +545,7 @@ async def test_claim_makes_consume_once_a_race_safe_claim_not_a_check(env):
     b = asyncio.create_task(_run(env, [item], creds))
     await asyncio.sleep(0); await asyncio.sleep(0)
     assert env.ledger.get(env.req.request_id).state == "in_flight"
-    assert cr.status_line(env.ledger.get(env.req.request_id)).startswith("pending: placing")
+    assert cr.status_line(env.ledger.get(env.req.request_id)).startswith("placing")
     gate.set()
     ra, rb = await a, await b
     # the winner places; the loser either saw in_flight ("ignored") or, having
@@ -697,3 +697,91 @@ async def test_sweep_fails_open_when_the_store_cannot_be_read(env):
         async def get_dm_history(self, *a, **k): raise RuntimeError("db")
     assert await _sweep(env, Broken(), FakeCredentials(listed=[0], held=_held())) == []
     assert env.ledger.get(env.req.request_id).state == "pending"
+
+
+# ── the file, not the object, is the ledger ──────────────────────────────────
+#
+# Staging 2026-10-06, Desk: the worker cached a RequestLedger built at BOOT
+# (file absent → empty). The MCP tool handler built its OWN instance at
+# 02:15:30Z and issued b081f515. The receipt arrived at 02:16:35Z, the arrival
+# hook asked the worker's cached ledger, saw nothing pending, and returned
+# silently. Nothing was placed and nothing was logged.
+
+
+@pytest.mark.asyncio
+async def test_a_request_issued_by_another_instance_is_seen_by_the_handler(tmp_path, caplog, monkeypatch):
+    """The exact staging interleaving: the worker takes its ledger at BOOT (file
+    absent), the tool handler issues later, the receipt arrives. Both must be the
+    same instance or the receipt is dropped."""
+    monkeypatch.setattr(cr, "_LEDGERS", {})
+    path = tmp_path / "credential_requests.json"
+    worker_side = cr.ledger_for(path)             # taken at boot, file absent
+    assert worker_side.pending() == []
+    tool_side = cr.ledger_for(path)               # the MCP tool handler's
+    req = tool_side.issue(credential_type=cr.TYPE_CUSTOMIZED, reason="r", alias="YOUTUBE_API_KEY")
+
+    creds = FakeCredentials(listed=[0], held=_held(ctype=cr.TYPE_CUSTOMIZED))
+    with caplog.at_level(logging.INFO):
+        out = await cr.handle_filed_replies(
+            [_dm(OWNER, _filed(req.request_id, cr.TYPE_CUSTOMIZED))],
+            owner_slug=OWNER, ledger=worker_side, credentials=creds,
+            agent_dir=tmp_path, workspace=tmp_path, harness="claude-code", agent_id="a1",
+        )
+    assert [o.state for o in out] == ["placed"], "the worker's ledger must see the tool's request"
+    assert worker_side.get(req.request_id).state == "placed"
+    assert cr.RequestLedger(path).get(req.request_id).state == "placed"  # and it is on disk
+    assert cr.customized_env(tmp_path) == {"YOUTUBE_API_KEY": SECRET.decode()}
+    assert "placed" in caplog.text and SECRET.decode() not in caplog.text
+
+
+def test_two_handles_to_one_file_cannot_both_claim(tmp_path, monkeypatch):
+    """The race reload-on-read would have reopened. claim() is atomic only
+    because ONE instance does check → flip → save; two instances that each hold
+    the pending row can both pass. ledger_for keeps it one instance."""
+    monkeypatch.setattr(cr, "_LEDGERS", {})
+    path = tmp_path / "l.json"
+    tool = cr.ledger_for(path)
+    req = tool.issue(credential_type=cr.TYPE_CUSTOMIZED, reason="r", alias="X")
+    # the arrival hook and the boot sweep, both obtained AFTER the request exists
+    h1, h2 = cr.ledger_for(path), cr.ledger_for(path)
+    assert h1 is h2 is tool, "one ledger per file per process"
+    assert sorted([h1.claim(req.request_id), h2.claim(req.request_id)]) == [False, True]
+    assert cr.RequestLedger(path).get(req.request_id).state == "in_flight"
+
+
+def test_ledger_for_is_per_resolved_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(cr, "_LEDGERS", {})
+    a = cr.ledger_for(tmp_path / "l.json")
+    b = cr.ledger_for(tmp_path / "sub" / ".." / "l.json")  # same file, different spelling
+    assert a is b
+    assert cr.ledger_for(tmp_path / "other.json") is not a
+
+
+@pytest.mark.asyncio
+async def test_a_filed_fence_with_nothing_pending_logs_the_signature(tmp_path, caplog):
+    """The impossible combination: an owner DM carrying a filed fence while the
+    ledger reports nothing pending. That is this bug's one-line signature, so the
+    fast exit must not be silent."""
+    rid = str(uuid.uuid4())
+    with caplog.at_level(logging.WARNING):
+        out = await cr.handle_filed_replies(
+            [_dm(OWNER, _filed(rid, cr.TYPE_CUSTOMIZED))],
+            owner_slug=OWNER, ledger=cr.RequestLedger(tmp_path / "empty.json"),
+            credentials=FakeCredentials(), agent_dir=tmp_path, workspace=tmp_path,
+            harness="claude-code", agent_id="a1",
+        )
+    assert out == []
+    assert "nothing pending" in caplog.text and rid in caplog.text and "ledger_for" in caplog.text
+
+
+def test_the_pending_status_never_invites_a_resubmission():
+    """Twice on staging an agent read "pending" as "the filing failed" and asked
+    the owner to submit again. The text must forbid that explicitly."""
+    pending = cr.CredentialRequest(request_id="x", type=cr.TYPE_CHATGPT, reason="r")
+    line = cr.status_line(pending)
+    assert line.startswith("pending: waiting for the owner")
+    assert "may already have filed" in line and "does NOT mean it failed" in line
+    assert "do NOT ask them to submit it again" in line
+    in_flight = cr.status_line(cr.CredentialRequest(request_id="x", type=cr.TYPE_CHATGPT, reason="r", state="in_flight"))
+    assert in_flight.startswith("placing") and "HAS already filed" in in_flight
+    assert "Do NOT ask them to submit it again" in in_flight

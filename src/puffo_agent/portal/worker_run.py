@@ -688,13 +688,13 @@ class StandardWorkerRun:
                         paths.agent_id, type(exc).__name__)
 
     def _credential_kwargs(self, paths: WorkerRunPaths) -> dict[str, Any]:
-        from .credential_requests import RequestLedger
+        from .credential_requests import ledger_for
 
         worker = self.worker
-        ledger = getattr(worker, "_credential_ledger", None)
-        if ledger is None:
-            ledger = RequestLedger(agent_dir(paths.agent_id) / "credential_requests.json")
-            worker._credential_ledger = ledger
+        # The process-wide instance, SHARED with the MCP tool handler that issues
+        # requests. A per-worker copy could not see them (staging 2026-10-06).
+        ledger = ledger_for(agent_dir(paths.agent_id) / "credential_requests.json")
+        worker._credential_ledger = ledger
         return dict(
             owner_slug=worker.agent_cfg.puffo_core.operator_slug,
             ledger=ledger,
@@ -735,27 +735,14 @@ class StandardWorkerRun:
     async def _handle_credential_replies(self, context: WorkerRunContext, planned) -> None:
         """Act on the owner's ``puffo-credential-filed`` replies in this batch
         BEFORE the model sees it. Never raises."""
-        from .credential_requests import RequestLedger, handle_filed_replies
+        from .credential_requests import handle_filed_replies
 
         worker = self.worker
         items = getattr(planned, "items", None) or ()
         if not items:
             return
         try:
-            ledger = getattr(worker, "_credential_ledger", None)
-            if ledger is None:
-                ledger = RequestLedger(agent_dir(context.paths.agent_id) / "credential_requests.json")
-                worker._credential_ledger = ledger
-            await handle_filed_replies(
-                items,
-                owner_slug=worker.agent_cfg.puffo_core.operator_slug,
-                ledger=ledger,
-                credentials=getattr(worker, "_credentials", None),
-                agent_dir=agent_dir(context.paths.agent_id),
-                workspace=Path(context.paths.workspace_path),
-                harness=context.paths.effective_harness,
-                agent_id=context.paths.agent_id,
-            )
+            await handle_filed_replies(items, **self._credential_kwargs(context.paths))
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: credential reply handling failed: %s",
                            context.paths.agent_id, type(exc).__name__)
