@@ -108,9 +108,17 @@ def _register_credential_request(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def credential_status(request_id: str) -> str:
-        """Where a ``request_credential`` stands: ``pending``, ``placed <type>
-        #<index> v<version>; restarting my CLI to pick it up``, or
-        ``failed: <reason>``. Never contains the value."""
+        """Where a ``request_credential`` stands: pending, ``placed <type>
+        #<index> v<version>``, or ``failed: <reason>``. Never contains the value.
+
+        **``pending`` does NOT mean the owner failed to file it.** Filing is
+        asynchronous: the owner submits through the secure form, the value is
+        encrypted and filed through the credentials API, and only then does it
+        reach you. Until it does, the one thing you may tell the owner is that
+        it has not arrived on your side yet. Never say the filing failed, and
+        never ask them to fill the form or paste the value again — a second
+        submission creates a duplicate credential and may cost them a rotation.
+        Check again instead, and say ``placed`` only when this tool says so."""
         if cfg.rpc_client is None:
             raise RuntimeError(
                 "credential_status unavailable — PUFFO_RPC_URL not set "

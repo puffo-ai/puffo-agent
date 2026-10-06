@@ -180,12 +180,49 @@ class CredentialRequest:
         }
 
 
+#: One ledger per file per PROCESS. The MCP tool handler (which issues) and the
+#: worker (arrival hook, boot sweep, turn scan) both run inside the daemon, so
+#: two in-memory copies of one file was the whole defect: the worker's copy was
+#: built at boot before any request existed and never saw what the tool wrote
+#: (staging 2026-10-06 — Desk's receipt landed 65 s after the ask and was
+#: silently dropped). Sharing the instance also keeps ``claim`` atomic for free.
+#: A second PROCESS (a CLI run against the same file) is out of this registry's
+#: reach and would need flock; nothing does that today.
+_LEDGERS: dict[Path, RequestLedger] = {}
+
+
+def ledger_for(path: Path) -> RequestLedger:
+    """The process-wide ledger for ``path``. Always use this, never the class."""
+    key = Path(path).resolve()
+    existing = _LEDGERS.get(key)
+    if existing is None:
+        existing = RequestLedger(key)
+        _LEDGERS[key] = existing
+    return existing
+
+
 class RequestLedger:
     """Requests this agent issued, persisted under ``agent_dir`` at 0600.
 
     Persisted because the owner answers on their own time — a daemon restart
     between the ask and the reply must not orphan the reply. Holds NO secret;
     it is the request_id → type binding the untrusted reply is checked against.
+
+    **THE FILE, NOT THIS OBJECT, IS THE LEDGER.** Two instances exist by design
+    and in different processes' call stacks: the MCP tool handler builds one per
+    call to issue a request, and the worker caches one for the arrival hook and
+    the boot sweep. An instance that trusted its constructor-time snapshot could
+    not see a request the other had issued — which is exactly what happened on
+    staging 2026-10-06: the worker's ledger was built at boot before any request
+    existed, the tool wrote one at 02:15:30Z, and the receipt at 02:16:35Z found
+    an empty in-memory ledger and was silently dropped.
+
+    The fix is the INSTANCE COUNT, not staleness: use :func:`ledger_for`, which
+    keeps one instance per resolved path per process, so ``_items`` is shared
+    and there is nothing to go stale. Reloading on every read would have worked
+    for staleness and REOPENED the race #456 closed — ``claim`` is atomic only
+    because one instance does check → flip → save with no await between; two
+    instances that each reload and then save can both claim the same request.
     """
 
     def __init__(self, path: Path) -> None:
@@ -431,7 +468,24 @@ async def handle_filed_replies(
     del harness  # reserved: placement is type-keyed today
     outcomes: list[FiledOutcome] = []
     if not ledger.pending():
-        return outcomes  # no open request: an owner DM costs nothing here
+        # Cheap exit for the normal case. But an owner DM carrying a filed fence
+        # while the ledger reports nothing pending cannot happen in normal
+        # operation — it is the one-line signature of the ledger-instance bug
+        # (staging 2026-10-06), so say so rather than return in silence.
+        for item in items:
+            if (
+                _is_stored_row(item)
+                and getattr(item, "envelope_kind", "") == "dm"
+                and getattr(item, "sender_slug", "") == owner_slug
+            ):
+                filed = parse_filed_reply(message_text(getattr(item, "content", "")))
+                if filed is not None:
+                    logger.warning(
+                        "agent %s: owner filed %s (request %s) but this ledger has nothing pending — "
+                        "the request was issued against a different ledger instance; see ledger_for",
+                        agent_id, filed["type"], filed["request_id"],
+                    )
+        return outcomes
     for item in items:
         # Three paths feed this (turn scan, arrival hook, boot sweep) and all
         # must hand over the store's own row type. A different class would make
@@ -666,7 +720,10 @@ def status_line(req: CredentialRequest | None) -> str:
     if req is None:
         return "unknown request_id"
     if req.state == "in_flight":
-        return f"pending: placing {req.type} now"
+        return (
+            f"placing {req.type} now — the owner HAS already filed it and I am putting it in place. "
+            "Do NOT ask them to submit it again; check again in a moment."
+        )
     if req.state == "placed":
         return (
             f"placed {req.type} #{req.index} v{req.version}; "
@@ -674,7 +731,15 @@ def status_line(req: CredentialRequest | None) -> str:
         )
     if req.state == "failed":
         return f"failed: {req.detail}"
-    return f"pending: waiting for the owner to file {req.type}"
+    # Said carefully: twice on staging an agent read "pending" as "the filing
+    # failed" and asked the owner to submit the credential a second time. The
+    # only thing this state licenses is a statement about OUR side.
+    return (
+        f"pending: waiting for the owner's reply about {req.type}. They may already have filed it — "
+        "filing is asynchronous and I only see it once it reaches me, so this does NOT mean it "
+        "failed. Do NOT tell the owner it failed and do NOT ask them to submit it again; wait and "
+        "check again."
+    )
 
 
 # ── boot reconcile ───────────────────────────────────────────────────────────
