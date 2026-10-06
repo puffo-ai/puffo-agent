@@ -573,7 +573,7 @@ async def sweep_stored_replies(
     # cannot push the receipt past a single page. Hard cap: `max_pages` pages.
     floor_ms = (min(r.issued_at for r in pending) - 60) * 1000
     try:
-        rows = await _dm_rows_since(store, owner_slug, floor_ms, page=limit, max_pages=20)
+        rows = await _dm_rows_since(store, owner_slug, floor_ms, page=limit, max_pages=20, agent_id=agent_id)
     except Exception as exc:  # noqa: BLE001 — fail open, like every boot step
         logger.info("agent %s: credential reply sweep skipped: %s", agent_id, type(exc).__name__)
         return []
@@ -587,15 +587,33 @@ async def sweep_stored_replies(
     return outcomes
 
 
-async def _dm_rows_since(store: Any, peer: str, floor_ms: int, *, page: int, max_pages: int) -> list[Any]:
-    """Owner DMs received at or after ``floor_ms``, paging backward through the
-    store's newest-first keyset until the floor (or the cap) is reached."""
+async def _dm_rows_since(store: Any, peer: str, floor_ms: int, *, page: int, max_pages: int,
+                         agent_id: str = "") -> list[Any]:
+    """Owner DMs received at or after ``floor_ms``, paging backward in time
+    through the store's ``sent_at`` keyset until the floor (or the cap).
+
+    The store SELECTs ``sent_at DESC`` and then hands the page back
+    OLDEST-FIRST (``message_store.py`` ``selected_oldest_first``), so the next
+    cursor is the row with the smallest ``(sent_at, envelope_id)`` — chosen
+    explicitly rather than by position, so a change in page order cannot turn
+    this into a one-row-per-page crawl. The floor compares ``received_at`` while
+    the keyset pages on ``sent_at``; the caller's 60 s slack covers that skew.
+    """
     out: list[Any] = []
     before: str | None = None
+    seen: set[str] = set()
+    scanned = 0
     for _ in range(max_pages):
         batch = await store.get_dm_history(peer, limit=page, before_envelope_id=before)
         if not batch:
-            break
+            return out
+        ids = {getattr(r, "envelope_id", "") for r in batch}
+        if ids & seen:
+            # A cursor that did not move would re-serve rows: stop rather than crawl.
+            logger.warning("agent %s: credential reply sweep: page overlapped the previous page; stopping", agent_id)
+            return out
+        seen |= ids
+        scanned += len(batch)
         hit_floor = False
         for r in batch:
             if int(getattr(r, "received_at", 0) or 0) >= floor_ms:
@@ -603,10 +621,15 @@ async def _dm_rows_since(store: Any, peer: str, floor_ms: int, *, page: int, max
             else:
                 hit_floor = True
         if hit_floor or len(batch) < page:
-            break
-        before = getattr(batch[-1], "envelope_id", None)
+            return out
+        oldest = min(batch, key=lambda r: (int(getattr(r, "sent_at", 0) or 0), str(getattr(r, "envelope_id", ""))))
+        before = getattr(oldest, "envelope_id", None)
         if not before:
-            break
+            return out
+    # Exhausted the cap with neither the floor nor a short page in sight: say so,
+    # or this looks exactly like "nothing to sweep".
+    logger.warning("agent %s: credential reply sweep: scanned %d owner DMs over %d pages without reaching "
+                   "the time floor; the receipt may be older than the scan", agent_id, scanned, max_pages)
     return out
 
 

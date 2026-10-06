@@ -586,15 +586,20 @@ class FakeStore:
     """Newest-first keyset paging like the real store (before_envelope_id)."""
 
     def __init__(self, rows):
-        self.rows = sorted(rows, key=lambda r: -r.received_at); self.calls = 0
+        self.rows = sorted(rows, key=lambda r: -r.sent_at); self.calls = 0  # newest first, like the SELECT
+        self.pages: list[set] = []
 
     async def get_dm_history(self, peer, limit=50, before_envelope_id=None):
+        """Mirrors production: SELECT sent_at DESC, keyset on before_envelope_id,
+        then the page is returned OLDEST-FIRST (message_store.py selected_oldest_first)."""
         self.calls += 1
         rows = self.rows
         if before_envelope_id is not None:
             idx = next(i for i, r in enumerate(rows) if r.envelope_id == before_envelope_id)
             rows = rows[idx + 1:]
-        return rows[:limit]
+        page = list(reversed(rows[:limit]))
+        self.pages.append({r.envelope_id for r in page})
+        return page
 
 
 _rown = [0]
@@ -603,7 +608,7 @@ _rown = [0]
 def _row(sender, text, received_at_ms, kind="dm"):
     _rown[0] += 1
     return SimpleNamespace(envelope_id=f"msg_{_rown[0]}", envelope_kind=kind, sender_slug=sender,
-                           content={"text": text}, received_at=received_at_ms)
+                           content={"text": text}, received_at=received_at_ms, sent_at=received_at_ms - 5)
 
 
 async def _sweep(env, store, creds):
@@ -645,7 +650,20 @@ async def test_sweep_finds_a_receipt_buried_under_newer_owner_chatter(env):
     store = FakeStore(chatter + [receipt])
     out = await _sweep(env, store, creds)
     assert [o.state for o in out] == ["placed"]
-    assert store.calls >= 3  # paged past two full pages of 200
+    assert store.calls == 3  # two full pages of 200, then the page holding the receipt
+    # consecutive pages are disjoint: the cursor moved a whole page, not one row
+    for a, b in zip(store.pages, store.pages[1:]):
+        assert not (a & b)
+
+
+@pytest.mark.asyncio
+async def test_sweep_warns_instead_of_silently_giving_up_when_the_cap_is_hit(env, caplog):
+    now_ms = int(time.time() * 1000)
+    creds = FakeCredentials(listed=[0], held=_held())
+    store = FakeStore([_row(OWNER, f"hi {i}", now_ms + 1000 + i) for i in range(5000)])  # all newer than the floor
+    with caplog.at_level(logging.WARNING):
+        assert await _sweep(env, store, creds) == []
+    assert "without reaching the time floor" in caplog.text and "4000 owner DMs" in caplog.text
 
 
 @pytest.mark.asyncio
