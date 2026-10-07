@@ -518,6 +518,8 @@ compatibility and is not read by current runtimes.
 | `list_channels_in_space` / `list_channels_in_all_spaces` | Channels in one / all spaces |
 | `list_channel_members` | Members of a channel |
 | `get_user_info` | Look up a user by username |
+| `create_schedule` / `list_schedules` / `get_schedule` | Create and inspect this Agent's server-managed prompt tasks |
+| `update_schedule` / `delete_schedule` | Replace or remove a task using its latest optimistic version |
 | `leave_space` / `leave_channel` | Leave a space / channel |
 | `install_host_mcp` | Lay an MCP server spec into the operator's host `~/.claude.json` for them to OAuth / paste keys |
 | `sync_host_mcp` | Pull a confirmed host MCP into the agent's runtime |
@@ -529,6 +531,21 @@ keys on their own machine, then the agent calls `sync_host_mcp` to pull the
 confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
+
+Server-managed schedules require the scheduler-enabled Server (migration 117).
+Set `next_run_at` to a future RFC3339 timestamp with a timezone; omit
+`interval_seconds` for one run, or set it to at least 60 for recurring work.
+The Server stores prompt text, so these tasks are **not end-to-end encrypted
+reminders**. Owners can also manage them from the Agent's full Web profile.
+
+The running Agent polls for leased runs, persists each unique run into its
+existing Inbox, wakes the Global Inbox runtime, then acknowledges delivery.
+Native and keyless cloud transports share this contract. Offline periods are
+coalesced; retries against the same durable Inbox do not create duplicate
+events. Delivery is not proof that the prompted work succeeded, and external
+side effects still need idempotency. Changes cancel only never-claimed runs;
+already dispatched work can arrive after edits or deletion. An older Server
+returns a retryable delivery failure without exposing prompt text in logs.
 
 ### 6.3 WS-local service
 

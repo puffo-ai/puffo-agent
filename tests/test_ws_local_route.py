@@ -23,6 +23,25 @@ from puffo_agent.portal.ws_local.route import serve_attached
 ROOT_KEY = b"r" * 32
 
 
+@pytest.mark.asyncio
+async def test_external_inbox_owner_does_not_start_a_second_schedule_consumer():
+    """A non-owning WS attachment must neither claim tasks nor leak heartbeat work."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    async def heartbeat():
+        await asyncio.Future()
+
+    client = SimpleNamespace(listen=AsyncMock())
+    reporter = SimpleNamespace(run_heartbeat_loop=heartbeat, stop=Mock())
+    point = SimpleNamespace(client=client, reporter=reporter)
+    hub = SimpleNamespace(get=lambda slug: point)
+    callback = AsyncMock()
+    await route_mod._start_ws_consumer(hub, {}, SimpleNamespace(slug="agent"), callback)
+    client.listen.assert_awaited_once_with(callback)
+    reporter.stop.assert_called_once()
+
+
 class FakeTransport:
     def __init__(self) -> None:
         self._inbound: asyncio.Queue = asyncio.Queue()

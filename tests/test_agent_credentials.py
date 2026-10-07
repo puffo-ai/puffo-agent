@@ -480,7 +480,8 @@ def _services_run(server, *, owner=OWNER):
         await asyncio.Event().wait()
 
     reporter = NS(run_heartbeat_loop=forever, stop=lambda: None)
-    global_runtime = NS(run=forever, stop=lambda: None)
+    global_runtime = NS(run=forever, stop=lambda: None, notify=lambda: None)
+    context.client.store = NS()
     run._build_runtime_event_uploader = lambda ctx: None
     run._build_reporter = lambda client: reporter
     run._build_global_runtime = lambda ctx, **kw: global_runtime
@@ -524,6 +525,7 @@ async def test_shutdown_does_not_wait_for_a_registration_that_is_still_retrying(
     assert not services.credential_key_task.done()
     await asyncio.wait_for(run._cleanup(context, services), timeout=5)
     assert services.credential_key_task.cancelled()
+    assert services.schedule_task.cancelled()
 
 
 @pytest.mark.asyncio

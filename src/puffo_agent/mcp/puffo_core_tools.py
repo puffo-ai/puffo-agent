@@ -736,9 +736,11 @@ def register_core_tools(
     from .core_message_tools import register_message_tools
     from .core_monid_tools import register_monid_tools
     from .core_note_tools import register_note_tools
+    from .core_schedule_tools import register_schedule_tools
 
     register_inbox_tools(mcp, cfg, result_surface=result_surface)
     register_identity_tools(mcp, cfg)
+    register_schedule_tools(mcp, cfg)
     register_message_tools(mcp, cfg, result_surface=result_surface)
     register_history_tools(mcp, cfg)
     register_note_tools(mcp, cfg, result_surface=result_surface)
