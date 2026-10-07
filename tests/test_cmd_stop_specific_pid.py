@@ -31,8 +31,8 @@ class TestCmdStopOriginalPid:
              patch("puffo_agent.portal.cli.clear_stop_request") as clear_stop:
             rc = cli.cmd_stop(_args())
         assert rc == 0
-        clear.assert_called_once_with(expected_pid=1234)
-        clear_stop.assert_called_once_with(expected_pid=1234)
+        clear.assert_called_once_with(expected_pid=1234, identity=None)
+        clear_stop.assert_not_called()
         assert "stale pid" in capsys.readouterr().out
 
     def test_daemon_stops_within_timeout(self, capsys):
@@ -42,15 +42,15 @@ class TestCmdStopOriginalPid:
         with patch("puffo_agent.portal.cli.read_daemon_pid", side_effect=[1234, 1234]), \
              patch(
                 "puffo_agent.portal.cli.is_pid_alive",
-                side_effect=lambda pid: next(alive_calls),
+                side_effect=lambda pid, **kw: next(alive_calls),
             ), \
              patch("puffo_agent.portal.cli.write_stop_request") as write_stop, \
              patch("puffo_agent.portal.cli.clear_stop_request") as clear_stop, \
              patch("puffo_agent.portal.cli.time.sleep"):
             rc = cli.cmd_stop(_args(timeout=5))
         assert rc == 0
-        write_stop.assert_called_once_with(1234)
-        clear_stop.assert_called_once_with(expected_pid=1234)
+        write_stop.assert_called_once_with(1234, identity=None)
+        clear_stop.assert_called_once_with(expected_pid=1234, identity=None)
         out = capsys.readouterr().out
         assert "daemon stopped" in out
         # No "new daemon" surface — same pid throughout.
@@ -69,7 +69,7 @@ class TestCmdStopOriginalPid:
 
         # is_pid_alive returns True for original on entry, False once
         # the swap happens; True for new_pid when we check it post-swap.
-        def pid_alive(pid):
+        def pid_alive(pid, **kw):
             if pid == original_pid:
                 # First call (initial check): alive. Second (poll): dead.
                 return next(alive_iter)
@@ -107,7 +107,7 @@ class TestCmdStopOriginalPid:
         original_pid = 1234
         bogus_new_pid = 9999  # written to pid file but not alive
 
-        def pid_alive(pid):
+        def pid_alive(pid, **kw):
             if pid == original_pid:
                 return next(alive_iter)
             if pid == bogus_new_pid:

@@ -735,10 +735,13 @@ async def credential_status(ctx: HostMcpContext, *, request_id: str = "") -> str
 
 
 def _ledger(ctx: HostMcpContext):
-    from .credential_requests import RequestLedger
+    """The process-wide ledger — never a fresh instance. Two in-memory copies of
+    one file is what silently dropped Desk's filed credential (2026-10-06): the
+    worker's copy was built at boot and never saw what this handler issued."""
+    from .credential_requests import ledger_for
     from .state import agent_dir
 
-    return RequestLedger(agent_dir(ctx.agent_id) / "credential_requests.json")
+    return ledger_for(agent_dir(ctx.agent_id) / "credential_requests.json")
 
 
 async def stage_model_visible_read(

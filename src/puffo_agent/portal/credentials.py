@@ -109,6 +109,17 @@ class AgentCredentials:
             if item["type"] == credential_type and item["state"] == "ACTIVATED"
         )
 
+    async def held_all(self) -> list[dict]:
+        """Every ACTIVATED credential this agent holds, unfiltered — the boot
+        reconcile's source of truth (see ``credential_requests``)."""
+        data = await self._http.get("/v2/credentials")
+        return [
+            {"type": item["type"], "index": item["index"],
+             "version": item["version"], "alias": item.get("alias") or ""}
+            for item in data.get("credentials", [])
+            if item.get("state") == "ACTIVATED"
+        ]
+
     async def reconcile(self) -> None:
         """Drop everything the server no longer lists as held and current.
 

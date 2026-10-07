@@ -86,6 +86,20 @@ class CloudAgentCredentials:
         self._key_version = version
         return self._kem, version
 
+    async def ensure_registered(self) -> int:
+        """Make sure this agent HAS a credential key on the server; returns its version.
+
+        puffo-server registers a cloud agent's key eagerly at claim, or on the
+        agent's first POST to ``credential-kem-secret`` (#434: "boot once —
+        registers the key"). An agent claimed before that existed has neither,
+        and the owner cannot file a credential to an agent with no key. The
+        reconcile's list-first order never reaches the POST on an empty list,
+        so without this call a pre-#437 agent is stuck: no key → nothing to
+        file → empty list → no POST → no key. One POST, cached thereafter.
+        """
+        _, version = await self._ensure_kem()
+        return version
+
     async def get(self, credential_type: str, index: int) -> HeldCredential | None:
         """The current value, from memory or the server. None = not usable now."""
         cached = self._find(credential_type, index)
@@ -126,6 +140,22 @@ class CloudAgentCredentials:
             for item in data["credentials"]
             if item["type"] == credential_type and item["state"] == "ACTIVATED"
         )
+
+    async def held_all(self) -> list[dict]:
+        """Every ACTIVATED credential this agent holds, unfiltered.
+
+        ``{type, index, version, alias}`` per row. The boot reconcile needs the
+        whole list, not one type: a CUSTOMIZED grant is invisible to a per-type
+        ask, which is how a filed credential survived a rebuild server-side and
+        was never placed (staging 2026-10-06, issue #457).
+        """
+        data = await self._http.get_unsigned(_LIST_ROUTE)
+        return [
+            {"type": item["type"], "index": item["index"],
+             "version": item["version"], "alias": item.get("alias") or ""}
+            for item in data.get("credentials", [])
+            if item.get("state") == "ACTIVATED"
+        ]
 
     async def _open(self, data: dict, credential_type: str, index: int) -> HeldCredential:
         """Open as the credential ASKED FOR, or refuse — ids and AAD come from

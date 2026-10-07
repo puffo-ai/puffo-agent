@@ -41,6 +41,7 @@ def agent_dir(tmp_path, monkeypatch):
 
     d = tmp_path / "agents"
     monkeypatch.setattr(state, "agent_dir", lambda agent_id: d / agent_id)
+    monkeypatch.setattr(cr, "_LEDGERS", {})  # a fresh registry per test
     monkeypatch.setattr("puffo_agent.macos.keychain.is_macos", lambda: False)
     return d / "agent_test"
 
@@ -110,7 +111,9 @@ async def test_status_reports_the_ledger_and_never_a_value(tmp_path, agent_dir):
     result = await host_mcp_handler.request_credential(ctx, type=cr.TYPE_CHATGPT, reason="r")
     rid = result.split("request_id ")[1].split(")")[0]
     assert (await host_mcp_handler.credential_status(ctx, request_id=rid)).startswith("pending")
-    cr.RequestLedger(agent_dir / "credential_requests.json").settle(rid, state="placed", index=0, version=4)
+    # ledger_for, not a fresh instance: the handler reads the process-wide one,
+    # and a second in-memory copy is the bug this registry exists to prevent.
+    cr.ledger_for(agent_dir / "credential_requests.json").settle(rid, state="placed", index=0, version=4)
     assert await host_mcp_handler.credential_status(ctx, request_id=rid) == (
         f"placed {cr.TYPE_CHATGPT} #0 v4; restarting my CLI to pick it up"
     )

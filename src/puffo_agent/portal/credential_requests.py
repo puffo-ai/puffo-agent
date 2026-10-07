@@ -157,8 +157,10 @@ class CredentialRequest:
     reason: str
     alias: str = ""
     issued_at: int = 0
-    #: ``pending`` → ``placed`` | ``failed``. Set once; a consumed request
-    #: never goes back to pending, so a replayed reply does nothing.
+    #: ``pending`` → ``in_flight`` → ``placed`` | ``failed``. ``in_flight`` is a
+    #: CLAIM taken synchronously before the first await, so two coroutines that
+    #: see the same reply (arrival hook, boot sweep, turn scan) cannot both
+    #: place it. A request never returns to ``pending``; ``failed`` is terminal.
     state: str = "pending"
     index: int | None = None
     version: int | None = None
@@ -178,12 +180,49 @@ class CredentialRequest:
         }
 
 
+#: One ledger per file per PROCESS. The MCP tool handler (which issues) and the
+#: worker (arrival hook, boot sweep, turn scan) both run inside the daemon, so
+#: two in-memory copies of one file was the whole defect: the worker's copy was
+#: built at boot before any request existed and never saw what the tool wrote
+#: (staging 2026-10-06 — Desk's receipt landed 65 s after the ask and was
+#: silently dropped). Sharing the instance also keeps ``claim`` atomic for free.
+#: A second PROCESS (a CLI run against the same file) is out of this registry's
+#: reach and would need flock; nothing does that today.
+_LEDGERS: dict[Path, RequestLedger] = {}
+
+
+def ledger_for(path: Path) -> RequestLedger:
+    """The process-wide ledger for ``path``. Always use this, never the class."""
+    key = Path(path).resolve()
+    existing = _LEDGERS.get(key)
+    if existing is None:
+        existing = RequestLedger(key)
+        _LEDGERS[key] = existing
+    return existing
+
+
 class RequestLedger:
     """Requests this agent issued, persisted under ``agent_dir`` at 0600.
 
     Persisted because the owner answers on their own time — a daemon restart
     between the ask and the reply must not orphan the reply. Holds NO secret;
     it is the request_id → type binding the untrusted reply is checked against.
+
+    **THE FILE, NOT THIS OBJECT, IS THE LEDGER.** Two instances exist by design
+    and in different processes' call stacks: the MCP tool handler builds one per
+    call to issue a request, and the worker caches one for the arrival hook and
+    the boot sweep. An instance that trusted its constructor-time snapshot could
+    not see a request the other had issued — which is exactly what happened on
+    staging 2026-10-06: the worker's ledger was built at boot before any request
+    existed, the tool wrote one at 02:15:30Z, and the receipt at 02:16:35Z found
+    an empty in-memory ledger and was silently dropped.
+
+    The fix is the INSTANCE COUNT, not staleness: use :func:`ledger_for`, which
+    keeps one instance per resolved path per process, so ``_items`` is shared
+    and there is nothing to go stale. Reloading on every read would have worked
+    for staleness and REOPENED the race #456 closed — ``claim`` is atomic only
+    because one instance does check → flip → save with no await between; two
+    instances that each reload and then save can both claim the same request.
     """
 
     def __init__(self, path: Path) -> None:
@@ -228,10 +267,50 @@ class RequestLedger:
     def pending(self) -> list[CredentialRequest]:
         return [r for r in self._items.values() if r.state == "pending"]
 
-    def settle(self, request_id: str, *, state: str, index: int | None = None,
-               version: int | None = None, detail: str = "") -> None:
+    def claim(self, request_id: str) -> bool:
+        """Atomically take a pending request for processing (pending → in_flight).
+
+        Synchronous on purpose: on single-threaded asyncio nothing can interleave
+        between the read and the write, so of several coroutines racing on the
+        same reply exactly one gets ``True``. A check-then-await would let all
+        of them through.
+        """
         req = self._items.get(request_id)
         if req is None or req.state != "pending":
+            return False
+        req.state = "in_flight"
+        self._save()
+        return True
+
+    def release(self, request_id: str) -> None:
+        """Give a claim back (in_flight → pending). The ONE transition back, for a
+        reply the server is not ready to honour yet (version behind): the request
+        stays open so the next sighting of the reply retries. ``failed`` never
+        comes back through here."""
+        req = self._items.get(request_id)
+        if req is not None and req.state == "in_flight":
+            req.state = "pending"
+            self._save()
+
+    def recover_in_flight(self) -> int:
+        """At BOOT only: give back every claim left by a process that died between
+        claim and settle/release (OOM, a rebuild kill mid-handler, SIGTERM). Safe
+        then because no handler can be running yet. Without this a stranded
+        in_flight row refuses every claim forever — #242's lock-without-a-lease,
+        in miniature. Returns how many were released."""
+        stale = [r for r in self._items.values() if r.state == "in_flight"]
+        for r in stale:
+            r.state = "pending"
+        if stale:
+            self._save()
+        return len(stale)
+
+    def settle(self, request_id: str, *, state: str, index: int | None = None,
+               version: int | None = None, detail: str = "") -> None:
+        """Finish a claimed request as ``placed`` or ``failed``. Never back to pending."""
+        assert state in ("placed", "failed"), state
+        req = self._items.get(request_id)
+        if req is None or req.state not in ("pending", "in_flight"):
             return
         req.state, req.index, req.version, req.detail = state, index, version, detail
         self._save()
@@ -285,6 +364,36 @@ def _write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+#: Store key prefix for a CUSTOMIZED credential we hold but CANNOT export: its
+#: alias is a human label, not a usable variable name. The value is kept (so
+#: nothing the owner filed is lost and a tool can report it) and no variable is
+#: invented — a derived name reads as success in the log while the agent still
+#: cannot find the name it asked for.
+HELD_PREFIX = "held:"
+
+
+def _alias_from_ledger(ledger: Any, credential_type: str, index: int) -> str:
+    """The ENV VAR NAME the agent asked for, from its own request, or "".
+
+    The agent is what reads the variable, so its request is authoritative over
+    the server's label. Matched by index once a request is settled; before that,
+    only an unambiguous single open request of that type is used — two open
+    requests cannot be told apart, and guessing would export the wrong name.
+    """
+    if ledger is None:
+        return ""
+    try:
+        items = list(ledger._items.values())  # noqa: SLF001 — same module's type
+    except Exception:  # noqa: BLE001
+        return ""
+    settled = [r for r in items if r.type == credential_type and r.index == index and _ALIAS.fullmatch(r.alias or "")]
+    if settled:
+        return settled[0].alias
+    open_ = [r for r in items if r.type == credential_type and r.state in ("pending", "in_flight")
+             and _ALIAS.fullmatch(r.alias or "")]
+    return open_[0].alias if len(open_) == 1 else ""
+
+
 def place(
     *,
     agent_dir: Path,
@@ -301,9 +410,13 @@ def place(
     ``alias:<name>`` so several can coexist and the child sees each as the
     environment variable named by its alias.
     """
-    key = f"alias:{alias}" if credential_type == TYPE_CUSTOMIZED else credential_type
-    if credential_type == TYPE_CUSTOMIZED and not _ALIAS.fullmatch(alias or ""):
-        raise ValueError("a CUSTOMIZED credential needs an alias usable as an env var name")
+    if credential_type != TYPE_CUSTOMIZED:
+        key = credential_type
+    elif _ALIAS.fullmatch(alias or ""):
+        key = f"alias:{alias}"
+    else:
+        # Held, not exported. See HELD_PREFIX.
+        key = f"{HELD_PREFIX}{credential_type}:{index}"
     items = read_store(agent_dir)
     items[key] = {
         "type": credential_type,
@@ -312,6 +425,8 @@ def place(
         "value": value.decode("utf-8"),
         "fingerprint": fingerprint(value),
         "placed_at": int(time.time()),
+        "label": alias or "",
+        "exported": not key.startswith(HELD_PREFIX),
     }
     _write_private(store_path(agent_dir), json.dumps({"version": 1, "credentials": items}, indent=2))
     return key
@@ -388,7 +503,33 @@ async def handle_filed_replies(
     """
     del harness  # reserved: placement is type-keyed today
     outcomes: list[FiledOutcome] = []
+    if not ledger.pending():
+        # Cheap exit for the normal case. But an owner DM carrying a filed fence
+        # while the ledger reports nothing pending cannot happen in normal
+        # operation — it is the one-line signature of the ledger-instance bug
+        # (staging 2026-10-06), so say so rather than return in silence.
+        for item in items:
+            if (
+                _is_stored_row(item)
+                and getattr(item, "envelope_kind", "") == "dm"
+                and getattr(item, "sender_slug", "") == owner_slug
+            ):
+                filed = parse_filed_reply(message_text(getattr(item, "content", "")))
+                if filed is not None:
+                    logger.warning(
+                        "agent %s: owner filed %s (request %s) but this ledger has nothing pending — "
+                        "the request was issued against a different ledger instance; see ledger_for",
+                        agent_id, filed["type"], filed["request_id"],
+                    )
+        return outcomes
     for item in items:
+        # Three paths feed this (turn scan, arrival hook, boot sweep) and all
+        # must hand over the store's own row type. A different class would make
+        # every getattr below answer "" and skip silently — the #247 inert-
+        # feature failure — so an unexpected type is logged, not ignored.
+        if not _is_stored_row(item):
+            logger.warning("credential replies: unexpected row type %s; skipping", type(item).__name__)
+            continue
         if getattr(item, "envelope_kind", "") != "dm":
             continue
         if getattr(item, "sender_slug", "") != owner_slug:
@@ -398,7 +539,8 @@ async def handle_filed_replies(
             continue
         rid = filed["request_id"]
         req = ledger.get(rid)
-        if req is None or req.state != "pending":
+        # CLAIM before the first await: the loser of a race sees in_flight.
+        if req is None or not ledger.claim(rid):
             outcomes.append(FiledOutcome(rid, "ignored", "unknown or already consumed request_id"))
             continue
         if req.type != filed["type"]:
@@ -413,6 +555,8 @@ async def handle_filed_replies(
         if isinstance(got, FiledOutcome):
             if got.state == "failed":
                 ledger.settle(rid, state="failed", detail=got.detail)
+            else:
+                ledger.release(rid)  # transient (server behind): keep it open for a retry
             outcomes.append(FiledOutcome(rid, got.state, got.detail))
             continue
         outcomes.append(
@@ -487,6 +631,98 @@ def _place_and_settle(
         logger.warning("agent %s: could not request provider reload: %s", agent_id, exc)
     return FiledOutcome(rid, "placed")
 
+async def sweep_stored_replies(
+    store: Any,
+    *,
+    owner_slug: str,
+    ledger: RequestLedger,
+    credentials: Any,
+    agent_dir: Path,
+    workspace: Path,
+    harness: str,
+    agent_id: str = "",
+    limit: int = 200,
+) -> list[FiledOutcome]:
+    """At boot: act on owner replies that were STORED before this process
+    existed — a reply that landed while the agent was paused, or one an
+    older build admitted to a turn without acting on it.
+
+    Bounded (the newest ``limit`` DMs with the owner) and idempotent (the
+    ledger consumes a request once, so a second boot is a no-op). Funnels
+    into :func:`handle_filed_replies`, so the owner / DM / list-confirm /
+    version-floor chain is the same one seam. Skipped entirely when nothing is
+    pending, so a settled agent costs no query.
+    """
+    pending = ledger.pending()
+    if not pending:
+        return []
+    # Bounded in TIME: everything since the oldest pending request was issued
+    # (a minute of clock slack). The store pages newest-first by sent_at keyset;
+    # the floor compares received_at — the slack covers that skew. We page
+    # BACKWARD until a row older than the floor appears, so a chatty owner
+    # cannot push the receipt past a single page. Hard cap: `max_pages` pages.
+    floor_ms = (min(r.issued_at for r in pending) - 60) * 1000
+    try:
+        rows = await _dm_rows_since(store, owner_slug, floor_ms, page=limit, max_pages=20, agent_id=agent_id)
+    except Exception as exc:  # noqa: BLE001 — fail open, like every boot step
+        logger.info("agent %s: credential reply sweep skipped: %s", agent_id, type(exc).__name__)
+        return []
+    outcomes = await handle_filed_replies(
+        rows, owner_slug=owner_slug, ledger=ledger, credentials=credentials,
+        agent_dir=agent_dir, workspace=workspace, harness=harness, agent_id=agent_id,
+    )
+    if outcomes:
+        logger.info("agent %s: credential reply sweep: %s", agent_id,
+                    ", ".join(f"{o.request_id[:8]}={o.state}" for o in outcomes))
+    return outcomes
+
+
+async def _dm_rows_since(store: Any, peer: str, floor_ms: int, *, page: int, max_pages: int,
+                         agent_id: str = "") -> list[Any]:
+    """Owner DMs received at or after ``floor_ms``, paging backward in time
+    through the store's ``sent_at`` keyset until the floor (or the cap).
+
+    The store SELECTs ``sent_at DESC`` and then hands the page back
+    OLDEST-FIRST (``message_store.py`` ``selected_oldest_first``), so the next
+    cursor is the row with the smallest ``(sent_at, envelope_id)`` — chosen
+    explicitly rather than by position, so a change in page order cannot turn
+    this into a one-row-per-page crawl. The floor compares ``received_at`` while
+    the keyset pages on ``sent_at``; the caller's 60 s slack covers that skew.
+    """
+    out: list[Any] = []
+    before: str | None = None
+    seen: set[str] = set()
+    scanned = 0
+    for _ in range(max_pages):
+        batch = await store.get_dm_history(peer, limit=page, before_envelope_id=before)
+        if not batch:
+            return out
+        ids = {getattr(r, "envelope_id", "") for r in batch}
+        if ids & seen:
+            # A cursor that did not move would re-serve rows: stop rather than crawl.
+            logger.warning("agent %s: credential reply sweep: page overlapped the previous page; stopping", agent_id)
+            return out
+        seen |= ids
+        scanned += len(batch)
+        hit_floor = False
+        for r in batch:
+            if int(getattr(r, "received_at", 0) or 0) >= floor_ms:
+                out.append(r)
+            else:
+                hit_floor = True
+        if hit_floor or len(batch) < page:
+            return out
+        oldest = min(batch, key=lambda r: (int(getattr(r, "sent_at", 0) or 0), str(getattr(r, "envelope_id", ""))))
+        before = getattr(oldest, "envelope_id", None)
+        if not before:
+            return out
+    # Exhausted the cap with neither the floor nor a short page in sight: say so,
+    # or this looks exactly like "nothing to sweep".
+    logger.warning("agent %s: credential reply sweep: scanned %d owner DMs over %d pages without reaching "
+                   "the time floor; the receipt may be older than the scan", agent_id, scanned, max_pages)
+    return out
+
+
 def _forget(credentials: Any, credential_type: str, index: int) -> None:
     """Bypass the reader's cache for one credential, whichever reader it is.
 
@@ -502,18 +738,48 @@ def _forget(credentials: Any, credential_type: str, index: int) -> None:
         invalidate(lambda c: c.type == credential_type and c.index == index)
 
 
+def _is_stored_row(item: Any) -> bool:
+    """The store's row type, or a duck close enough to carry the three fields
+    the chain reads. Tests use plain namespaces; production passes StoredMessage."""
+    try:
+        from ..agent.message_store_models import StoredMessage
+
+        if isinstance(item, StoredMessage):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return all(hasattr(item, a) for a in ("envelope_kind", "sender_slug", "content"))
+
+
 def status_line(req: CredentialRequest | None) -> str:
     """What the model is told. Never the value."""
     if req is None:
         return "unknown request_id"
+    if req.state == "in_flight":
+        return (
+            f"placing {req.type} now — the owner HAS already filed it and I am putting it in place. "
+            "Do NOT ask them to submit it again; check again in a moment."
+        )
     if req.state == "placed":
+        if req.detail:
+            # e.g. "no variable exported (label 'Youtube access')" — tell the
+            # owner precisely instead of leaving the agent to say "pending".
+            return f"placed {req.type} #{req.index} v{req.version}, but {req.detail}"
         return (
             f"placed {req.type} #{req.index} v{req.version}; "
             "restarting my CLI to pick it up"
         )
     if req.state == "failed":
         return f"failed: {req.detail}"
-    return f"pending: waiting for the owner to file {req.type}"
+    # Said carefully: twice on staging an agent read "pending" as "the filing
+    # failed" and asked the owner to submit the credential a second time. The
+    # only thing this state licenses is a statement about OUR side.
+    return (
+        f"pending: waiting for the owner's reply about {req.type}. They may already have filed it — "
+        "filing is asynchronous and I only see it once it reaches me, so this does NOT mean it "
+        "failed. Do NOT tell the owner it failed and do NOT ask them to submit it again; wait and "
+        "check again."
+    )
 
 
 # ── boot reconcile ───────────────────────────────────────────────────────────
@@ -525,46 +791,138 @@ async def reconcile_at_boot(
     agent_dir: Path,
     harness: str,
     agent_id: str = "",
-) -> bool:
-    """Before the first spawn: if the server holds a plan credential for this
-    harness, fetch and place it. One bounded attempt, fail-open.
+    ledger: Any = None,
+) -> int:
+    """Before the first spawn: place every credential the SERVER says this agent
+    holds and that is not already placed at that version. Returns how many.
 
-    Why: a rebuild or resume-recreate re-injects the OLD vault value into the
-    environment and the store is not carried. Re-deriving from the server
-    makes a filed credential survive without carrying a secret file around.
-    Returns whether something was placed.
+    **The server list is the source of truth** — not the local ledger, not a
+    stored receipt. Neither survives a rebuild: ``agent_dir``'s ledger and
+    ``messages.db`` are not in the carry-over allowlist, so a credential the
+    owner filed before a rebuild was invisible to the old per-type reconcile and
+    stayed unplaced while the grant sat ACTIVATED on the server (staging
+    2026-10-06, issue #457). Listing everything removes that dependency: a
+    rebuilt, resumed or freshly provisioned agent converges on what it has been
+    granted, with no local state at all.
+
+    One bounded attempt, fail-open: a reconcile that cannot reach the server
+    leaves the environment's vault value in place and says so.
     """
-    ctype = PLAN_TYPE_FOR_HARNESS.get(harness)
-    if ctype is None or credentials is None:
-        return False
+    if credentials is None:
+        return 0
+    # The key must exist before anything can be wrapped TO us (#455); the list
+    # and the fetches below both need it.
+    register = getattr(credentials, "ensure_registered", None)
+    if callable(register):
+        try:
+            version = await register()
+            logger.info("agent %s: boot credential reconcile: credential key registered (v%s)", agent_id, version)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("agent %s: boot credential reconcile: key registration unavailable (%s); continuing",
+                        agent_id, type(exc).__name__)
+    lister = getattr(credentials, "held_all", None)
+    if not callable(lister):
+        return 0
     try:
-        held_list = await credentials.held(ctype)
-    except Exception as exc:  # noqa: BLE001 — fail open to the env var
-        logger.info("agent %s: boot credential list unavailable (%s); using the environment",
+        rows = await lister()
+    except Exception as exc:  # noqa: BLE001 — fail open to the environment
+        logger.info("agent %s: boot credential reconcile: list unavailable (%s); using the environment",
                     agent_id, type(exc).__name__)
+        return 0
+    if not rows:
+        logger.info("agent %s: boot credential reconcile: the server lists no credentials for this agent; "
+                    "using the environment", agent_id)
+        return 0
+    stored = read_store(agent_dir)
+    placed = 0
+    for row in rows:
+        ctype, index, version = row["type"], row["index"], row["version"]
+        alias = row["alias"]
+        label = alias
+        if ctype == TYPE_CUSTOMIZED:
+            # The alias IS the variable name the agent will read, so it must be
+            # usable as one. Order: the agent's own request (authoritative — it
+            # is the reader), else the server's row if that happens to be a
+            # valid name (which it is for a request-driven filing, since the web
+            # sends the requested alias). A free-text label from the Apps tab is
+            # NEVER normalised into a name: a derived name reads as success
+            # while the agent still cannot find what it asked for.
+            alias = _alias_from_ledger(ledger, ctype, index) or (alias if _ALIAS.fullmatch(alias or "") else "")
+            key = f"alias:{alias}" if alias else f"{HELD_PREFIX}{ctype}:{index}"
+        else:
+            key = ctype
+        current = stored.get(key) or {}
+        if _already_placed(current, index, version):
+            logger.info("agent %s: boot credential reconcile: %s #%s v%s already placed", agent_id, ctype, index, version)
+            continue
+        # The version on the server differs from (or is missing locally) what we
+        # hold, so we are about to replace it — drop any cached copy first. The
+        # cloud reader serves memory while the held value is unexpired, so a warm
+        # cache would hand back the OLD bytes and place them under the NEW
+        # version label. Same reason the arrival handler forgets before fetching.
+        _forget(credentials, ctype, index)
+        try:
+            held = await credentials.get(ctype, index)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("agent %s: boot credential reconcile: fetch of %s #%s failed (%s); skipping",
+                        agent_id, ctype, index, type(exc).__name__)
+            continue
+        if held is None:
+            logger.info("agent %s: boot credential reconcile: %s #%s not distributed to this agent",
+                        agent_id, ctype, index)
+            continue
+        try:
+            place(agent_dir=agent_dir, credential_type=held.type, index=held.index,
+                  version=held.version, value=held.value, alias=alias)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: boot credential reconcile: placement of %s #%s failed: %s",
+                           agent_id, ctype, index, type(exc).__name__)
+            continue
+        placed += 1
+        _record_placement(ledger, held, ctype=ctype, alias=alias, label=label, agent_id=agent_id)
+    return placed
+
+
+def _already_placed(current: dict, index: int, version: int) -> bool:
+    """Is the stored row this exact credential AND internally intact?
+
+    Version and index alone are not enough: a row whose ``value`` no longer
+    hashes to its recorded ``fingerprint`` is corrupt (a truncated write, a
+    hand-edit), and skipping it would leave the agent running on bad bytes
+    forever because the version "matches". Checked locally — no fetch needed to
+    know a row disagrees with itself.
+    """
+    if current.get("version") != version or current.get("index") != index:
         return False
-    if not held_list:
+    value = current.get("value")
+    if not isinstance(value, str):
         return False
-    # The lowest index. Fine while a plan type is one-per-harness; a second
-    # plan credential of the same type would need an explicit choice here.
-    index = held_list[0][0]
-    try:
-        held = await credentials.get(ctype, index)
-    except Exception as exc:  # noqa: BLE001
-        logger.info("agent %s: boot credential fetch failed (%s); using the environment",
-                    agent_id, type(exc).__name__)
-        return False
-    if held is None:
-        return False
-    current = read_store(agent_dir).get(ctype) or {}
-    if current.get("version") == held.version and current.get("fingerprint") == fingerprint(held.value):
-        return False  # already placed at this version
-    try:
-        place(agent_dir=agent_dir, credential_type=held.type, index=held.index,
-              version=held.version, value=held.value)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("agent %s: boot placement failed: %s", agent_id, type(exc).__name__)
-        return False
-    logger.info("agent %s: boot reconcile placed %s #%s v%s (fp %s)",
-                agent_id, held.type, held.index, held.version, fingerprint(held.value))
-    return True
+    return current.get("fingerprint") == fingerprint(value.encode("utf-8"))
+
+
+def _record_placement(ledger: Any, held: Any, *, ctype: str, alias: str, label: str, agent_id: str) -> None:
+    """Log the placement honestly and settle the agent's own request, if any."""
+    if ctype == TYPE_CUSTOMIZED and not alias:
+        logger.warning(
+            "agent %s: boot reconcile placed %s #%s v%s (fp %s) but exported NO variable: its label "
+            "%r is not usable as an environment variable name. The value is held; re-file it from the "
+            "agent's own request so the alias is the name it reads.",
+            agent_id, held.type, held.index, held.version, fingerprint(held.value), label,
+        )
+    else:
+        logger.info("agent %s: boot reconcile placed %s #%s v%s (fp %s)%s",
+                    agent_id, held.type, held.index, held.version, fingerprint(held.value),
+                    f" as {alias}" if ctype == TYPE_CUSTOMIZED else "")
+    if ledger is None:
+        return
+    match = _alias_from_ledger(ledger, ctype, held.index)
+    for req in list(getattr(ledger, "_items", {}).values()):
+        if req.type == ctype and req.state in ("pending", "in_flight") and (
+            ctype != TYPE_CUSTOMIZED or req.alias == match
+        ):
+            if req.state == "pending":
+                ledger.claim(req.request_id)
+            ledger.settle(req.request_id, state="placed", index=held.index, version=held.version,
+                          detail="" if alias or ctype != TYPE_CUSTOMIZED
+                          else f"no variable exported (label {label!r})")
+            break

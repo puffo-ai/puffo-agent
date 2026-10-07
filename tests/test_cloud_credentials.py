@@ -202,6 +202,18 @@ async def test_a_fetch_racing_a_forget_does_not_land():
     assert creds._find(TYPE, 0) is None
 
 
+@pytest.mark.asyncio
+async def test_ensure_registered_posts_once_and_returns_the_version():
+    srv = FakeKeylessServer()
+    creds = CloudAgentCredentials(srv, SLUG, OWNER)
+    assert await creds.ensure_registered() == 1
+    assert await creds.ensure_registered() == 1
+    assert srv.kem_posts == 1
+    srv.row(0, b"later")
+    assert (await creds.get(TYPE, 0)).value == b"later"
+    assert srv.kem_posts == 1  # the key fetched at registration is reused
+
+
 def test_owner_is_required():
     with pytest.raises(ValueError):
         CloudAgentCredentials(FakeKeylessServer(), SLUG, "")
