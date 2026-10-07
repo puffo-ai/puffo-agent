@@ -77,9 +77,8 @@ def register_message_tools(
     ) -> Any:
         """Send workspace files and an optional caption to a channel or DM.
 
-        ``caption`` is the message text shown with the files; ``text`` is
-        accepted as an alias for it (the same name ``send_message`` uses) —
-        pass one or the other, not two different values.
+        ``text`` is an alias for ``caption`` (``send_message``'s name for the
+        body); two different values are an error.
 
         ``paths`` are workspace-relative; ``channel``, ``root_id``,
         ``visibility_level``, ``send_anyway``, and ``covers`` match

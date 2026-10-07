@@ -1,17 +1,13 @@
-"""``send_message_with_attachments`` must not silently lose its body.
+"""``send_message_with_attachments``: ``text`` aliases ``caption``.
 
-``send_message`` names the message body ``text`` while the attachments
-tool names it ``caption``; models habitually carry ``text=`` across, and
-pydantic's default ignore-unknown-fields policy made that body vanish
-with a successful send result (observed in production 2026-10-05: four
-messages delivered as bare file cards, ``"text":""`` in the envelopes).
-``text`` is therefore a first-class alias for ``caption``, and giving
-both with different content is a loud error, never a silent pick.
+Pydantic drops unknown args, so a habitual ``text=`` used to vanish while
+the send still reported ``sent``.
 """
 
 from __future__ import annotations
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from puffo_agent.mcp import core_message_tools
 
@@ -42,8 +38,7 @@ async def _call(mcp, args):
 
 @pytest.mark.asyncio
 async def test_text_reaches_the_caption(monkeypatch):
-    """The production trap: ``text=`` through the real validation layer
-    must land in the outgoing caption, not evaporate."""
+    """The production trap: ``text=`` reaches the caption."""
     captured = []
     mcp = _build_mcp(monkeypatch, captured)
     await _call(
@@ -83,11 +78,11 @@ async def test_identical_caption_and_text_are_accepted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_conflicting_caption_and_text_error_loudly(monkeypatch):
-    """Two different bodies must never silently pick one."""
+    """Two different bodies never silently pick one."""
     captured = []
     mcp = _build_mcp(monkeypatch, captured)
-    with pytest.raises(Exception) as excinfo:
-        result = await mcp.call_tool(
+    with pytest.raises(ToolError, match="alias"):
+        await mcp.call_tool(
             "send_message_with_attachments",
             {
                 "paths": ["a.md"],
@@ -96,12 +91,7 @@ async def test_conflicting_caption_and_text_error_loudly(monkeypatch):
                 "text": "another body",
             },
         )
-        # FastMCP versions differ on raise-vs-isError; normalize to raise.
-        text = str(result)
-        if "aliases" in text:
-            raise RuntimeError(text)
-    assert "alias" in str(excinfo.value)
-    assert captured == []  # nothing was dispatched
+    assert captured == []
 
 
 @pytest.mark.asyncio
