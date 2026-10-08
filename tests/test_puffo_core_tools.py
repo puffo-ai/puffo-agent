@@ -335,7 +335,7 @@ async def test_hidden_schema_semantic_send_fields_only():
             "covers",
         },
         "send_message_with_attachments": {
-            "paths", "channel", "caption", "root_id",
+            "paths", "channel", "caption", "text", "root_id",
             "visibility_level", "send_anyway", "covers",
         },
     }

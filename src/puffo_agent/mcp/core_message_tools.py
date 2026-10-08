@@ -69,6 +69,7 @@ def register_message_tools(
         paths: list[str],
         channel: str,
         caption: str = "",
+        text: str = "",
         root_id: str = "",
         visibility_level: str = "default",
         send_anyway: bool = False,
@@ -76,19 +77,28 @@ def register_message_tools(
     ) -> Any:
         """Send workspace files and an optional caption to a channel or DM.
 
+        ``text`` is an alias for ``caption`` (``send_message``'s name for the
+        body); two different values are an error.
+
         ``paths`` are workspace-relative; ``channel``, ``root_id``,
         ``visibility_level``, ``send_anyway``, and ``covers`` match
         ``send_message``. Results are ``sent``, ``held``, or an error. See
         the managed ``send-message-with-attachments`` skill and its common
         ``send-message`` held-send procedure.
         """
+        if caption and text and caption != text:
+            raise ValueError(
+                "send_message_with_attachments received both caption= and "
+                "text= with different content; they are aliases for the "
+                "message body — pass exactly one"
+            )
         return project_send_result(
             await _dispatch_semantic_send(
                 cfg,
                 SemanticSendRequest(
                     destination=channel,
                     attachment_paths=(tuple(paths) if isinstance(paths, list) else ()),
-                    caption=caption,
+                    caption=caption or text,
                     root_id=root_id,
                     visibility_level=visibility_level,
                     send_anyway=send_anyway,

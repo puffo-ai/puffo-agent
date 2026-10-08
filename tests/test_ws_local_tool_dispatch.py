@@ -121,7 +121,7 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
             "covers",
         },
         "send_message_with_attachments": {
-            "paths", "channel", "caption", "root_id",
+            "paths", "channel", "caption", "text", "root_id",
             "visibility_level", "send_anyway", "covers",
         },
         "mark_covered": {"covers", "by_message_id", "note"},

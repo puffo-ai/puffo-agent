@@ -27,6 +27,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Attachment messages no longer lose their text when the agent writes
+  `text=`.** `send_message` calls the body `text` while
+  `send_message_with_attachments` called it `caption`; a habitual `text=` was
+  silently dropped, the files went out as bare cards, and the send still
+  reported success — the operator and the agent then disagreed about what had
+  been said. `text` is now accepted as an alias for `caption`, and passing two
+  different bodies is an error instead of a silent pick.
+
 - **No more "my Claude sign-in has expired" DM for a credential that just
   rotated fine.** A 401 on a turn and the rotation that fixes it are the same
   event seen twice, so the refresh routinely recovered the agent *before* the
