@@ -119,7 +119,6 @@ class WorkerRunServices:
     status_task: asyncio.Task
     watch_task: asyncio.Task
     runtime_upload_task: asyncio.Task
-    schedule_task: asyncio.Task
     credential_key_task: asyncio.Task | None = None
 
 
@@ -1208,8 +1207,6 @@ class StandardWorkerRun:
             logger.warning("process health settlement failed", exc_info=True)
 
     async def _start_services(self, context: WorkerRunContext) -> WorkerRunServices:
-        from ..agent.managed_schedules import ScheduleDelivery
-
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
         reporter = self._build_reporter(context.client)
@@ -1222,10 +1219,6 @@ class StandardWorkerRun:
             ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
-        schedule_task = spawn(ScheduleDelivery(
-            http=context.client.http, slug=context.client.slug,
-            store=context.client.store, notify=global_runtime.notify,
-        ).run(), name="scheduler.delivery")
         global_task = spawn(
             global_runtime.run(),
             name="global_runtime.run",
@@ -1258,7 +1251,6 @@ class StandardWorkerRun:
             global_runtime_task=global_task,
             reminder_sync=reminder_sync,
             reminder_sync_task=reminder_task,
-            schedule_task=schedule_task,
             reporter=reporter,
             heartbeat_task=heartbeat_task,
             credential_key_task=credential_key_task,
@@ -1356,8 +1348,6 @@ class StandardWorkerRun:
         self, context: WorkerRunContext, services: WorkerRunServices
     ) -> None:
         worker = self.worker
-        services.schedule_task.cancel()
-        await asyncio.gather(services.schedule_task, return_exceptions=True)
         if (
             services.reminder_sync is not None
             and services.reminder_sync_task is not None

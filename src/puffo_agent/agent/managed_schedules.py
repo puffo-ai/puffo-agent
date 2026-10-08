@@ -1,116 +1,101 @@
-"""Server scheduler transport and acknowledged, durable Inbox delivery."""
+"""Encrypted schedule management. Delivery uses the existing message transport."""
 from __future__ import annotations
 
-import asyncio
-import logging
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from ..crypto.http_client import PuffoCoreHttpClient
-from .message_store import MessageStore
-
-logger = logging.getLogger(__name__)
+from ..crypto.keystore import decode_secret
+from ..crypto.message import EncryptInput, decrypt_message, encrypt_message
+from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
+from .client_support import DeviceKeyCache
+from .outbound_messages import fetch_device_keys
+from .schedule_wire import CONTENT_TYPE, validate_plan, validate_schedule_text
 
 
 class ScheduleAPI:
     def __init__(self, http: PuffoCoreHttpClient, slug: str):
         self.http = http
+        self.slug = slug
         prefix = "/v2/cloud-agents" if http.keyless else "/v2"
-        self.path = f"{prefix}/agents/{quote(slug, safe='')}"
+        self.path = f"{prefix}/agents/{quote(slug, safe='')}/schedules"
 
     async def list(self) -> dict[str, Any]:
-        path = f"{self.path}/schedules"
-        if self.http.keyless:
-            return await self.http.get_unsigned(path)
-        return await self.http.get(path)
+        data = await self._get(self.path)
+        return {"schedules": [await self._open(row) for row in data["schedules"]]}
 
     async def read(self, schedule_id: str) -> dict[str, Any]:
-        path = f"{self.path}/schedules/{UUID(schedule_id)}"
-        if self.http.keyless:
-            return await self.http.get_unsigned(path)
-        return await self.http.get(path)
+        return await self._open(await self._get(f"{self.path}/{UUID(schedule_id)}"))
 
     async def create(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/schedules", body)
+        sealed = await self._seal(str(uuid4()), body)
+        post = self.http.post_unsigned if self.http.keyless else self.http.post
+        return await self._open(await post(self.path, sealed))
 
     async def update(self, schedule_id: str, version: int, body: dict[str, Any]) -> dict[str, Any]:
-        path = f"{self.path}/schedules/{UUID(schedule_id)}?version={int(version)}"
-        if self.http.keyless:
-            return await self.http.put_unsigned(path, body)
-        return await self.http.put(path, body)
+        sealed = await self._seal(str(UUID(schedule_id)), body)
+        put = self.http.put_unsigned if self.http.keyless else self.http.put
+        return await self._open(await put(f"{self.path}/{UUID(schedule_id)}?version={int(version)}", sealed))
 
     async def delete(self, schedule_id: str, version: int) -> dict[str, bool]:
-        path = f"{self.path}/schedules/{UUID(schedule_id)}?version={int(version)}"
-        if self.http.keyless:
-            await self.http.delete_unsigned(path)
-        else:
-            await self.http.delete(path)
+        delete = self.http.delete_unsigned if self.http.keyless else self.http.delete
+        await delete(f"{self.path}/{UUID(schedule_id)}?version={int(version)}")
         return {"deleted": True}
 
-    async def claim(self, claim_id: str) -> dict[str, Any]:
-        return await self._post("/schedule-runs/claim", {"claim_id": claim_id})
+    async def _get(self, path: str) -> Any:
+        get = self.http.get_unsigned if self.http.keyless else self.http.get
+        return await get(path)
 
-    async def acknowledge(self, run_id: str, claim_id: str) -> None:
-        await self._post(f"/schedule-runs/{UUID(run_id)}/ack", {"claim_id": claim_id})
-
-    async def _post(self, suffix: str, body: dict[str, Any]) -> Any:
+    async def _seal(self, schedule_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        validate_schedule_text(body)
+        draft = {**body, "id": schedule_id, "revision": str(uuid4()), "first_run_at": body["next_run_at"]}
+        del draft["next_run_at"]
         if self.http.keyless:
-            return await self.http.post_unsigned(self.path + suffix, body)
-        return await self.http.post(self.path + suffix, body)
+            return draft  # The existing trusted KMS bridge seals before persistence.
+        profiles = await self.http.get(f"/identities/profiles?slugs={quote(self.slug, safe='')}")
+        owner = next(p["owner_slug"] for p in profiles["profiles"] if p["slug"] == self.slug)
+        if not owner:
+            raise ValueError("schedule agent has no owner")
+        first = datetime.fromisoformat(draft["first_run_at"].replace("Z", "+00:00"))
+        if first.tzinfo is None:
+            raise ValueError("schedule timestamp requires a timezone")
+        plan = {
+            "version": 1, "schedule_id": schedule_id, "revision": draft["revision"],
+            "agent_id": self.slug, "owner_slug": owner, "first_run_at": int(first.timestamp() * 1000),
+            "interval_seconds": draft["interval_seconds"], "enabled": draft["enabled"],
+            "name": draft["name"], "prompt": draft["prompt"],
+        }
+        await self.http._ensure_subkey()
+        session = self.http.keystore.load_session(self.http.slug)
+        devices = await fetch_device_keys(http=self.http, slugs=[self.slug, owner])
+        active = await self.http.get(f"/certs/active?slugs={self.slug},{owner}")
+        active_ids = {d["device_id"] for d in active["devices"]}
+        envelope = encrypt_message(EncryptInput(
+            envelope_kind="dm", sender_slug=self.http.slug, sender_subkey_id=session.subkey_id,
+            recipient_slug=self.slug, content_type=CONTENT_TYPE, content=plan,
+            recipients=[d for d in devices if d.device_id in active_ids], is_visible_to_human=False,
+        ), Ed25519KeyPair.from_secret_bytes(decode_secret(session.subkey_secret_key)))
+        return {"id": schedule_id, "revision": draft["revision"], "envelope": envelope,
+                "signer_subkey_id": session.subkey_id, "first_run_at": draft["first_run_at"],
+                "interval_seconds": draft["interval_seconds"], "enabled": draft["enabled"]}
 
-
-def _run_payload(run: dict[str, Any], *, slug: str, claim_id: str) -> dict[str, Any]:
-    run_id = str(UUID(run["id"]))
-    schedule_id = str(UUID(run["schedule_id"]))
-    if run["agent_id"] != slug or run["claim_id"] != claim_id:
-        raise ValueError("scheduler delivery binding mismatch")
-    due = datetime.fromisoformat(run["scheduled_at"].replace("Z", "+00:00"))
-    if due.tzinfo is None or not run["owner_slug"] or not isinstance(run["prompt"], str):
-        raise ValueError("invalid scheduler delivery")
-    return {
-        "envelope_id": f"schedule-run:{run_id}",
-        "envelope_kind": "dm",
-        "sender_slug": run["owner_slug"],
-        "recipient_slug": slug,
-        "content_type": "application/puffo-schedule+json",
-        "content": {
-            "event_type": "scheduled_task", "sender_type": "system",
-            "schedule_id": schedule_id, "run_id": run_id,
-            "name": run["name"], "text": run["prompt"],
-            "scheduled_at": run["scheduled_at"],
-        },
-        "sent_at": int(due.timestamp() * 1000),
-        "is_encrypted": False,
-    }
-
-
-class ScheduleDelivery:
-    def __init__(self, *, http: PuffoCoreHttpClient, slug: str, store: MessageStore, notify: Callable[[], None]):
-        self._api = ScheduleAPI(http, slug)
-        self._slug = slug
-        self._store = store
-        self._notify = notify
-        self._claim_id = str(uuid4())
-
-    async def deliver_once(self) -> None:
-        async with asyncio.timeout(10):
-            response = await self._api.claim(self._claim_id)
-        for run in response["runs"]:
-            payload = _run_payload(run, slug=self._slug, claim_id=self._claim_id)
-            await self._store.store_local_event(
-                payload, reason="scheduled task", idempotent=True,
-            )
-            self._notify()
-            async with asyncio.timeout(10):
-                await self._api.acknowledge(run["id"], self._claim_id)
-
-    async def run(self) -> None:
-        while True:
+    async def _open(self, row: dict[str, Any]) -> dict[str, Any]:
+        if self.http.keyless:
+            return row
+        identity = self.http.keystore.load_identity(self.http.slug)
+        kem = KemKeyPair.from_secret_bytes(decode_secret(identity.kem_secret_key))
+        keys = await DeviceKeyCache(self.http).get_signing_keys(row["envelope"]["sender_slug"])
+        for key in keys:
             try:
-                await self.deliver_once()
+                payload = decrypt_message(row["envelope"], identity.device_id, kem, key)
             except Exception:
-                # Error bodies can contain the prompt; log no response text.
-                logger.warning("scheduler delivery failed; will retry")
-            await asyncio.sleep(15)
+                continue
+            validate_plan(payload, {
+                "schedule_id": row["id"], "revision": row["revision"], "owner_slug": row["owner_slug"],
+                "first_run_at": int(datetime.fromisoformat(row["first_run_at"].replace("Z", "+00:00")).timestamp() * 1000),
+                "interval_seconds": row["interval_seconds"],
+            }, agent=self.slug, sender=row["envelope"]["sender_slug"])
+            return {**row, "name": payload.content["name"], "prompt": payload.content["prompt"]}
+        raise ValueError("unable to decrypt schedule with this device")

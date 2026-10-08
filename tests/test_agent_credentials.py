@@ -525,7 +525,6 @@ async def test_shutdown_does_not_wait_for_a_registration_that_is_still_retrying(
     assert not services.credential_key_task.done()
     await asyncio.wait_for(run._cleanup(context, services), timeout=5)
     assert services.credential_key_task.cancelled()
-    assert services.schedule_task.cancelled()
 
 
 @pytest.mark.asyncio

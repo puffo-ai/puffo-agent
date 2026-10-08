@@ -421,7 +421,6 @@ async def _start_ws_consumer(
     hub: WsLocalHub, connection: dict, authed, on_message,
 ) -> None:
     from ...agent.global_inbox_runtime import await_listener_with_runtime
-    from ...agent.managed_schedules import ScheduleDelivery
 
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
     owned = connection.get("owned_runtime")
@@ -429,15 +428,10 @@ async def _start_ws_consumer(
     reminder_sync = None
     reminder_task = None
     runtime_task = None
-    schedule_task = None
     try:
         if owned is not None:
             # First statement of the scope whose ``finally`` unwinds it.
             _install_owned_runtime(client, owned)
-            schedule_task = spawn(ScheduleDelivery(
-                http=client.http, slug=client.slug, store=client.store,
-                notify=owned.notify,
-            ).run(), name="scheduler.delivery")
             reminder_sync = await _prepare_owned_reminder_sync(point, client, owned)
             reminder_task = spawn(
                 reminder_sync.run(request_snapshot_on_start=False),
@@ -452,9 +446,6 @@ async def _start_ws_consumer(
         else:
             await client.listen(on_message)
     finally:
-        if schedule_task is not None:
-            schedule_task.cancel()
-            await asyncio.gather(schedule_task, return_exceptions=True)
         await _stop_ws_consumer(
             point, client, owned, heartbeat, runtime_task,
             reminder_sync, reminder_task,

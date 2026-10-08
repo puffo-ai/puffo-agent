@@ -535,17 +535,21 @@ path.
 Server-managed schedules require the scheduler-enabled Server (migration 117).
 Set `next_run_at` to a future RFC3339 timestamp with a timezone; omit
 `interval_seconds` for one run, or set it to at least 60 for recurring work.
-The Server stores prompt text, so these tasks are **not end-to-end encrypted
-reminders**. Owners can also manage them from the Agent's full Web profile.
+Native Agents and Web owners sign and encrypt prompts before storage, using
+existing message keys. Puffo-managed keyless cloud Agents use the trusted KMS
+bridge to seal drafts and open deliveries. Owners can manage tasks from the
+Agent's full Web profile. Existing reminder tools remain separate and unchanged.
 
-The running Agent polls for leased runs, persists each unique run into its
-existing Inbox, wakes the Global Inbox runtime, then acknowledges delivery.
-Native and keyless cloud transports share this contract. Offline periods are
+The existing WebSocket/pending-message transport delivers a signed template
+inside a per-occurrence wrapper. The Agent verifies its timing/identity binding,
+persists a system event keyed by schedule/revision/due-time into its existing
+Inbox, wakes the Global Inbox runtime, then uses the ordinary message ACK.
+There is no separate schedule claim/ACK API or Agent polling loop. Offline periods are
 coalesced; retries against the same durable Inbox do not create duplicate
 events. Delivery is not proof that the prompted work succeeded, and external
-side effects still need idempotency. Changes cancel only never-claimed runs;
-already dispatched work can arrive after edits or deletion. An older Server
-returns a retryable delivery failure without exposing prompt text in logs.
+side effects still need idempotency. Already queued work can arrive after edits
+or deletion. Re-save tasks after recipient key changes; new devices cannot open
+old recipient wraps. Upgrade Server, Agent and Web together before creating tasks.
 
 ### 6.3 WS-local service
 
