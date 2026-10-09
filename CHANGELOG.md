@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Agents can see which credentials they hold.** A new `list_credentials`
+  tool returns the type, index, version and alias of everything the operator
+  has shared — metadata only, never a secret. Until now an agent could only
+  discover its own access by triggering an error: with several Google
+  accounts shared, `gmail_send` refused and listed them in the message.
+
 - **Agents can work a mailbox their operator shared with them.** Four tools:
   `gmail_send`, `gmail_search` (Gmail's own search syntax), `gmail_read`
   (HTML mail is converted to text, attachments are listed by name only) and

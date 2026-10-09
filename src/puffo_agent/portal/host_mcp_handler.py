@@ -734,6 +734,31 @@ async def credential_status(ctx: HostMcpContext, *, request_id: str = "") -> str
     return status_line(_ledger(ctx).get(rid))
 
 
+async def list_credentials(ctx: HostMcpContext) -> dict[str, Any]:
+    """Metadata of every credential this agent holds. Never a value.
+
+    Each row is projected field by field, so a server that one day returns
+    the wrapped blob alongside the listing still cannot leak it through here.
+    """
+    credentials = ctx.credentials
+    if credentials is None:
+        raise RuntimeError(
+            "this agent cannot hold credentials (no operator recorded)"
+        )
+    rows = await credentials.held_all()
+    return {
+        "credentials": [
+            {
+                "type": row["type"],
+                "index": row["index"],
+                "version": row["version"],
+                "alias": row["alias"],
+            }
+            for row in rows
+        ]
+    }
+
+
 def _ledger(ctx: HostMcpContext):
     """The process-wide ledger — never a fresh instance. Two in-memory copies of
     one file is what silently dropped Desk's filed credential (2026-10-06): the

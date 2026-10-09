@@ -128,6 +128,28 @@ def _register_credential_request(mcp: FastMCP, cfg: Any) -> None:
         return await cfg.rpc_client.credential_status(request_id=request_id)
 
 
+    @mcp.tool()
+    async def list_credentials() -> dict[str, Any]:
+        """Every credential your operator has shared with you: ``type``,
+        ``index``, ``version`` and ``alias``. Metadata only — the secret
+        itself is never returned here, and never needs to be: the tools that
+        use a credential fetch and decrypt it themselves.
+
+        Use it to answer "what do I have access to", to find the ``alias``
+        a tool wants for ``from_account``, or to check that something you
+        asked for with ``request_credential`` has actually landed. An empty
+        list means nothing is shared with you right now, which is not an
+        error. A credential your operator switched off is not listed.
+        """
+        if cfg.rpc_client is None:
+            raise RuntimeError(
+                "list_credentials unavailable — PUFFO_RPC_URL not set "
+                "on this MCP runtime, so the puffo-agent daemon's "
+                "rpc_service isn't reachable."
+            )
+        return await cfg.rpc_client.list_credentials()
+
+
 def _register_sync(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def sync_host_mcp(template_id: str) -> str:

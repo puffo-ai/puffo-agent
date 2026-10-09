@@ -231,6 +231,27 @@ async def credential_status_route(request: web.Request) -> web.Response:
     )
 
 
+async def list_credentials_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/list-credentials — no body fields."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or body:
+        return web.json_response(
+            {"error": "list_credentials takes no arguments"}, status=400,
+        )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response(
+            {"error": "the agent is not running yet", "code": "no_worker"}, status=409,
+        )
+    try:
+        return web.json_response(await host_mcp_handler.list_credentials(ctx))
+    except RuntimeError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+
 async def permission_request_route(request: web.Request) -> web.Response:
     """POST /v1/rpc/{agent_id}/permission-request —
     ``{tool_name, summary, timeout_s}``. Long-poll; ``message`` is
@@ -845,6 +866,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/credential-status",
         credential_status_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/list-credentials",
+        list_credentials_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/leave-request",
