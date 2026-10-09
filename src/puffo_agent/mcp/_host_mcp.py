@@ -486,6 +486,9 @@ class PuffoRpcClient:
             "request-credential", {"type": type, "reason": reason, "alias": alias},
         )
 
+    async def list_credentials(self) -> dict[str, Any]:
+        return await self._post_object("list-credentials", {})
+
     async def credential_status(self, *, request_id: str) -> str:
         return await self._post("credential-status", {"request_id": request_id})
 
