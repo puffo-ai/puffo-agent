@@ -532,7 +532,7 @@ confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
 
-Server-managed schedules require the scheduler-enabled Server (migration 117).
+Server-managed schedules require the scheduler-enabled Server (migration 118).
 Set `next_run_at` to a future RFC3339 timestamp with a timezone; omit
 `interval_seconds` for one run, or set it to at least 60 for recurring work.
 Native Agents and Web owners sign and encrypt prompts before storage, using
