@@ -269,6 +269,23 @@ async def test_native_management_seals_before_http_and_authenticates_reads(seale
     assert (await api.read(created["id"]))["name"] == "Test"
     updated = await api.update(created["id"], 1, {**body, "enabled": False})
     assert updated["revision"] != created["revision"]
+    healthy = copy.deepcopy(saved)
+    broken = {**copy.deepcopy(saved), "id": str(uuid4())}
+    original_get = http.get.side_effect
+    async def mixed_get(path):
+        return {"schedules": [broken, healthy]} if path.endswith("schedules") else await original_get(path)
+    http.get.side_effect = mixed_get
+    listed = (await api.list())["schedules"]
+    assert listed[0]["opened"] is False
+    assert "prompt" not in listed[0]
+    assert listed[0]["id"] == broken["id"] and listed[0]["version"] == 1
+    assert listed[1]["prompt"] == body["prompt"]
+    broken["envelope"] = {}
+    assert (await api.list())["schedules"][0]["opened"] is False
+    http.get.side_effect = OSError("network unavailable")
+    with pytest.raises(OSError, match="network unavailable"):
+        await api.list()
+    http.get.side_effect = original_get
     await api.delete(created["id"], 2)
     http.delete.assert_awaited_once()
     for change in [{"name": "界" * 41}, {"prompt": "界" * 5462}]:

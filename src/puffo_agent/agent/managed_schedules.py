@@ -15,6 +15,10 @@ from .outbound_messages import fetch_device_keys
 from .schedule_wire import CONTENT_TYPE, validate_plan, validate_schedule_text
 
 
+class ScheduleUnavailable(ValueError):
+    """This row cannot be verified with the current device's keys."""
+
+
 class ScheduleAPI:
     def __init__(self, http: PuffoCoreHttpClient, slug: str):
         self.http = http
@@ -24,7 +28,15 @@ class ScheduleAPI:
 
     async def list(self) -> dict[str, Any]:
         data = await self._get(self.path)
-        return {"schedules": [await self._open(row) for row in data["schedules"]]}
+        rows = []
+        for row in data["schedules"]:
+            try:
+                rows.append(await self._open(row))
+            except ScheduleUnavailable:
+                # Metadata remains usable for deletion/replacement after key
+                # rotation. Network/key-store failures are not row corruption.
+                rows.append({**row, "opened": False})
+        return {"schedules": rows}
 
     async def read(self, schedule_id: str) -> dict[str, Any]:
         return await self._open(await self._get(f"{self.path}/{UUID(schedule_id)}"))
@@ -84,6 +96,8 @@ class ScheduleAPI:
     async def _open(self, row: dict[str, Any]) -> dict[str, Any]:
         if self.http.keyless:
             return row
+        if not isinstance(row["envelope"], dict) or not isinstance(row["envelope"].get("sender_slug"), str):
+            raise ScheduleUnavailable("invalid stored schedule envelope")
         identity = self.http.keystore.load_identity(self.http.slug)
         kem = KemKeyPair.from_secret_bytes(decode_secret(identity.kem_secret_key))
         keys = await DeviceKeyCache(self.http).get_signing_keys(row["envelope"]["sender_slug"])
@@ -92,10 +106,13 @@ class ScheduleAPI:
                 payload = decrypt_message(row["envelope"], identity.device_id, kem, key)
             except Exception:
                 continue
-            validate_plan(payload, {
-                "schedule_id": row["id"], "revision": row["revision"], "owner_slug": row["owner_slug"],
-                "first_run_at": int(datetime.fromisoformat(row["first_run_at"].replace("Z", "+00:00")).timestamp() * 1000),
-                "interval_seconds": row["interval_seconds"],
-            }, agent=self.slug, sender=row["envelope"]["sender_slug"])
-            return {**row, "name": payload.content["name"], "prompt": payload.content["prompt"]}
-        raise ValueError("unable to decrypt schedule with this device")
+            try:
+                validate_plan(payload, {
+                    "schedule_id": row["id"], "revision": row["revision"], "owner_slug": row["owner_slug"],
+                    "first_run_at": int(datetime.fromisoformat(row["first_run_at"].replace("Z", "+00:00")).timestamp() * 1000),
+                    "interval_seconds": row["interval_seconds"],
+                }, agent=self.slug, sender=row["envelope"]["sender_slug"])
+            except ValueError as error:
+                raise ScheduleUnavailable(str(error)) from error
+            return {**row, "opened": True, "name": payload.content["name"], "prompt": payload.content["prompt"]}
+        raise ScheduleUnavailable("unable to decrypt schedule with this device")

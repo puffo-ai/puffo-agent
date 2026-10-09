@@ -28,7 +28,11 @@ def register_schedule_tools(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def list_schedules() -> dict[str, Any]:
-        """List this agent's server schedules, including paused and completed tasks."""
+        """List schedules, including paused/completed tasks.
+
+        An unopenable task has opened=false and no verified name/prompt.
+        Its id/version remain available for deletion or replacement.
+        """
         return await ScheduleAPI(cfg.http_client, cfg.slug).list()
 
     @mcp.tool()
@@ -45,6 +49,8 @@ def register_schedule_tools(mcp: FastMCP, cfg: Any) -> None:
 
         Supply a future next_run_at, including when pausing. Changes cancel
         future triggers; already queued messages can still arrive.
+        Dispatch does not change the configuration version. Replacing a
+        completed task with enabled=true explicitly schedules it again.
         """
         return await ScheduleAPI(cfg.http_client, cfg.slug).update(schedule_id, version, {
             "name": name, "prompt": prompt, "next_run_at": next_run_at,
