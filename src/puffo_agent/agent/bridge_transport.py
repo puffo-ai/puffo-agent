@@ -301,7 +301,9 @@ async def dispatch_bridge_frame(
     uncorrelated, so it only warns.
     """
     kind = frame.get("type", "")
-    if kind == "message":
+    if kind == "scheduled_message":
+        await _handle_bridge_schedule(client, frame)
+    elif kind == "message":
         await _handle_bridge_message_frame(client, frame)
     elif kind == "pending_delivered":
         client._log.info(
@@ -383,6 +385,21 @@ async def dispatch_bridge_frame(
         )
     else:
         client._log.debug("bridge frame ignored: type=%s", kind)
+
+
+async def _handle_bridge_schedule(client, frame: dict) -> None:
+    from .schedule_wire import commit_occurrence
+
+    if _bridge_frame_sequence(client, frame) in (None, _INVALID_SEQUENCE):
+        return
+    try:
+        await commit_occurrence(frame["content"], store=client.store, agent=client.slug,
+                                owner=client.operator_slug,
+                                notify=client.global_runtime.notify if client.global_runtime is not None else None)
+    except Exception:  # noqa: BLE001 — preserve the pump and leave delivery unacked
+        client._log.warning("bridge scheduled delivery rejected or persistence failed")
+        return
+    _track_bridge_task(client, spawn(client._ack_bridge_envelope([frame["envelope_id"]]), name="schedule.ack"))
 
 
 async def _handle_bridge_membership_event(client, frame: dict) -> None:

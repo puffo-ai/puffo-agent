@@ -476,3 +476,11 @@ class PuffoCoreHttpClient:
                 return json.loads(text)
             except (json.JSONDecodeError, ValueError):
                 return text
+
+    async def delete_unsigned(self, path: str) -> None:
+        async with self._healed_request(
+            "DELETE", f"{self.server_url}{path}", headers=self._egress_headers(),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)

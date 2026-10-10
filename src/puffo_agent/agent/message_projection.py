@@ -478,6 +478,16 @@ def format_message_row(
     current_agent_aliases: Sequence[str] = (),
     reply_count: int | None = None,
 ) -> str:
+    if (_event_type(message) == "scheduled_task"
+            and _value(message, "receipt_reason") == "scheduled task"
+            and _value(message, "receipt_disposition") == "local_runtime"):
+        event = _content(message)
+        return (
+            f'[event context_version={CONTEXT_VERSION} event_type="scheduled_task" '
+            f'run_id={_quoted(event["run_id"])} schedule_id={_quoted(event["schedule_id"])} '
+            f'scheduled_at={_quoted(event["scheduled_at"])} name={_quoted(event["name"])}]\n'
+            + _content_field(event["text"])
+        )
     if _reminder_event(message) is not None:
         return format_reminder_event(message)
     if _event_type(message).startswith(("channel_member_", "space_member_")):
