@@ -124,3 +124,15 @@ async def test_completed_assistant_replay_cannot_arm_watchdog(monkeypatch, tmp_p
         assert manager.active_turn_ref is None
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_read_loop_exits_cleanly_when_proc_cleared():
+    """Regression: close() nulls _proc while _read_loop is still
+    scheduled; the loop must end instead of crashing the task with
+    AttributeError ('NoneType' object has no attribute 'stdout')."""
+    driver = ClaudeCodeCliDriver()
+    driver._closed = True  # mirror close(): _closed set before _proc cleared
+    driver._proc = None
+
+    await driver._read_loop()
