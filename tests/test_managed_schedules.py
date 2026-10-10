@@ -184,6 +184,7 @@ async def test_keyless_mcp_crud_uses_trusted_bridge_scope_and_versions():
     schemas = {t.name: t for t in await mcp.list_tools()}
     assert set(schemas) == {"create_schedule", "list_schedules", "get_schedule", "update_schedule", "delete_schedule"}
     assert all("agent_id" not in t.inputSchema["properties"] for t in schemas.values())
+    assert schemas["list_schedules"].inputSchema["properties"] == {}
     sid = str(uuid4())
     body = {"name": "task", "prompt": "do it", "next_run_at": "2030-01-01T00:00:00Z"}
     for name, args in [("create_schedule", body), ("list_schedules", {}), ("get_schedule", {"schedule_id": sid}),
@@ -194,6 +195,18 @@ async def test_keyless_mcp_crud_uses_trusted_bridge_scope_and_versions():
     assert transport.put_unsigned.await_args.args[0].endswith(f"/{sid}?version=4")
     transport.delete_unsigned.assert_awaited_once_with(f"/v2/cloud-agents/agents/agent-one/schedules/{sid}?version=4")
     transport.post.assert_not_awaited()
+    # MCP serialization must retain server-owned state, including completed
+    # read-by-ID results, without inventing client-side filtering.
+    for status in ("scheduled", "paused", "quarantined", "completed"):
+        row = {"id": sid, "status": status,
+               "completed_at": "2030-01-01T00:00:00Z" if status == "completed" else None}
+        transport.get_unsigned.return_value = row
+        _, result = await mcp.call_tool("get_schedule", {"schedule_id": sid})
+        assert result == row
+        if status != "completed":
+            transport.get_unsigned.return_value = {"schedules": [row]}
+            _, result = await mcp.call_tool("list_schedules", {})
+            assert result == {"schedules": [row]}
     with pytest.raises(ValueError):
         await ScheduleAPI(transport, "agent-one").read("../other-agent")
 
@@ -267,6 +280,12 @@ async def test_native_management_seals_before_http_and_authenticates_reads(seale
     assert created["prompt"] == body["prompt"]
     assert (await api.list())["schedules"][0]["prompt"] == body["prompt"]
     assert (await api.read(created["id"]))["name"] == "Test"
+    # Native decryption must preserve runtime metadata, not derive it from
+    # the signed configuration's enabled flag or discard unknown fields.
+    for status in ("scheduled", "paused", "quarantined", "completed"):
+        saved.update(status=status, completed_at="2030-01-01T00:00:00Z" if status == "completed" else None)
+        opened = await api.read(created["id"])
+        assert (opened["status"], opened["completed_at"]) == (status, saved["completed_at"])
     updated = await api.update(created["id"], 1, {**body, "enabled": False})
     assert updated["revision"] != created["revision"]
     healthy = copy.deepcopy(saved)

@@ -532,13 +532,21 @@ confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
 
-Server-managed schedules require the scheduler-enabled Server (migration 118).
+Server-managed schedules require the scheduler-enabled Server; migration 119
+(Server #463) adds completion tracking and explicit status responses.
 Set `next_run_at` to a future RFC3339 timestamp with a timezone; omit
 `interval_seconds` for one run, or set it to at least 60 for recurring work.
 Native Agents and Web owners sign and encrypt prompts before storage, using
 existing message keys. Puffo-managed keyless cloud Agents use the trusted KMS
 bridge to seal drafts and open deliveries. Owners can manage tasks from the
 Agent's full Web profile. Existing reminder tools remain separate and unchanged.
+
+`list_schedules()` has no status filter parameter. The Server omits completed
+tasks while retaining scheduled, paused, and quarantined tasks. Use
+`get_schedule(schedule_id)` to inspect a completed task by its known ID.
+Responses retain the Server's read-only `status` (`scheduled`, `paused`,
+`completed`, or `quarantined`) and nullable `completed_at`. Completion means
+durable enqueue, not successful Agent execution; it does not cancel delivery.
 
 The existing WebSocket/pending-message transport delivers a signed template
 inside a per-occurrence wrapper. The Agent verifies its timing/identity binding,

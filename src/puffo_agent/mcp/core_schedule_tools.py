@@ -28,7 +28,11 @@ def register_schedule_tools(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def list_schedules() -> dict[str, Any]:
-        """List schedules, including paused/completed tasks.
+        """List scheduled, paused, and quarantined tasks for this agent.
+
+        Server excludes completed tasks; use get_schedule with a known id
+        to inspect one. No status filter parameter is supported. Read-only
+        status and completed_at describe scheduling, not execution success.
 
         An unopenable task has opened=false and no verified name/prompt.
         Its id/version remain available for deletion or replacement.
@@ -37,7 +41,11 @@ def register_schedule_tools(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def get_schedule(schedule_id: str) -> dict[str, Any]:
-        """Read one schedule and its current version before editing it."""
+        """Read a schedule by id, including completed tasks, before editing.
+
+        Read-only status is scheduled, paused, completed, or quarantined.
+        completed_at records durable enqueue, not successful Agent execution.
+        """
         return await ScheduleAPI(cfg.http_client, cfg.slug).read(schedule_id)
 
     @mcp.tool()
