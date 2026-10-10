@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 import uuid
@@ -91,9 +92,41 @@ def _resolve_claude_autocompact_tokens(
 class RuntimeStateError(RuntimeError):
     """Internal state-machine contract violation, never retried automatically."""
 
-    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, error_code: str | None = None, detail: str = "",
+    ) -> None:
         super().__init__(message)
         self.error_code = error_code
+        self.detail = detail
+
+
+# Terminal-event keys that are turn bookkeeping, not provider failure
+# evidence. Everything else in a failed turn's terminal payload is the
+# provider's own words — the part post-mortems need (2026-09-18: a 3.4s
+# ProviderFailureError left no trace of the provider's actual error and
+# the incident's first cause became unrecoverable).
+_PROVIDER_DETAIL_BOOKKEEPING = frozenset({
+    "outcome", "error_code", "retryable",
+    "input_tokens", "output_tokens", "context_tokens", "tool_calls",
+    "provider_session_id", "send_message_targets",
+})
+_PROVIDER_DETAIL_MAX_CHARS = 500
+
+
+def _provider_error_detail(data: Mapping[str, Any]) -> str:
+    """Bounded, log-only tail of the provider's raw failure payload."""
+    residue = {
+        key: value for key, value in data.items()
+        if key not in _PROVIDER_DETAIL_BOOKKEEPING
+        and value not in (None, "", [], {})
+    }
+    if not residue:
+        return ""
+    try:
+        text = json.dumps(residue, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001 — diagnostics must not fail the turn
+        text = str(residue)
+    return text[:_PROVIDER_DETAIL_MAX_CHARS]
 
 
 # Environmental failures: never session loss.
@@ -863,6 +896,7 @@ class RuntimeManager:
                     provider_error_code = str(
                         event.data.get("error_code") or ""
                     )
+                    exit_detail = _provider_error_detail(event.data)
                     if provider_error_code:
                         failure_data: dict[str, Any] = {
                             "outcome": "abandoned",
@@ -878,6 +912,11 @@ class RuntimeManager:
                             ),
                             "retryable": True,
                         }
+                    if exit_detail:
+                        # Preserve the provider's own words from the exit
+                        # event; the terminal consumer only forwards this
+                        # into log-side diagnostics.
+                        failure_data["provider_detail"] = exit_detail
                     abandoned = HarnessEvent(
                         type=HarnessEventType.TURN_ABANDONED,
                         driver=self.driver_name,
@@ -1538,15 +1577,21 @@ class RuntimeManagerAdapter(Adapter):
                         error_code,
                         explicitly_retryable=bool(event.data.get("retryable")),
                     )
+                    detail = _provider_error_detail(event.data)
                     if retryable or is_auth:
                         raise AgentAPIError(
                             message,
                             is_auth=is_auth,
                             error_code=error_code,
+                            detail=detail,
                         )
                     if is_provider_failure_code(error_code):
-                        raise ProviderFailureError(message, error_code=error_code)
-                    raise RuntimeStateError(message, error_code=error_code)
+                        raise ProviderFailureError(
+                            message, error_code=error_code, detail=detail,
+                        )
+                    raise RuntimeStateError(
+                        message, error_code=error_code, detail=detail,
+                    )
                 metadata.update({
                     key: value for key, value in event.data.items()
                     if key in {
