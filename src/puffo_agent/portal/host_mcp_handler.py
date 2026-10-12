@@ -841,6 +841,32 @@ async def gmail_mailbox(
     return await handler(ctx.credentials, **kw)
 
 
+async def slack_send(
+    ctx: HostMcpContext, *, channel: str, text: str, thread_ts: str = "", from_account: str = "",
+) -> dict[str, object]:
+    """Post to Slack as the workspace user shared with this agent."""
+    from .slack import send
+
+    return await send(
+        ctx.credentials, channel=channel, text=text, thread_ts=thread_ts,
+        from_account=from_account,
+    )
+
+
+async def connector(
+    ctx: HostMcpContext, *, provider: str, op: str, **kw,
+) -> dict[str, object]:
+    """A repeatable Slack or Discord read with the account shared with this agent."""
+    from . import discord, slack
+
+    handler = {
+        "slack": {"search": slack.search, "read": slack.read, "list_channels": slack.list_channels},
+        "discord": {"whoami": discord.whoami, "guilds": discord.guilds,
+                    "guild_member": discord.guild_member, "connections": discord.connections},
+    }[provider][op]
+    return await handler(ctx.credentials, **kw)
+
+
 async def create_reminder(
     ctx: HostMcpContext,
     *,

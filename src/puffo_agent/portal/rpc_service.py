@@ -590,6 +590,21 @@ async def gmail_send_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _check_op_body(body, ops: dict) -> str | None:
+    """Why an ``{"op": …, …}`` body is not acceptable, or ``None``. ``ops``
+    maps op → (required string fields, optional fields with their type)."""
+    if not isinstance(body, dict) or body.get("op") not in ops:
+        return "op must be one of " + ", ".join(sorted(ops))
+    required, optional = ops[body["op"]]
+    fields = {k: v for k, v in body.items() if k != "op"}
+    if not required <= set(fields) or not set(fields) <= (required | set(optional)):
+        return f"{body['op']} takes {sorted(required)} and optionally {sorted(optional)}"
+    for name, value in fields.items():
+        if not isinstance(value, optional.get(name, str)) or isinstance(value, bool):
+            return f"{name} has the wrong type"
+    return None
+
+
 # op -> (required string fields, optional fields with their type)
 _MAILBOX_OPS = {
     "search": (set(), {"query": str, "limit": int, "from_account": str}),
@@ -608,21 +623,10 @@ async def gmail_mailbox_route(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "body must be JSON"}, status=400)
-    if not isinstance(body, dict) or body.get("op") not in _MAILBOX_OPS:
-        return web.json_response(
-            {"error": "op must be one of " + ", ".join(sorted(_MAILBOX_OPS))}, status=400,
-        )
-    op = body["op"]
-    required, optional = _MAILBOX_OPS[op]
-    fields = {k: v for k, v in body.items() if k != "op"}
-    if not required <= set(fields) or not set(fields) <= (required | set(optional)):
-        return web.json_response(
-            {"error": f"{op} takes {sorted(required)} and optionally {sorted(optional)}"},
-            status=400,
-        )
-    for name, value in fields.items():
-        if not isinstance(value, optional.get(name, str)) or isinstance(value, bool):
-            return web.json_response({"error": f"{name} has the wrong type"}, status=400)
+    problem = _check_op_body(body, _MAILBOX_OPS)
+    if problem:
+        return web.json_response({"error": problem}, status=400)
+    op, fields = body["op"], {k: v for k, v in body.items() if k != "op"}
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
         return web.json_response(
@@ -639,6 +643,90 @@ async def gmail_mailbox_route(request: web.Request) -> web.Response:
              "code": "no_answer"}, status=400,
         )
     return web.json_response(result)
+
+
+async def slack_send_route(request: web.Request) -> web.Response:
+    """Post one Slack message. 4xx: definitely not posted. 200 carries
+    ``status`` "sent" or "unknown"."""
+    from .oauth_connector import ConnectorError
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    fields = ("channel", "text", "thread_ts", "from_account")
+    if not isinstance(body, dict) or not set(body) <= set(fields) or not all(
+        isinstance(body.get(k, ""), str) for k in fields
+    ):
+        return web.json_response(
+            {"error": "slack_send accepts only string channel, text, thread_ts, from_account"},
+            status=400,
+        )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        # 409, not 503: a 5xx reads as "unknown" one hop up.
+        return web.json_response(
+            {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
+            status=409,
+        )
+    try:
+        result = await host_mcp_handler.slack_send(
+            ctx, channel=body.get("channel", ""), text=body.get("text", ""),
+            thread_ts=body.get("thread_ts", ""), from_account=body.get("from_account", ""),
+        )
+    except ConnectorError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+    return web.json_response(result)
+
+
+_CONNECTOR_OPS = {
+    "slack": {
+        "search": ({"query"}, {"limit": int, "from_account": str}),
+        "read": ({"channel"}, {"limit": int, "thread_ts": str, "from_account": str}),
+        "list_channels": (set(), {"types": str, "limit": int, "from_account": str}),
+    },
+    "discord": {
+        "whoami": (set(), {"from_account": str}),
+        "guilds": (set(), {"from_account": str}),
+        "guild_member": ({"guild_id"}, {"from_account": str}),
+        "connections": (set(), {"from_account": str}),
+    },
+}
+
+
+def connector_route(provider: str):
+    """The repeatable operations of one connector, behind one route."""
+    ops = _CONNECTOR_OPS[provider]
+
+    async def route(request: web.Request) -> web.Response:
+        from .oauth_connector import ConnectorError, ConnectorLostAnswer
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        problem = _check_op_body(body, ops)
+        if problem:
+            return web.json_response({"error": problem}, status=400)
+        op, fields = body["op"], {k: v for k, v in body.items() if k != "op"}
+        ctx = _warm_context(request.match_info["agent_id"])
+        if ctx is None:
+            return web.json_response(
+                {"error": "the agent is not running yet", "code": "no_worker"}, status=409,
+            )
+        try:
+            result = await host_mcp_handler.connector(ctx, provider=provider, op=op, **fields)
+        except ConnectorError as exc:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+        except ConnectorLostAnswer as exc:
+            return web.json_response(
+                {"error": f"{exc}; nothing changed, so this is safe to try again",
+                 "code": "no_answer"}, status=400,
+            )
+        return web.json_response(result)
+
+    route.__name__ = f"{provider}_route"
+    return route
 
 
 async def create_reminder_route(request: web.Request) -> web.Response:
@@ -902,6 +990,18 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/gmail-mailbox",
         gmail_mailbox_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/slack-send",
+        slack_send_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/slack",
+        connector_route("slack"),
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/discord",
+        connector_route("discord"),
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",

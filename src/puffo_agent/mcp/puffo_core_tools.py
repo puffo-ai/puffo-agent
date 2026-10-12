@@ -728,6 +728,7 @@ def register_core_tools(
     result_surface: ToolResultSurface = "stdio_mcp",
 ) -> None:
     """Register the core MCP surface in its established public order."""
+    from .core_connector_tools import register_connector_tools
     from .core_gmail_tools import register_gmail_tools
     from .core_history_tools import register_history_tools
     from .core_host_tools import register_host_tools
@@ -745,6 +746,7 @@ def register_core_tools(
     register_host_tools(mcp, cfg)
     register_monid_tools(mcp, cfg)
     register_gmail_tools(mcp, cfg)
+    register_connector_tools(mcp, cfg)
 
     if cfg.bridge_client is not None:
         from .lifecycle_tools import register_lifecycle_tools

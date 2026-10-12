@@ -14,6 +14,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   discover its own access by triggering an error: with several Google
   accounts shared, `gmail_send` refused and listed them in the message.
 
+- **Agents can use the Slack workspace and Discord account their operator
+  connected in Settings → Apps.** Slack: `slack_send` (optionally into a
+  thread), `slack_search` (Slack's own search syntax), `slack_read` (a
+  conversation's latest messages or one thread, authors named where Slack
+  will say) and `slack_list_channels` (channels, groups and DMs with their
+  ids). Discord: `discord_whoami`, `discord_guilds`, `discord_guild_member`
+  and `discord_connections` — identity and membership only, since the
+  approval-free user grant cannot read or post messages. Posting to Slack
+  reports *sent*, *failed* or *unknown* like `gmail_send` does ("unknown"
+  means it may have gone out and must not be posted again without checking
+  the channel); every read is repeatable and reports a plain failure. A
+  token Slack or Discord refuses is refreshed once, then the error says to
+  reconnect the account. Tokens and message text never reach the log.
+
 - **Agents can work a mailbox their operator shared with them.** Four tools:
   `gmail_send`, `gmail_search` (Gmail's own search syntax), `gmail_read`
   (HTML mail is converted to text, attachments are listed by name only) and
