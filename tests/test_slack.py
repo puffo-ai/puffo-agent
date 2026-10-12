@@ -39,6 +39,13 @@ async def _send(w, api, **kw):
     return await slack.send(w, transport=api, api=API, **kw)
 
 
+def test_the_types_are_the_ones_puffo_server_provisions():
+    """Written out, not derived: the server names the provider "slackuser"
+    (``SlackProvider::NAME``), and a guess of "slack" lists nothing."""
+    assert (slack.CONNECTOR.rt_type, slack.CONNECTOR.at_type) == (
+        "PUFFO_SLACKUSER_OAUTH_v1", "PUFFO_SLACKUSER_OAUTH_AT_v1")
+
+
 # ── posting ─────────────────────────────────────────────────────────
 
 

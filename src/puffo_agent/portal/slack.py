@@ -24,9 +24,11 @@ from .oauth_connector import (
 
 logger = logging.getLogger(__name__)
 
+# puffo-server registers the provider as "slackuser" (the user half of the
+# grant), so the types say SLACKUSER, not SLACK.
 CONNECTOR = Connector(
     name="slack", label="Slack workspace",
-    rt_type="PUFFO_SLACK_OAUTH_v1", at_type="PUFFO_SLACK_OAUTH_AT_v1",
+    rt_type="PUFFO_SLACKUSER_OAUTH_v1", at_type="PUFFO_SLACKUSER_OAUTH_AT_v1",
 )
 API = "https://slack.com/api"
 

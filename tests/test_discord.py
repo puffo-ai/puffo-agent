@@ -22,6 +22,12 @@ def wallet(**kw):
     return Wallet(discord.CONNECTOR, accounts=kw.pop("accounts", ((0, "ali#1"),)), **kw)
 
 
+def test_the_types_are_the_ones_puffo_server_provisions():
+    """Written out, not derived: ``DiscordProvider::NAME`` is "discord"."""
+    assert (discord.CONNECTOR.rt_type, discord.CONNECTOR.at_type) == (
+        "PUFFO_DISCORD_OAUTH_v1", "PUFFO_DISCORD_OAUTH_AT_v1")
+
+
 @pytest.mark.asyncio
 async def test_whoami_is_a_get_with_the_token_and_a_user_agent():
     api = Scripted((200, {"id": "1", "username": "ali", "global_name": "Ali", "email": "a@x", "verified": True}))
