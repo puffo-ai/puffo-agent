@@ -147,36 +147,61 @@ class PuffoRpcClient:
         already have sent it, so a hang-up, timeout or 5xx is "unknown" and
         must never be retried.
         """
-        path = f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/gmail-send"
         payload = {"to": to, "subject": subject, "body": body}
         if from_account:
             payload["from_account"] = from_account
-        unknown = {
-            "status": "unknown",
-            "detail": "the answer from the daemon was lost. The message may have been "
-                      "sent; do not send it again without checking the Sent folder.",
-        }
+        return await self._post_may_have_sent(
+            "gmail-send", payload, what="gmail_send",
+            unknown="the answer from the daemon was lost. The message may have been "
+                    "sent; do not send it again without checking the Sent folder.",
+        )
+
+    async def slack_send(
+        self, *, channel: str, text: str, thread_ts: str = "", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Post through the daemon; same three outcomes as ``gmail_send``."""
+        payload = {"channel": channel, "text": text}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        if from_account:
+            payload["from_account"] = from_account
+        return await self._post_may_have_sent(
+            "slack-send", payload, what="slack_send",
+            unknown="the answer from the daemon was lost. The message may have been "
+                    "posted; do not post it again without checking the channel.",
+        )
+
+    async def _post_may_have_sent(
+        self, route: str, payload: dict[str, Any], *, what: str, unknown: str,
+    ) -> dict[str, Any]:
+        path = f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/{route}"
+        lost = {"status": "unknown", "detail": unknown}
         session = await self._get_session()
         try:
             async with session.post(f"{self.base_url}{path}", json=payload) as resp:
                 status = resp.status
                 if status >= 500:
-                    return unknown
+                    return lost
                 try:
                     data = await resp.json()
                 except Exception:
                     data = None
         except aiohttp.ClientConnectorError as exc:
-            raise RuntimeError(f"gmail_send: daemon unreachable, nothing was sent: {exc}") from exc
+            raise RuntimeError(f"{what}: daemon unreachable, nothing was sent: {exc}") from exc
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            return unknown
+            return lost
         if status >= 400:
             # The daemon answers 4xx only when nothing was sent.
             error = data.get("error") if isinstance(data, dict) else None
             raise RuntimeError(f"not sent: {error or status}")
         if not isinstance(data, dict):
-            return unknown
+            return lost
         return data
+
+    async def connector(self, provider: str, op: str, **fields) -> dict[str, Any]:
+        """Slack or Discord, repeatable operations only: ordinary route
+        semantics."""
+        return await self._post_object(provider, {"op": op, **fields})
 
     async def gmail_mailbox(self, op: str, **fields) -> dict[str, Any]:
         """Read or file mail. Idempotent, so ordinary route semantics."""
