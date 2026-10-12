@@ -6,13 +6,51 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-12
+
 ### Added
+
+- **Scheduled tasks.** Five tools — `create_schedule`, `list_schedules`,
+  `get_schedule`, `update_schedule` and `delete_schedule` — let an agent
+  manage one-off and recurring prompt tasks that the server owns and fires.
+  A task's prompt is encrypted and signed with the agent's existing keys
+  (keyless cloud agents use the trusted KMS bridge); a delivery whose
+  signature, owner, agent, revision or recurrence does not check out is
+  rejected. A due task arrives as a durable system event in the Inbox, stored
+  before the message is acknowledged, and is deduplicated across restarts and
+  reconnects. `list_schedules` omits completed tasks; `get_schedule` still
+  reads one by id. `completed_at` means the event was delivered, not that the
+  agent's turn succeeded. A row the agent cannot open is listed with
+  `opened: false` so it can still be deleted or replaced. (#464)
+
+- **An agent can ask its owner for a credential.** `request_credential(type,
+  reason, alias?)` DMs the owner a request the web renders as a secure form.
+  The owner's browser seals the value and files it with the server — never as
+  a message — and the daemon, which sees the owner's reply before the model
+  does, places it and reloads the agent's CLI. `credential_status(request_id)` reports the outcome.
+  No tool ever returns a credential value. (#452)
+
+- **Cloud agents show membership changes.** Joins, leaves and similar space
+  events arriving over the cloud bridge become the same system messages a
+  native agent already sees. (#441)
+
+- **`puffo-agent agent restart <id>` respawns one agent's worker, and unparks
+  an agent stuck on a recovery gate.** Restarting a single agent previously
+  meant `pause` then `resume`. A quarantined turn additionally parks its
+  agent until an operator accepts that replaying it may repeat external
+  effects, and only the operator's remote client could accept that — a local
+  deployment had to hand-edit `turn_recovery.json`. Restarting a named agent
+  is now that acceptance: it requeues the quarantined turn's messages and
+  says so. An unattended respawn still cannot replay silently, and the
+  command refuses to clear a gate whose provider stop is unconfirmed.
+  `agent show` reports an open gate, and the parked-state diagnostic names
+  the command instead of the internal wire ops. (#429)
 
 - **Agents can see which credentials they hold.** A new `list_credentials`
   tool returns the type, index, version and alias of everything the operator
   has shared — metadata only, never a secret. Until now an agent could only
   discover its own access by triggering an error: with several Google
-  accounts shared, `gmail_send` refused and listed them in the message.
+  accounts shared, `gmail_send` refused and listed them in the message. (#465)
 
 - **Agents can use the Slack workspace and Discord account their operator
   connected in Settings → Apps.** Slack: `slack_send` (optionally into a
@@ -26,7 +64,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   means it may have gone out and must not be posted again without checking
   the channel); every read is repeatable and reports a plain failure. A
   token Slack or Discord refuses is refreshed once, then the error says to
-  reconnect the account. Tokens and message text never reach the log.
+  reconnect the account. Tokens and message text never reach the log. (#465)
 
 - **Agents can work a mailbox their operator shared with them.** Four tools:
   `gmail_send`, `gmail_search` (Gmail's own search syntax), `gmail_read`
@@ -47,13 +85,44 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A cloud agent reconnects within about a second after its sandbox
+  resumes, and notices a silently dead socket.** The bridge previously waited
+  on its own backoff (up to 30 s) after a resume, and a socket that died
+  without a close frame held messages until the next reconnect. It now ends
+  the stream on a wall-clock jump or after 45 s without any frame (the server
+  pings every 30 s), and reconnects immediately, then backs off to at most
+  5 s. Each loss and recovery is logged with its cause. (#446)
+
+- **Shared credentials reach the agent reliably.** At start the agent
+  registers its credential key (cloud agents claimed before the server
+  supported it had none), then places every credential the server lists for
+  it, of every type, so a rebuilt or resumed agent converges on what it was
+  granted without any local state. The owner's "filed" reply is acted on when
+  it arrives, not when a turn later reads it, and one request ledger per file
+  per process stops a filed reply from being silently ignored. Every outcome
+  is logged, never a value. (#454, #455, #456, #459, #460)
+
+- **`puffo-agent start` no longer mistakes another process for its daemon.**
+  Lifecycle markers are bound to the process's creation time, its Puffo home
+  and a per-run instance id, so a reused PID — including one from a different
+  Puffo home — cannot inherit readiness or receive the stop. Older daemons
+  stay detectable and stoppable. (#451)
+
+- **Update checks survive GitHub's API rate limit.** `check-update`, the
+  startup "you are behind" warning and the LingTai kernel check fall back to
+  the public `releases/latest` redirect, which has no quota. (#450)
+
+- **OpenCode reports the context window of a newly published model.** When the
+  window is unknown before the first turn, it is looked up once more after
+  that turn, once OpenCode has refreshed its online catalog. (#449)
+
 - **Attachment messages no longer lose their text when the agent writes
   `text=`.** `send_message` calls the body `text` while
   `send_message_with_attachments` called it `caption`; a habitual `text=` was
   silently dropped, the files went out as bare cards, and the send still
   reported success — the operator and the agent then disagreed about what had
   been said. `text` is now accepted as an alias for `caption`, and passing two
-  different bodies is an error instead of a silent pick.
+  different bodies is an error instead of a silent pick. (#463)
 
 - **No more "my Claude sign-in has expired" DM for a credential that just
   rotated fine.** A 401 on a turn and the rotation that fixes it are the same
@@ -63,7 +132,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   believable. The DM now waits briefly and checks that the failure is still
   live before sending; a recovery in between drops it and logs why. A genuine
   expiry still notifies, and a real failure after a recovered blip still
-  notifies.
+  notifies. (#440)
+
+### Deploy notes
+
+- Scheduled tasks need puffo-server with the schedule routes (server #450 and
+  #463) and the web schedule UI (puffo-core-han-group#1446). The Slack and
+  Discord connectors need the Connect buttons in Settings → Apps
+  (puffo-core-han-group#1468). Cloud membership messages need server #429;
+  that change is additive, so either deploy order is safe.
 
 ## [2.0.14] - 2026-10-01
 
@@ -102,17 +179,6 @@ Same runtime as 2.0.13, plus one display fix and a safer release pipeline.
 
 ### Added
 
-- **`puffo-agent agent restart <id>` respawns one agent's worker, and unparks
-  an agent stuck on a recovery gate.** Restarting a single agent previously
-  meant `pause` then `resume`. A quarantined turn additionally parks its
-  agent until an operator accepts that replaying it may repeat external
-  effects, and only the operator's remote client could accept that — a local
-  deployment had to hand-edit `turn_recovery.json`. Restarting a named agent
-  is now that acceptance: it requeues the quarantined turn's messages and
-  says so. An unattended respawn still cannot replay silently, and the
-  command refuses to clear a gate whose provider stop is unconfirmed.
-  `agent show` reports an open gate, and the parked-state diagnostic names
-  the command instead of the internal wire ops.
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate
