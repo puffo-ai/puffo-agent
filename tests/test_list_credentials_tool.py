@@ -1,8 +1,4 @@
-"""The ``list_credentials`` tool, handler and RPC route.
-
-Metadata only: the one property worth protecting here is that a secret can
-never travel this path, whatever the server puts in the listing.
-"""
+"""``list_credentials``: tool, handler, RPC route; metadata only."""
 
 from __future__ import annotations
 
@@ -18,7 +14,7 @@ from puffo_agent.portal import host_mcp_handler
 
 
 class _Wallet:
-    """Stands in for ``AgentCredentials``; ``held_all`` is all this path uses."""
+    """``AgentCredentials`` stand-in: ``held_all`` only."""
 
     def __init__(self, rows):
         self.rows = rows
@@ -52,7 +48,7 @@ async def test_it_reports_the_metadata_of_everything_held():
 
 @pytest.mark.asyncio
 async def test_a_value_in_the_listing_is_not_passed_on():
-    """The projection is the guard: extra fields are dropped, not forwarded."""
+    """Guard: projection drops extra fields."""
     leaky = dict(ROW, blob="c2VjcmV0", value="hunter2", access_token="ya29.secret")
     result = await host_mcp_handler.list_credentials(_ctx(_Wallet([leaky])))
     assert result["credentials"] == [ROW]
@@ -102,7 +98,6 @@ async def test_the_tool_without_rpc_gives_guidance():
 
 
 def test_the_tool_is_in_the_core_tool_list():
-    # Absent here, the CLI refuses the call however well the rest is wired.
     assert "list_credentials" in PUFFO_CORE_TOOL_NAMES
 
 

@@ -1,10 +1,4 @@
-"""Slack against a fake Slack.
-
-The cells that matter: posting keeps "unknown" distinct from failure, Slack's
-``ok: false`` is read as the status it is, a bad token is refreshed once and
-then named, repeatable calls stay retryable, and tokens and message text stay
-out of the log.
-"""
+"""Slack against a fake Slack: post outcomes, ``ok: false``, refresh, log hygiene."""
 
 import logging
 from types import SimpleNamespace as NS
@@ -40,13 +34,9 @@ async def _send(w, api, **kw):
 
 
 def test_the_types_are_the_ones_puffo_server_provisions():
-    """Written out, not derived: the server names the provider "slackuser"
-    (``SlackProvider::NAME``), and a guess of "slack" lists nothing."""
+    """Literal server names (``SlackProvider::NAME`` = "slackuser")."""
     assert (slack.CONNECTOR.rt_type, slack.CONNECTOR.at_type) == (
         "PUFFO_SLACKUSER_OAUTH_v1", "PUFFO_SLACKUSER_OAUTH_AT_v1")
-
-
-# ── posting ─────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -114,9 +104,6 @@ async def test_a_lost_answer_to_a_post_is_unknown_and_never_reposted(answer):
     assert len(api.requests) == 1
 
 
-# ── reading ─────────────────────────────────────────────────────────
-
-
 def users(**names):
     return {f"/users.info": [ok(user={"id": uid, "name": n, "real_name": n.title()}) for uid, n in names.items()]}
 
@@ -149,7 +136,6 @@ async def test_a_blank_query_or_channel_is_refused_before_any_request():
 
 @pytest.mark.asyncio
 async def test_reading_a_channel_names_the_authors_it_can_and_leaves_the_rest_as_ids():
-    """A lookup that fails, and one that answers without a name, both leave the id."""
     history = ok(has_more=True, messages=[
         {"ts": "3", "user": "U1", "text": "hi", "reply_count": 2},
         {"ts": "2", "user": "U2", "text": "yo", "subtype": "bot_message", "username": "deploybot"},
@@ -228,9 +214,6 @@ async def test_the_log_carries_codes_and_ids_not_tokens_or_message_text(caplog):
     assert "7.7" in text and "slack_channel_not_found" in text and "outcome unknown" in text
     for secret in (TOKEN, FRESH, "hello there"):
         assert secret not in text
-
-
-# ── the daemon route and the RPC hop ────────────────────────────────
 
 
 def _route_app():
@@ -372,7 +355,7 @@ async def test_the_rpc_hop_keeps_unknown_distinct_from_failure(unused_tcp_port, 
     finally:
         await client.close()
         await runner.cleanup()
-    # Only the fields that were given travel; nothing is padded in.
+    # only given fields travel
     assert seen == ({"channel": "C1", "text": "t", "thread_ts": "1.0"} if expected == "error"
                     else {"channel": "C1", "text": "t", "from_account": "acme-hq"})
 

@@ -1,9 +1,4 @@
-"""The request path every connected provider shares.
-
-What matters: the right account is chosen or the agent is asked, a refused
-token is refreshed exactly once, and "never went out" stays distinct from
-"the answer was lost". Provider reply semantics are tested with each provider.
-"""
+"""Shared connector path: account choice, one refresh, definite vs lost."""
 
 import asyncio
 import json
@@ -37,7 +32,7 @@ def token(connector, value):
 
 
 class Wallet:
-    """The three AgentCredentials calls a connector makes."""
+    """``AgentCredentials`` stand-in."""
 
     def __init__(self, connector=ACME, accounts=((0, "acme-main"),), cached=TOKEN):
         self.connector, self.accounts, self.cached = connector, list(accounts), cached
@@ -61,8 +56,7 @@ class Wallet:
 
 
 class Scripted:
-    """Answers in order; records every request. An answer is an exception,
-    ``(status, json-able)`` or ``(status, bytes)``."""
+    """Answers in order: exception | (status, json) | (status, bytes)."""
 
     def __init__(self, *answers):
         self.answers, self.requests = list(answers), []
@@ -77,7 +71,7 @@ class Scripted:
 
 
 class Routed(Scripted):
-    """Answers keyed by the path under ``base``; a list answers in order."""
+    """Answers by path under ``base``; a list answers in order."""
 
     def __init__(self, base, routes, fail_with=None):
         super().__init__()

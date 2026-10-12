@@ -1,10 +1,4 @@
-"""Discord, as the user the operator connected.
-
-The grant is approval-free user scopes only (``identify email guilds
-guilds.members.read connections``), so this reads who the user is and where
-they are; reading or posting messages needs a bot token Puffo does not hold.
-Everything here is repeatable, so a lost answer is simply retryable.
-"""
+"""Discord as the connected user: identity scopes only (no messages), all reads."""
 
 from __future__ import annotations
 
@@ -30,7 +24,7 @@ CONNECTOR = Connector(
     rt_type="PUFFO_DISCORD_OAUTH_v1", at_type="PUFFO_DISCORD_OAUTH_AT_v1",
 )
 API = "https://discord.com/api/v10"
-# Discord rejects requests without a User-Agent.
+# required by Discord
 HEADERS = {"user-agent": "puffo-agent"}
 
 
@@ -114,9 +108,6 @@ async def connections(
     ]
     logger.info("discord connections: %d", len(rows))
     return {"connections": rows, "count": len(rows)}
-
-
-# ── the shared request path ────────────────────────────────────────
 
 
 def _refused(status: int, data: Any) -> bool:

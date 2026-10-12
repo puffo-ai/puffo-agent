@@ -591,8 +591,7 @@ async def gmail_send_route(request: web.Request) -> web.Response:
 
 
 def _check_op_body(body, ops: dict) -> str | None:
-    """Why an ``{"op": …, …}`` body is not acceptable, or ``None``. ``ops``
-    maps op → (required string fields, optional fields with their type)."""
+    """Error for a bad ``{"op", ...}`` body, else ``None``."""
     if not isinstance(body, dict) or body.get("op") not in ops:
         return "op must be one of " + ", ".join(sorted(ops))
     required, optional = ops[body["op"]]
@@ -646,8 +645,7 @@ async def gmail_mailbox_route(request: web.Request) -> web.Response:
 
 
 async def slack_send_route(request: web.Request) -> web.Response:
-    """Post one Slack message. 4xx: definitely not posted. 200 carries
-    ``status`` "sent" or "unknown"."""
+    """4xx: not posted. 200: sent | unknown."""
     from .oauth_connector import ConnectorError
 
     try:
@@ -664,7 +662,7 @@ async def slack_send_route(request: web.Request) -> web.Response:
         )
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
-        # 409, not 503: a 5xx reads as "unknown" one hop up.
+        # 409, not 5xx: 5xx reads as unknown upstream
         return web.json_response(
             {"error": "the agent is not running yet; nothing was sent", "code": "no_worker"},
             status=409,
@@ -695,7 +693,6 @@ _CONNECTOR_OPS = {
 
 
 def connector_route(provider: str):
-    """The repeatable operations of one connector, behind one route."""
     ops = _CONNECTOR_OPS[provider]
 
     async def route(request: web.Request) -> web.Response:

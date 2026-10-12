@@ -1,12 +1,4 @@
-"""The request path shared by every provider an operator connects through
-Settings → Apps: pick the shared account, carry its access token, refresh it
-once when the provider refuses it. What a provider's reply *means* stays in
-the provider module; only ids and codes reach the log.
-
-Two failure kinds, because the caller's retry policy differs: a
-``ConnectorError`` is definite (nothing happened, or the provider refused),
-a ``ConnectorLostAnswer`` means the request may have been acted on.
-"""
+"""Shared OAuth connector request path: account pick, bearer token, one refresh."""
 
 from __future__ import annotations
 
@@ -25,17 +17,14 @@ from .credentials import AgentCredentials
 logger = logging.getLogger(__name__)
 
 Transport = Callable[..., Awaitable[tuple[int, bytes]]]
-# (status, parsed body or None) → "the token was refused".
+# (status, parsed body) -> token refused
 Refused = Callable[[int, Any], bool]
 
-# Refused rather than buffered; no provider answer should be anywhere near it.
 MAX_REPLY_BYTES = 30 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class Connector:
-    """One provider as the credential subsystem knows it."""
-
     name: str
     label: str
     rt_type: str
@@ -49,8 +38,7 @@ class Account:
 
 
 class ConnectorError(Exception):
-    """Definite: the request did not happen, or the provider refused it.
-    ``code`` is safe to log."""
+    """Definite: not sent, or refused. ``code`` is log-safe."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -58,7 +46,7 @@ class ConnectorError(Exception):
 
 
 class ConnectorLostAnswer(Exception):
-    """The request went out and the answer was lost."""
+    """Sent; answer lost."""
 
 
 async def pick_account(
@@ -113,10 +101,10 @@ async def access_token(connector: Connector, account: Account, *, fresh: bool) -
 
 
 async def _before_request(connector: Connector, code: str, call):
-    """Anything failing before the request goes out is definite."""
+    """Failure before sending = definite."""
     try:
         return await call
-    except Exception as exc:  # noqa: BLE001 - reported as a definite, logged-by-code failure
+    except Exception as exc:  # noqa: BLE001 - definite, logged by code
         _fail(connector, code)
         raise ConnectorError(code, f"nothing was sent: {type(exc).__name__}: {exc}") from exc
 
@@ -133,9 +121,7 @@ async def call(
     transport: Transport | None = None,
     refused: Refused,
 ) -> tuple[int, Any]:
-    """One authed request, retried once with a fresh token when ``refused``
-    says the provider turned the token away. Returns the status and the
-    parsed JSON body (``None`` when the body is not JSON)."""
+    """One authed request; one refresh when ``refused``. Body ``None`` = not JSON."""
     if params:
         url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
     body = json.dumps(payload).encode() if payload is not None else None
@@ -187,7 +173,7 @@ async def http_transport(
 
 
 async def _read_body(resp) -> bytes:
-    """Read to the end: ``read(n)`` returns what is buffered, not n bytes."""
+    """``read(n)`` returns only what is buffered."""
     chunks, total = [], 0
     async for chunk in resp.content.iter_chunked(64 * 1024):
         total += len(chunk)

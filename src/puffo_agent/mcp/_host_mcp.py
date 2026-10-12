@@ -159,7 +159,7 @@ class PuffoRpcClient:
     async def slack_send(
         self, *, channel: str, text: str, thread_ts: str = "", from_account: str = "",
     ) -> dict[str, Any]:
-        """Post through the daemon; same three outcomes as ``gmail_send``."""
+        """Same outcomes as ``gmail_send``."""
         payload = {"channel": channel, "text": text}
         if thread_ts:
             payload["thread_ts"] = thread_ts
@@ -199,8 +199,7 @@ class PuffoRpcClient:
         return data
 
     async def connector(self, provider: str, op: str, **fields) -> dict[str, Any]:
-        """Slack or Discord, repeatable operations only: ordinary route
-        semantics."""
+        """Repeatable ops only."""
         return await self._post_object(provider, {"op": op, **fields})
 
     async def gmail_mailbox(self, op: str, **fields) -> dict[str, Any]:

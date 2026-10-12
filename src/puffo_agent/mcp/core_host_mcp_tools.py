@@ -130,16 +130,12 @@ def _register_credential_request(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def list_credentials() -> dict[str, Any]:
-        """Every credential your operator has shared with you: ``type``,
-        ``index``, ``version`` and ``alias``. Metadata only — the secret
-        itself is never returned here, and never needs to be: the tools that
-        use a credential fetch and decrypt it themselves.
+        """Credentials your operator shared with you: ``type``, ``index``,
+        ``version``, ``alias``. Metadata only — the secret is never returned here.
 
-        Use it to answer "what do I have access to", to find the ``alias``
-        a tool wants for ``from_account``, or to check that something you
-        asked for with ``request_credential`` has actually landed. An empty
-        list means nothing is shared with you right now, which is not an
-        error. A credential your operator switched off is not listed.
+        Use it to see what you can access, find the ``alias`` for
+        ``from_account``, or confirm a ``request_credential`` landed. Empty =
+        nothing shared; switched-off credentials are not listed.
         """
         if cfg.rpc_client is None:
             raise RuntimeError(

@@ -1,9 +1,4 @@
-"""Discord against a fake Discord: identity-only reads with a user token.
-
-The cells that matter: a 401 is refreshed once and then named, 403 points
-at the grant rather than looking like a bug, a rate limit is retryable and
-says how long, and list answers that are not lists read as empty.
-"""
+"""Discord against a fake Discord: identity reads, refresh, 403/429 mapping."""
 
 from types import SimpleNamespace as NS
 
@@ -23,7 +18,7 @@ def wallet(**kw):
 
 
 def test_the_types_are_the_ones_puffo_server_provisions():
-    """Written out, not derived: ``DiscordProvider::NAME`` is "discord"."""
+    """Literal server names (``DiscordProvider::NAME`` = "discord")."""
     assert (discord.CONNECTOR.rt_type, discord.CONNECTOR.at_type) == (
         "PUFFO_DISCORD_OAUTH_v1", "PUFFO_DISCORD_OAUTH_AT_v1")
 

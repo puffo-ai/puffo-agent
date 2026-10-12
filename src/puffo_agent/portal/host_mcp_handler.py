@@ -735,11 +735,7 @@ async def credential_status(ctx: HostMcpContext, *, request_id: str = "") -> str
 
 
 async def list_credentials(ctx: HostMcpContext) -> dict[str, Any]:
-    """Metadata of every credential this agent holds. Never a value.
-
-    Each row is projected field by field, so a server that one day returns
-    the wrapped blob alongside the listing still cannot leak it through here.
-    """
+    """Metadata only; projected per field so a blob cannot leak."""
     credentials = ctx.credentials
     if credentials is None:
         raise RuntimeError(
@@ -844,7 +840,6 @@ async def gmail_mailbox(
 async def slack_send(
     ctx: HostMcpContext, *, channel: str, text: str, thread_ts: str = "", from_account: str = "",
 ) -> dict[str, object]:
-    """Post to Slack as the workspace user shared with this agent."""
     from .slack import send
 
     return await send(
@@ -856,7 +851,6 @@ async def slack_send(
 async def connector(
     ctx: HostMcpContext, *, provider: str, op: str, **kw,
 ) -> dict[str, object]:
-    """A repeatable Slack or Discord read with the account shared with this agent."""
     from . import discord, slack
 
     handler = {

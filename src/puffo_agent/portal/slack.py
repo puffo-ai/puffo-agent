@@ -1,10 +1,4 @@
-"""Slack, as the user the operator connected: post, search, read and list.
-
-Posting is the one non-idempotent call, so it keeps the three outcomes
-(*sent*, *failed*, *unknown*); everything else is repeatable and a lost
-answer is simply retryable. Slack fails with HTTP 200 and ``ok: false``, so
-``ok`` is the status. Only ids and codes reach the log.
-"""
+"""Slack as the connected user. Only posting is non-idempotent; ``ok`` is the status."""
 
 from __future__ import annotations
 
@@ -24,24 +18,21 @@ from .oauth_connector import (
 
 logger = logging.getLogger(__name__)
 
-# puffo-server registers the provider as "slackuser" (the user half of the
-# grant), so the types say SLACKUSER, not SLACK.
+# server provider name: "slackuser"
 CONNECTOR = Connector(
     name="slack", label="Slack workspace",
     rt_type="PUFFO_SLACKUSER_OAUTH_v1", at_type="PUFFO_SLACKUSER_OAUTH_AT_v1",
 )
 API = "https://slack.com/api"
 
-# Slack's own names for "this token is no good"; one refresh, then reconnect.
+# refresh once, then reconnect
 AUTH_ERRORS = frozenset({
     "invalid_auth", "token_revoked", "token_expired", "not_authed", "account_inactive",
 })
 CHANNEL_KINDS = ("public_channel", "private_channel", "mpim", "im")
 DEFAULT_KINDS = ",".join(CHANNEL_KINDS)
 MAX_RESULTS = 50
-# Past this a message would bury the agent's own context; the cut is flagged.
 MAX_TEXT_CHARS = 4000
-# Name lookups are a courtesy; a long channel does not get one per author.
 MAX_NAME_LOOKUPS = 25
 
 
@@ -55,8 +46,7 @@ async def send(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """``{"status": "sent" | "unknown", ...}``; raises when it definitely
-    was not posted."""
+    """Raises only when definitely not posted."""
     if not channel.strip():
         raise ConnectorError("bad_request", "channel is required")
     if not text.strip():
@@ -88,7 +78,6 @@ async def search(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Messages matching a Slack search, newest first."""
     if not query.strip():
         raise ConnectorError("bad_request", "query is required")
     account = await pick_account(CONNECTOR, credentials, from_account)
@@ -113,7 +102,6 @@ async def read(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """A conversation's latest messages, or one thread's replies."""
     if not channel.strip():
         raise ConnectorError("bad_request", "channel is required")
     account = await pick_account(CONNECTOR, credentials, from_account)
@@ -144,7 +132,6 @@ async def list_channels(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Conversations the connected user can see: channels, groups, DMs."""
     kinds = [k.strip() for k in (types or DEFAULT_KINDS).split(",") if k.strip()]
     unknown = [k for k in kinds if k not in CHANNEL_KINDS]
     if unknown:
@@ -167,9 +154,6 @@ async def list_channels(
     return {"channels": channels, "count": len(channels)}
 
 
-# ── the shared request path ────────────────────────────────────────
-
-
 def _refused(status: int, data: Any) -> bool:
     return status == 401 or (
         isinstance(data, dict) and data.get("ok") is False and data.get("error") in AUTH_ERRORS
@@ -184,9 +168,7 @@ async def _get(account: Account, url: str, params: dict, transport) -> dict:
 
 
 def _ok(status: int, data: Any, *, retryable: bool) -> dict:
-    """Slack's answer, or the right kind of failure. ``retryable`` is the
-    caller's idempotency: a rate limit or 5xx on a repeatable call is a lost
-    answer, on a post it is definite (Slack does not act on either)."""
+    """429: retryable on reads, definite on post."""
     if status == 429:
         if retryable:
             _fail("rate_limited")
@@ -232,9 +214,6 @@ def _fail(code: str) -> None:
 
 def _limit(asked: int, default: int, *, ceiling: int = MAX_RESULTS) -> int:
     return max(1, min(int(asked or default), ceiling))
-
-
-# ── shaping what the agent sees ────────────────────────────────────
 
 
 def _text(message: dict) -> tuple[str, bool]:
@@ -294,9 +273,7 @@ def _channel(c: dict, names: dict[str, str]) -> dict:
 
 
 async def _user_names(account: Account, ids: set, transport, api: str) -> dict[str, str]:
-    """Display names for author ids, best effort: an id that cannot be
-    resolved is shown as the id. Bounded so a busy channel costs one
-    request per author only up to the cap."""
+    """Best effort, capped; unresolved ids stay ids."""
     names: dict[str, str] = {}
     for user in sorted(u for u in ids if isinstance(u, str) and u)[:MAX_NAME_LOOKUPS]:
         try:
