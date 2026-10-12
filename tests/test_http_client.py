@@ -511,6 +511,7 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
             self._echo,
         )
         app.router.add_route("GET", "/v2/cloud-agents/spaces", self._echo)
+        app.router.add_route("DELETE", "/v2/cloud-agents/agents/self/schedules/one", self._echo)
         # Signed routes — used to prove the shim never touches them.
         app.router.add_route("GET", "/health", self._echo)
         app.router.add_route("POST", "/messages", self._echo)
@@ -520,6 +521,21 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
         self.captured_headers = {k.lower(): v for k, v in request.headers.items()}
         self.captured_body = await request.read()
         return web.json_response({"ok": True, "blob_id": "b1"})
+
+    @unittest_run_loop
+    async def test_delete_schedule_uses_egress_auth_and_propagates_rejection(self):
+        client = PuffoCoreHttpClient(f"http://localhost:{self.server.port}", self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-schedule"}):
+                await client.delete_unsigned("/v2/cloud-agents/agents/self/schedules/one?version=4")
+            assert self.captured_headers["x-sandbox-token"] == "tok-schedule"
+            assert "x-puffo-signature" not in self.captured_headers
+            assert self.captured_body == b""
+            with self.assertRaises(HttpError) as error:
+                await client.delete_unsigned("/v2/cloud-agents/agents/self/schedules/missing")
+            assert error.exception.status == 404
+        finally:
+            await client.close()
 
     @unittest_run_loop
     async def test_post_bytes_unsigned_sends_raw_bytes_no_signature(self):

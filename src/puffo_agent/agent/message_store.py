@@ -871,6 +871,7 @@ class MessageStore(
         reason: str,
         intro_channel_id: str | None = None,
         received_at: int | None = None,
+        idempotent: bool = False,
     ) -> StoredMessage:
         async with self._inbox_lock:
             return await self._store_local_event_unlocked(
@@ -878,6 +879,7 @@ class MessageStore(
                 reason=reason,
                 intro_channel_id=intro_channel_id,
                 received_at=received_at,
+                idempotent=idempotent,
             )
 
     async def _store_local_event_unlocked(
@@ -887,6 +889,7 @@ class MessageStore(
         reason: str,
         intro_channel_id: str | None = None,
         received_at: int | None = None,
+        idempotent: bool = False,
     ) -> StoredMessage:
         values = self._payload_values(payload, received_at)
         envelope_id = values[0]
@@ -895,6 +898,20 @@ class MessageStore(
         db = await self._ensure_db()
         await db.execute("BEGIN IMMEDIATE")
         try:
+            if idempotent:
+                async with db.execute(
+                    "SELECT receipt_disposition, receipt_reason, content FROM messages WHERE envelope_id = ?",
+                    (envelope_id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is not None:
+                    if (existing["receipt_disposition"] != ReceiptDisposition.LOCAL_RUNTIME.value
+                            or existing["receipt_reason"] != reason or existing["content"] != values[7]):
+                        raise LifecycleConflict("local event id already has different content")
+                    await db.rollback()
+                    message = await self._get_message_by_envelope_unlocked(db, envelope_id)
+                    assert message is not None
+                    return message
             if intro_channel_id:
                 cursor = await db.execute(
                     "INSERT OR IGNORE INTO channel_intro_prompted(channel_id, prompted_at) "

@@ -179,6 +179,18 @@ class InboundReceiptHandler:
         self._read_plaintext = read_plaintext
 
     async def handle(self, delivery: ServerDelivery) -> TransportOutcome:
+        if delivery["envelope"].get("type") == "scheduled_message_envelope":
+            from .schedule_wire import commit_occurrence, verified_occurrence
+
+            wrapper = delivery["envelope"]
+            opened = await self._open_payload({"seq": delivery["seq"], "envelope": wrapper["template"]})
+            if opened is None or opened[1]:
+                return TransportOutcome.HOLD
+            content = verified_occurrence(opened[0], wrapper, agent=self.client.slug, owner=self.client.operator_slug)
+            await commit_occurrence(content, store=self.client.store, agent=self.client.slug,
+                                    owner=self.client.operator_slug,
+                                    notify=self.client.global_runtime.notify if self.client.global_runtime is not None else None)
+            return TransportOutcome.ACK
         opened = await self._open_payload(delivery)
         if opened is None:
             return TransportOutcome.HOLD

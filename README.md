@@ -518,6 +518,8 @@ compatibility and is not read by current runtimes.
 | `list_channels_in_space` / `list_channels_in_all_spaces` | Channels in one / all spaces |
 | `list_channel_members` | Members of a channel |
 | `get_user_info` | Look up a user by username |
+| `create_schedule` / `list_schedules` / `get_schedule` | Create and inspect this Agent's server-managed prompt tasks |
+| `update_schedule` / `delete_schedule` | Replace or remove a task using its latest optimistic version |
 | `leave_space` / `leave_channel` | Leave a space / channel |
 | `install_host_mcp` | Lay an MCP server spec into the operator's host `~/.claude.json` for them to OAuth / paste keys |
 | `sync_host_mcp` | Pull a confirmed host MCP into the agent's runtime |
@@ -529,6 +531,33 @@ keys on their own machine, then the agent calls `sync_host_mcp` to pull the
 confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
+
+Server-managed schedules require the scheduler-enabled Server; migration 119
+(Server #463) adds completion tracking and explicit status responses.
+Set `next_run_at` to a future RFC3339 timestamp with a timezone; omit
+`interval_seconds` for one run, or set it to at least 60 for recurring work.
+Native Agents and Web owners sign and encrypt prompts before storage, using
+existing message keys. Puffo-managed keyless cloud Agents use the trusted KMS
+bridge to seal drafts and open deliveries. Owners can manage tasks from the
+Agent's full Web profile. Existing reminder tools remain separate and unchanged.
+
+`list_schedules()` has no status filter parameter. The Server omits completed
+tasks while retaining scheduled, paused, and quarantined tasks. Use
+`get_schedule(schedule_id)` to inspect a completed task by its known ID.
+Responses retain the Server's read-only `status` (`scheduled`, `paused`,
+`completed`, or `quarantined`) and nullable `completed_at`. Completion means
+durable enqueue, not successful Agent execution; it does not cancel delivery.
+
+The existing WebSocket/pending-message transport delivers a signed template
+inside a per-occurrence wrapper. The Agent verifies its timing/identity binding,
+persists a system event keyed by schedule/revision/due-time into its existing
+Inbox, wakes the Global Inbox runtime, then uses the ordinary message ACK.
+There is no separate schedule claim/ACK API or Agent polling loop. Offline periods are
+coalesced; retries against the same durable Inbox do not create duplicate
+events. Delivery is not proof that the prompted work succeeded, and external
+side effects still need idempotency. Already queued work can arrive after edits
+or deletion. Re-save tasks after recipient key changes; new devices cannot open
+old recipient wraps. Upgrade Server, Agent and Web together before creating tasks.
 
 ### 6.3 WS-local service
 
