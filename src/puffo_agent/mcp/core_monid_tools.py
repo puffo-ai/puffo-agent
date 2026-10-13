@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -380,6 +381,39 @@ def _spend_retry_guidance(wire_key: str) -> str:
     )
 
 
+def _error_body(exc: HttpError) -> dict[str, Any]:
+    try:
+        parsed = json.loads(exc.body)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _is_provider_rate_limit(exc: HttpError) -> bool:
+    """Billing reports a provider's 429 as a 502 whose message names that status."""
+    return (
+        exc.status == 502
+        and _error_body(exc).get("message") == "provider returned status 429"
+    )
+
+
+def _known_charge(exc: HttpError) -> int | None:
+    """What a failed spend cost, from billing's ``charged_micro``. Billing sets it only
+    once the hold is released or settled; ``None`` means unknown (a parked spend, or a
+    billing that predates the field)."""
+    charged = _error_body(exc).get("charged_micro")
+    if isinstance(charged, bool) or not isinstance(charged, int) or charged < 0:
+        return None
+    return charged
+
+
+def _charge_note(charged: int) -> str:
+    if charged == 0:
+        return "Nothing was charged for this call."
+    dollars = (Decimal(charged) / 1_000_000).normalize()
+    return f"This call was charged ${dollars:f}."
+
+
 def _spend_failure(exc: HttpError, wire_key: str) -> RuntimeError:
     """Map a billing spend ``HttpError`` to the tool's error.
 
@@ -397,6 +431,35 @@ def _spend_failure(exc: HttpError, wire_key: str) -> RuntimeError:
             "will not run it again, so no new charge was made. To buy fresh "
             "data, change the request or pass a new explicit idempotency_key.\n"
             f"{_LABEL_NON_MONID}"
+        )
+    charged = _known_charge(exc)
+    if _is_provider_rate_limit(exc):
+        # The data source refused on request rate. This key's hold is already terminal, so
+        # an immediate same-key retry won't run again, and sibling endpoints usually share
+        # the limit. Without charged_micro the charge is unknown: billing sends this same
+        # 502 whether or not monid billed the refusal.
+        charge = (
+            _charge_note(charged)
+            if charged is not None
+            else "A refused call is normally not charged, but this error can't "
+            "confirm it: tell the user the charge is not confirmed, and don't "
+            "quote or estimate a cost."
+        )
+        return RuntimeError(
+            "monid spend failed: the data source is rate-limiting requests "
+            "(provider returned status 429). Wait a few minutes before trying "
+            "again, and don't switch to a similar endpoint meanwhile: they "
+            "usually share the limit. The same arguments in this turn won't run "
+            "again, so retry in a later turn or with a new explicit "
+            f"idempotency_key. {charge}\n"
+            f"{_LABEL_NON_MONID}"
+        )
+    if charged is not None:
+        # Billing resolved the hold and says what it cost, so nothing is ambiguous and a
+        # same-key retry would not run again.
+        return RuntimeError(
+            f"monid spend failed: {_monid_error_message(exc)}\n"
+            f"{_charge_note(charged)}\n{_LABEL_NON_MONID}"
         )
     # A charge may have settled before an ambiguous (non-4xx) failure surfaced;
     # retrying the same arguments recomputes the SAME key so billing settles it

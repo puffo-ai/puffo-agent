@@ -453,6 +453,139 @@ async def test_spend_409_conflict_is_mapped_cleanly():
     assert "automatic idempotency key was retired" not in message
 
 
+_SPEND_ARGS = {
+    "provider": "tikhub",
+    "endpoint": "/api/v1/kuaishou/web/fetch_one_video_comment",
+    "input": {"queryParams": {"photo_id": "3xvx3f345yzccpw"}},
+    "max_cost_micro": 10000,
+}
+
+
+@pytest.mark.asyncio
+async def test_spend_provider_rate_limit_says_wait_without_promising_no_charge():
+    """Billing reports a provider 429 as a 502. A same-key retry would only hit the
+    duplicate guard, so the error says to wait instead, and it can't know whether
+    monid billed the refusal, so it never claims nothing was charged."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            502,
+            json.dumps(
+                {
+                    "error": "upstream_error",
+                    "message": "provider returned status 429",
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "data source is rate-limiting requests" in message
+    assert "Wait a few minutes" in message
+    assert "don't switch to a similar endpoint" in message
+    assert "charge is not confirmed" in message
+    assert "reuse idempotency key" not in message
+    assert "reconcile that idempotency key" not in message
+    assert "nothing was charged" not in message
+    assert "no new charge was made" not in message
+    assert "MUST clearly label it as NOT a Monid result" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("charged", "note"),
+    [
+        (0, "Nothing was charged for this call."),
+        (2000, "This call was charged $0.002."),
+    ],
+)
+async def test_spend_provider_rate_limit_states_billing_reported_charge(charged, note):
+    """When billing reports what the failed call cost, the error says it exactly."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            502,
+            json.dumps(
+                {
+                    "error": "upstream_error",
+                    "message": "provider returned status 429",
+                    "charged_micro": charged,
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "data source is rate-limiting requests" in message
+    assert note in message
+    assert "not confirmed" not in message
+    assert "reuse idempotency key" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("charged", "note"),
+    [
+        (0, "Nothing was charged for this call."),
+        (2000, "This call was charged $0.002."),
+        (1_500_000, "This call was charged $1.5."),
+    ],
+)
+async def test_spend_failure_with_billing_reported_charge_is_not_ambiguous(
+    charged, note
+):
+    """A 5xx that carries charged_micro has a resolved hold: state the charge and drop
+    the same-key retry guidance, which would not run the spend again."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            502,
+            json.dumps(
+                {
+                    "error": "upstream_error",
+                    "message": "provider returned status 503",
+                    "charged_micro": charged,
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "provider returned status 503" in message
+    assert note in message
+    assert "reuse idempotency key" not in message
+    assert "rate-limiting" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps(
+            {"error": "upstream_error", "message": "provider returned status 503"}
+        ),
+        "provider returned status 429",
+    ],
+)
+async def test_spend_other_502_stays_ambiguous(body):
+    """Only a parsed provider-429 message is a rate limit; another provider status
+    or a non-JSON body keeps the ambiguous same-key retry guidance."""
+    http = _FakeHttp(post_error=HttpError(502, body))
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "reuse idempotency key" in message
+    assert "rate-limiting" not in message
+
+
 @pytest.mark.asyncio
 async def test_spend_distinct_requests_in_one_turn_get_distinct_keys():
     """Two different spends in the same turn derive different keys (the request

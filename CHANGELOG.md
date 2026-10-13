@@ -6,7 +6,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.1.0] - 2026-10-12
+## [2.1.0] - 2026-10-13
 
 ### Added
 
@@ -115,6 +115,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - **OpenCode reports the context window of a newly published model.** When the
   window is unknown before the first turn, it is looked up once more after
   that turn, once OpenCode has refreshed its online catalog. (#449)
+- **A rate-limited paid-data call now tells the agent to wait.** When the
+  data source behind monid refused with "requests too quickly", the agent was
+  told a charge may have settled and to retry at once. It told the user they
+  might have been charged, its immediate retry was refused as a duplicate,
+  and it switched to a similar endpoint that shares the same limit. The error
+  now says to wait a few minutes and not to switch endpoints. It states the
+  exact charge in dollars when billing reports one, and otherwise says it is
+  not confirmed. The primer adds two rules: on a rate limit, tell
+  the user the source is busy and when the retry is. Before a pull of many
+  pages, state the rough call count and cost and get an OK first. (#468)
+
 
 - **Attachment messages no longer lose their text when the agent writes
   `text=`.** `send_message` calls the body `text` while
