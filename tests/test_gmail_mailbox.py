@@ -770,4 +770,3 @@ async def test_a_failed_write_leaves_no_temp_file_behind(tmp_path):
         await get_attachment(Wallet(), message_id="m1", filename="r.xml",
                              workspace=tmp_path, transport=api, api=API)
     assert not list((tmp_path / "gmail-attachments" / "m1").glob(".part-*"))
-

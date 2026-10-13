@@ -955,4 +955,3 @@ async def test_the_routes_hand_the_workspace_and_drafts_through(tmp_path, monkey
             assert (tmp_path / (await saved.json())["path"]).read_bytes() == b"<feedback/>"
     finally:
         rpc_service._RPC_RESOLVER = previous
-
