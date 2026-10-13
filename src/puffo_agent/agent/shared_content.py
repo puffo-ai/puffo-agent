@@ -181,7 +181,11 @@ the real one. Flow: call `monid_prepare` to get ranked candidate capabilities,
 pick the one whose description matches your intent, then if within budget call
 `monid_spend` on it, honoring the returned price ceiling. For other, low-stakes
 facts that free search covers reliably, free search is fine — monid is for data
-that free access cannot reliably get.
+that free access cannot reliably get. If a spend is rate-limited, wait several
+minutes, tell the user plainly the data source is busy and when you'll retry,
+and don't switch to a similar endpoint meanwhile. Before a paged pull that
+needs many calls, tell the user roughly how many calls and what they cost, and
+get an OK first.
 """
 
 
@@ -1152,6 +1156,12 @@ Free search stays fine for low-stakes facts it covers reliably.
    its idempotency key so billing dedupes and you're not charged twice.
    Pass an explicit `idempotency_key` only to tie retries to your own
    logical operation; a genuinely new purchase needs new arguments.
+5. If a spend is rate-limited, wait several minutes, tell the user plainly
+   the data source is busy and when you'll retry, and don't switch to a
+   similar endpoint meanwhile — they usually share the limit.
+6. Before a paged pull that needs many calls (say 363 comments at about
+   2 per page), tell the user roughly how many calls and what they cost,
+   and get an OK first.
 
 You never hold the monid key or the money: Puffo holds the key, checks
 your budget, pays, and returns the result. Never install or run a monid
