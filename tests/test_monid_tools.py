@@ -495,6 +495,75 @@ async def test_spend_provider_rate_limit_says_wait_without_promising_no_charge()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("charged", "note"),
+    [
+        (0, "Nothing was charged for this call."),
+        (2000, "This call was charged 2000 micro-dollars."),
+    ],
+)
+async def test_spend_provider_rate_limit_states_billing_reported_charge(charged, note):
+    """When billing reports what the failed call cost, the error says it exactly."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            502,
+            json.dumps(
+                {
+                    "error": "upstream_error",
+                    "message": "provider returned status 429",
+                    "charged_micro": charged,
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "data source is rate-limiting requests" in message
+    assert note in message
+    assert "not confirmed" not in message
+    assert "reuse idempotency key" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("charged", "note"),
+    [
+        (0, "Nothing was charged for this call."),
+        (2000, "This call was charged 2000 micro-dollars."),
+    ],
+)
+async def test_spend_failure_with_billing_reported_charge_is_not_ambiguous(
+    charged, note
+):
+    """A 5xx that carries charged_micro has a resolved hold: state the charge and drop
+    the same-key retry guidance, which would not run the spend again."""
+    http = _FakeHttp(
+        post_error=HttpError(
+            502,
+            json.dumps(
+                {
+                    "error": "upstream_error",
+                    "message": "provider returned status 503",
+                    "charged_micro": charged,
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", _SPEND_ARGS)
+    message = str(excinfo.value)
+    assert "provider returned status 503" in message
+    assert note in message
+    assert "reuse idempotency key" not in message
+    assert "rate-limiting" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "body",
     [
         json.dumps(
