@@ -7,7 +7,9 @@ through the RPC hop alike.
 
 import asyncio
 import base64
+import copy
 import email
+import email.policy
 import json
 import logging
 
@@ -18,7 +20,9 @@ from aiohttp import web
 from puffo_agent.crypto.http_client import HttpError
 from puffo_agent.mcp._host_mcp import PuffoRpcClient
 from puffo_agent.portal.credentials import HeldCredential
-from puffo_agent.portal.gmail_send import AT_TYPE, RT_TYPE, GmailSendError, send
+from puffo_agent.portal.gmail_send import (
+    AT_TYPE, RT_TYPE, GmailSendError, build_message, create_draft, send, send_draft,
+)
 
 TOKEN, FRESH = "at-cached-7f3a", "at-fresh-91c2"
 
@@ -373,7 +377,9 @@ async def test_the_mcp_tool_hands_the_call_to_the_daemon():
     out = await registered["gmail_send"](
         to="b@x", subject="s", body="hello", from_account="me@example.com")
     assert out == {"status": "sent", "message_id": "m-9"}
-    assert calls == [{"to": "b@x", "subject": "s", "body": "hello",
+    assert calls == [{"to": "b@x", "subject": "s", "body": "hello", "cc": "", "bcc": "",
+                      "html_body": "", "reply_to_message_id": "",
+                      "forward_message_id": "", "attachments": [],
                       "from_account": "me@example.com"}]
 
 
@@ -476,7 +482,7 @@ async def test_the_route_reaches_the_worker_and_keeps_the_two_outcomes_apart(out
     monkeypatch.setattr(gs, "gmail_transport", transport)
     app, rpc_service = _route_app()
     previous = rpc_service._RPC_RESOLVER
-    rpc_service._RPC_RESOLVER = lambda agent_id: NS(credentials=Wallet())
+    rpc_service._RPC_RESOLVER = lambda agent_id: NS(credentials=Wallet(), workspace=None)
     try:
         async with TestClient(TestServer(app)) as http:
             resp = await http.post("/v1/rpc/agent-1/gmail-send",
@@ -565,3 +571,388 @@ async def test_an_answer_past_the_cap_is_refused_rather_than_buffered(unused_tcp
         assert exc.value.code == "too_large"
     finally:
         await runner.cleanup()
+
+
+# ── composing: cc, bcc, html, replies, forwards, attachments ───────
+
+API = "https://gmail.test/v1/users/me"
+
+
+class Routes:
+    """Answers by method and path; records every request."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    async def __call__(self, url, body, headers, *, method="POST"):
+        path = url.split("?", 1)[0].split("/users/me", 1)[-1]
+        self.calls.append((method, path, url, json.loads(body) if body else None))
+        answer = self.routes[(method, path)]
+        if isinstance(answer, list):
+            answer = answer.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer[0], json.dumps(answer[1]).encode()
+
+    def sent(self):
+        posts = [c for c in self.calls if c[0] == "POST"]
+        assert len(posts) == 1, posts
+        body = posts[0][3]
+        message = body.get("message", body)
+        return message, email.message_from_bytes(
+            base64.urlsafe_b64decode(message["raw"]), policy=email.policy.default)
+
+
+ORIGINAL = (200, {"id": "orig", "threadId": "thread-9", "payload": {"headers": [
+    {"name": "Message-ID", "value": "<abc@mail.example>"},
+    {"name": "References", "value": "<root@mail.example>"},
+    {"name": "Subject", "value": "DMARC report"},
+    {"name": "From", "value": "Alice <alice@example.com>"},
+    {"name": "Reply-To", "value": "reports@example.com"},
+]}})
+
+
+def test_cc_bcc_and_an_html_alternative_are_carried():
+    msg = email.message_from_bytes(build_message(
+        "b@x", "s", "plain", cc="c@x", bcc="d@x", html_body="<p>rich</p>"),
+        policy=email.policy.default)
+    assert (msg["Cc"], msg["Bcc"]) == ("c@x", "d@x")
+    assert msg.get_body(preferencelist=("html",)).get_content().strip() == "<p>rich</p>"
+    assert msg.get_body(preferencelist=("plain",)).get_content().strip() == "plain"
+
+
+def test_a_header_injection_through_cc_is_refused():
+    with pytest.raises(GmailSendError) as exc:
+        build_message("b@x", "s", "b", cc="c@x\r\nBcc: evil@x")
+    assert exc.value.code == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_stays_in_the_conversation_and_answers_the_sender():
+    gmail = Routes({("GET", "/messages/orig"): ORIGINAL,
+                    ("POST", "/messages/send"): _sent()})
+    out = await send(Wallet(), to="", subject="", body="ack", reply_to_message_id="orig",
+                     transport=gmail, send_url=f"{API}/messages/send", api=API)
+    assert out["status"] == "sent"
+    message, msg = gmail.sent()
+    assert message["threadId"] == "thread-9"
+    assert msg["In-Reply-To"] == "<abc@mail.example>"
+    assert msg["References"] == "<root@mail.example> <abc@mail.example>"
+    assert (msg["To"], msg["Subject"]) == ("reports@example.com", "Re: DMARC report")
+
+
+@pytest.mark.asyncio
+async def test_a_reply_does_not_stack_re_prefixes():
+    original = copy.deepcopy(ORIGINAL)
+    original[1]["payload"]["headers"][2]["value"] = "RE: DMARC report"
+    gmail = Routes({("GET", "/messages/orig"): original, ("POST", "/messages/send"): _sent()})
+    await send(Wallet(), to="x@y", subject="", body="ack", reply_to_message_id="orig",
+               transport=gmail, send_url=f"{API}/messages/send", api=API)
+    assert gmail.sent()[1]["Subject"] == "RE: DMARC report"
+
+
+@pytest.mark.asyncio
+async def test_a_forward_carries_the_original_with_its_attachments():
+    inner = email.message.EmailMessage()
+    inner["Subject"] = "Q3 numbers"
+    inner.set_content("see attached")
+    inner.add_attachment(b"1,2,3", maintype="text", subtype="csv", filename="q3.csv")
+    raw = base64.urlsafe_b64encode(inner.as_bytes()).decode()
+    gmail = Routes({("GET", "/messages/orig"): (200, {"id": "orig", "threadId": "t-7", "raw": raw}),
+                    ("POST", "/messages/send"): _sent()})
+    await send(Wallet(), to="boss@x", subject="", body="fyi", forward_message_id="orig",
+               transport=gmail, send_url=f"{API}/messages/send", api=API)
+    message, msg = gmail.sent()
+    assert message["threadId"] == "t-7" and msg["Subject"] == "Fwd: Q3 numbers"
+    (forwarded,) = [p for p in msg.iter_attachments() if p.get_content_type() == "message/rfc822"]
+    assert "q3.csv" in forwarded.as_string()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_of_the_original_sends_nothing():
+    gmail = Routes({("GET", "/messages/orig"): (503, {})})
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="", subject="", body="ack", reply_to_message_id="orig",
+                   transport=gmail, send_url=f"{API}/messages/send", api=API)
+    assert exc.value.code == "lookup_failed" and "nothing was sent" in str(exc.value)
+    assert all(m == "GET" for m, *_ in gmail.calls)
+
+
+@pytest.mark.asyncio
+async def test_reply_and_forward_together_are_refused_before_any_call():
+    gmail = Routes({})
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b", reply_to_message_id="a",
+                   forward_message_id="b", transport=gmail, api=API)
+    assert exc.value.code == "bad_request" and gmail.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_are_attached(tmp_path):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "summary.csv").write_bytes(b"a,b\n1,2\n")
+    gmail = Routes({("POST", "/messages/send"): _sent()})
+    await send(Wallet(), to="x@y", subject="s", body="b", attachments=["out/summary.csv"],
+               workspace=tmp_path, transport=gmail, send_url=f"{API}/messages/send", api=API)
+    (part,) = list(gmail.sent()[1].iter_attachments())
+    assert (part.get_filename(), part.get_content_type()) == ("summary.csv", "text/csv")
+    assert part.get_content() == "a,b\n1,2\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make, code", [
+    (lambda ws: "/etc/hostname", "bad_request"),
+    (lambda ws: "../escape.txt", "bad_request"),
+    (lambda ws: "missing.txt", "bad_request"),
+    (lambda ws: "link.txt", "bad_request"),
+    (lambda ws: "big.bin", "too_large"),
+])
+async def test_an_attachment_outside_the_rules_sends_nothing(tmp_path, make, code):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (tmp_path / "escape.txt").write_text("secret")
+    (workspace / "link.txt").symlink_to(tmp_path / "escape.txt")
+    with open(workspace / "big.bin", "wb") as f:
+        f.truncate(25 * 1024 * 1024 + 1)
+    gmail = Routes({})
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b", attachments=[make(workspace)],
+                   workspace=workspace, transport=gmail, api=API)
+    assert exc.value.code == code and gmail.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_absolute_attachment_path_is_told_to_be_relative(tmp_path):
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b", attachments=[str(tmp_path / "a")],
+                   workspace=tmp_path, transport=Routes({}), api=API)
+    assert "relative to your workspace" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_attachments_need_a_workspace_and_at_most_ten_files(tmp_path):
+    for i in range(11):
+        (tmp_path / f"f{i}").write_text("x")
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b", attachments=["f0"],
+                   workspace=None, transport=Routes({}), api=API)
+    assert exc.value.code == "no_workspace"
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b",
+                   attachments=[f"f{i}" for i in range(11)], workspace=tmp_path,
+                   transport=Routes({}), api=API)
+    assert exc.value.code == "bad_request"
+
+
+# ── drafts ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_draft_is_saved_not_sent():
+    gmail = Routes({("POST", "/drafts"): (200, {"id": "r-1", "message": {"id": "m-5", "threadId": "t-5"}})})
+    out = await create_draft(Wallet(), to="x@y", subject="s", body="b", transport=gmail, api=API)
+    assert out == {"status": "created", "draft_id": "r-1", "message_id": "m-5", "thread_id": "t-5"}
+    assert [(m, p) for m, p, *_ in gmail.calls] == [("POST", "/drafts")]
+    assert gmail.calls[0][3]["message"]["raw"]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_draft_answer_is_unknown_and_points_at_the_draft_list():
+    gmail = Routes({("POST", "/drafts"): aiohttp.ServerDisconnectedError()})
+    out = await create_draft(Wallet(), to="x@y", subject="s", body="b", transport=gmail, api=API)
+    assert out["status"] == "unknown" and "gmail_list_drafts" in out["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_draft_is_a_definite_failure():
+    gmail = Routes({("POST", "/drafts"): (400, {"error": {"message": "bad"}})})
+    with pytest.raises(GmailSendError) as exc:
+        await create_draft(Wallet(), to="x@y", subject="s", body="b", transport=gmail, api=API)
+    assert exc.value.code == "gmail_400"
+
+
+@pytest.mark.asyncio
+async def test_sending_a_draft_keeps_the_three_outcomes():
+    sent = Routes({("POST", "/drafts/send"): _sent("m-8")})
+    assert (await send_draft(Wallet(), draft_id="r-1", transport=sent, api=API))["status"] == "sent"
+    assert sent.calls[0][3] == {"id": "r-1"}
+    lost = Routes({("POST", "/drafts/send"): aiohttp.ServerDisconnectedError()})
+    out = await send_draft(Wallet(), draft_id="r-1", transport=lost, api=API)
+    assert out["status"] == "unknown" and "Sent folder" in out["detail"]
+    with pytest.raises(GmailSendError) as exc:
+        await send_draft(Wallet(), draft_id=" ", transport=Routes({}), api=API)
+    assert exc.value.code == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_the_draft_route_validates_then_reaches_the_worker(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import gmail_send as gs
+    from puffo_agent.portal import rpc_service
+
+    async def transport(url, body, headers):
+        return 200, json.dumps({"id": "r-9", "message": {"id": "m", "threadId": "t"}}).encode()
+
+    monkeypatch.setattr(gs, "gmail_transport", transport)
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-draft", rpc_service.gmail_draft_route)
+    previous = rpc_service._RPC_RESOLVER
+    rpc_service._RPC_RESOLVER = lambda agent_id: NS(credentials=Wallet(), workspace=None)
+    try:
+        async with TestClient(TestServer(app)) as http:
+            ok = await http.post("/v1/rpc/agent-1/gmail-draft",
+                                 json={"op": "create", "to": "b@x", "subject": "s", "body": "b"})
+            assert ok.status == 200 and (await ok.json())["draft_id"] == "r-9"
+            for bad in ({"op": "delete"}, {"op": "send"}, {"op": "send", "draft_id": 1},
+                        {"op": "create", "attachments": "a.txt"}, {"op": "create", "x": "y"}):
+                assert (await http.post("/v1/rpc/agent-1/gmail-draft", json=bad)).status == 400
+            rpc_service._RPC_RESOLVER = lambda agent_id: None
+            no_worker = await http.post("/v1/rpc/agent-1/gmail-draft",
+                                        json={"op": "send", "draft_id": "r-9"})
+            assert no_worker.status == 409
+    finally:
+        rpc_service._RPC_RESOLVER = previous
+
+
+@pytest.mark.asyncio
+async def test_a_lost_draft_answer_on_the_rpc_hop_is_unknown(unused_tcp_port):
+    async def route(request):
+        raise web.HTTPInternalServerError()
+
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-draft", route)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    client = PuffoRpcClient(f"http://127.0.0.1:{unused_tcp_port}", "agent-1")
+    try:
+        created = await client.gmail_draft("create", to="b@x", subject="s", body="b")
+        assert created["status"] == "unknown" and "gmail_list_drafts" in created["detail"]
+        sent = await client.gmail_draft("send", draft_id="r-1")
+        assert sent["status"] == "unknown" and "Sent folder" in sent["detail"]
+    finally:
+        await client.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_draft_tools_forward_to_the_daemon():
+    from types import SimpleNamespace as NS
+
+    from puffo_agent.mcp.core_gmail_tools import register_gmail_tools
+
+    registered, calls = {}, []
+
+    class FakeMcp:
+        def tool(self):
+            def decorate(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return decorate
+
+    async def gmail_draft(op, **fields):
+        calls.append((op, fields))
+        return {"ok": op}
+
+    register_gmail_tools(FakeMcp(), NS(rpc_client=NS(gmail_draft=gmail_draft,
+                                                     gmail_send=None, gmail_mailbox=None)))
+    assert await registered["gmail_create_draft"](to="b@x", body="hi") == {"ok": "create"}
+    assert await registered["gmail_send_draft"](draft_id="r-1") == {"ok": "send"}
+    assert calls[0][1]["to"] == "b@x" and calls[0][1]["attachments"] == []
+    assert calls[1] == ("send", {"draft_id": "r-1", "from_account": ""})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original", [
+    (200, {"id": "orig", "threadId": "t"}),
+    (200, {"id": "orig", "threadId": "t", "raw": "!!!not base64!!!"}),
+])
+async def test_an_unreadable_original_is_not_forwarded(original):
+    gmail = Routes({("GET", "/messages/orig"): original})
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="", body="b", forward_message_id="orig",
+                   transport=gmail, api=API)
+    assert exc.value.code == "bad_reply" and all(m == "GET" for m, *_ in gmail.calls)
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_message_and_a_bare_string_of_paths_are_refused():
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="x" * (35 * 1024 * 1024),
+                   transport=Routes({}), api=API)
+    assert exc.value.code == "too_large"
+    with pytest.raises(GmailSendError) as exc:
+        await send(Wallet(), to="x@y", subject="s", body="b", attachments="a.txt",
+                   transport=Routes({}), api=API)
+    assert exc.value.code == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_draft_answer_is_unknown_and_an_odd_refusal_still_fails():
+    async def garbled(url, body, headers):
+        return 200, b"<html>"
+
+    out = await create_draft(Wallet(), to="x@y", subject="s", body="b", transport=garbled, api=API)
+    assert out["status"] == "unknown"
+
+    async def plain_refusal(url, body, headers):
+        return 403, json.dumps({"error": "forbidden"}).encode()
+
+    with pytest.raises(GmailSendError) as exc:
+        await create_draft(Wallet(), to="x@y", subject="s", body="b",
+                           transport=plain_refusal, api=API)
+    assert exc.value.code == "gmail_403"
+
+
+@pytest.mark.asyncio
+async def test_the_routes_hand_the_workspace_and_drafts_through(tmp_path, monkeypatch):
+    """Route -> handler for the two branches only a real context exercises:
+    sending a draft, and saving an attachment into ``ctx.workspace``."""
+    from types import SimpleNamespace as NS
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import gmail_mailbox as gm
+    from puffo_agent.portal import gmail_send as gs
+    from puffo_agent.portal import rpc_service
+
+    data = base64.urlsafe_b64encode(b"<feedback/>").decode()
+    message = (200, {"id": "m1", "payload": {"parts": [
+        {"filename": "r.xml", "mimeType": "application/xml", "body": {"data": data, "size": 11}}]}})
+    reads = Routes({("GET", "/messages/m1"): message})
+
+    async def read_transport(url, body, headers, *, method="POST"):
+        return await reads(url.replace("https://gmail.googleapis.com/gmail/v1", "x"), body, headers, method=method)
+
+    answers = [(200, {"id": "m-2", "threadId": "t"}), (404, {"error": {"message": "gone"}})]
+
+    async def send_transport(url, body, headers):
+        status, reply = answers.pop(0)
+        return status, json.dumps(reply).encode()
+
+    monkeypatch.setattr(gm, "gmail_transport", read_transport)
+    monkeypatch.setattr(gs, "gmail_transport", send_transport)
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-draft", rpc_service.gmail_draft_route)
+    app.router.add_post("/v1/rpc/{agent_id}/gmail-mailbox", rpc_service.gmail_mailbox_route)
+    previous = rpc_service._RPC_RESOLVER
+    rpc_service._RPC_RESOLVER = lambda agent_id: NS(credentials=Wallet(), workspace=tmp_path)
+    try:
+        async with TestClient(TestServer(app)) as http:
+            sent = await http.post("/v1/rpc/agent-1/gmail-draft", json={"op": "send", "draft_id": "r-1"})
+            assert sent.status == 200 and (await sent.json())["status"] == "sent"
+            gone = await http.post("/v1/rpc/agent-1/gmail-draft", json={"op": "send", "draft_id": "r-1"})
+            assert gone.status == 400 and (await gone.json())["code"] == "gmail_404"
+            garbled = await http.post("/v1/rpc/agent-1/gmail-draft", data=b"{not json",
+                                      headers={"content-type": "application/json"})
+            assert garbled.status == 400
+            saved = await http.post("/v1/rpc/agent-1/gmail-mailbox", json={
+                "op": "get_attachment", "message_id": "m1", "filename": "r.xml"})
+            assert saved.status == 200
+            assert (tmp_path / (await saved.json())["path"]).read_bytes() == b"<feedback/>"
+    finally:
+        rpc_service._RPC_RESOLVER = previous
+

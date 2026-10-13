@@ -1471,6 +1471,7 @@ class Worker:
             message_client=client,
             send_coordinator=getattr(client, "send_delegate", None),
             credentials=getattr(self, "_credentials", None),
+            workspace=self.agent_cfg.resolve_workspace_dir(),
         )
 
     # Set by stop(): True only when the task ended and the adapter and

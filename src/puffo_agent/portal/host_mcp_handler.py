@@ -53,6 +53,8 @@ class HostMcpContext:
     send_coordinator: Any = None
     # The worker's AgentCredentials (design v2); None when it holds none.
     credentials: Any = None
+    # The agent's workspace, for tools that read or write files in it.
+    workspace: Path | None = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -816,15 +818,20 @@ async def read_inbox(
     )
 
 
-async def gmail_send(
-    ctx: HostMcpContext, *, to: str, subject: str, body: str, from_account: str = "",
-) -> dict[str, object]:
+async def gmail_send(ctx: HostMcpContext, **fields) -> dict[str, object]:
     """Send through Gmail with the Google account shared with this agent."""
     from .gmail_send import send
 
-    return await send(
-        ctx.credentials, to=to, subject=subject, body=body, from_account=from_account,
-    )
+    return await send(ctx.credentials, workspace=ctx.workspace, **fields)
+
+
+async def gmail_draft(ctx: HostMcpContext, *, op: str, **fields) -> dict[str, object]:
+    """Create a draft, or send one."""
+    from .gmail_send import create_draft, send_draft
+
+    if op == "create":
+        return await create_draft(ctx.credentials, workspace=ctx.workspace, **fields)
+    return await send_draft(ctx.credentials, **fields)
 
 
 async def gmail_mailbox(
@@ -833,7 +840,17 @@ async def gmail_mailbox(
     """Read or file mail with the Google account shared with this agent."""
     from . import gmail_mailbox as mailbox
 
-    handler = {"search": mailbox.search, "read": mailbox.read, "organize": mailbox.organize}[op]
+    if op == "get_attachment":
+        return await mailbox.get_attachment(ctx.credentials, workspace=ctx.workspace, **kw)
+    handler = {
+        "search": mailbox.search,
+        "read": mailbox.read,
+        "organize": mailbox.organize,
+        "list_labels": mailbox.list_labels,
+        "create_label": mailbox.create_label,
+        "label": mailbox.label,
+        "list_drafts": mailbox.list_drafts,
+    }[op]
     return await handler(ctx.credentials, **kw)
 
 

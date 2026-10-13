@@ -1390,10 +1390,13 @@ async def test_coordinator_worker_host_context_shares_failed_held_attachment_att
     worker._client = client
     worker.agent_cfg = SimpleNamespace(
         id="agent-id", runtime=SimpleNamespace(harness="claude-code"),
+        resolve_workspace_dir=lambda: tmp_path / "workspace",
     )
     monkeypatch.setattr(state_mod, "agent_home_dir", lambda _id: tmp_path)
     context = worker.host_mcp_context()
     assert context.send_coordinator is delegate
+    # File-handling tools read and write here, so it must reach the context.
+    assert context.workspace == tmp_path / "workspace"
     await context.send_coordinator.send({
         "destination": "failed", "text": "text",
     })

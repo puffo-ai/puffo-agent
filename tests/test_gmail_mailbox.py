@@ -17,6 +17,11 @@ from aiohttp import web
 from puffo_agent.portal.gmail_mailbox import (
     ACTIONS,
     GmailLostAnswer,
+    create_label,
+    get_attachment,
+    label,
+    list_drafts,
+    list_labels,
     organize,
     read,
     search,
@@ -99,7 +104,9 @@ async def test_the_result_limit_is_clamped_to_something_gmail_accepts(asked, sen
 @pytest.mark.asyncio
 async def test_a_search_with_no_matches_is_an_empty_answer_not_an_error():
     api = Api({"/messages": (200, {})})
-    assert await search(Wallet(), transport=api, api=API) == {"messages": [], "count": 0}
+    assert await search(Wallet(), transport=api, api=API) == {
+        "messages": [], "count": 0, "next_page_token": "",
+    }
 
 
 @pytest.mark.asyncio
@@ -461,10 +468,21 @@ async def test_the_mailbox_tools_forward_to_the_daemon():
     assert await registered["gmail_search"](query="is:unread", limit=3) == {"ok": "search"}
     assert await registered["gmail_read"](message_id="m1") == {"ok": "read"}
     assert await registered["gmail_organize"](message_id="m1", action="trash") == {"ok": "organize"}
+    assert await registered["gmail_list_labels"]() == {"ok": "list_labels"}
+    assert await registered["gmail_create_label"](name="DMARC") == {"ok": "create_label"}
+    assert await registered["gmail_label"](message_ids=["m1"], add=["DMARC"]) == {"ok": "label"}
+    assert await registered["gmail_list_drafts"]() == {"ok": "list_drafts"}
+    assert await registered["gmail_get_attachment"](
+        message_id="m1", filename="r.xml") == {"ok": "get_attachment"}
     assert calls == [
-        ("search", {"query": "is:unread", "limit": 3, "from_account": ""}),
+        ("search", {"query": "is:unread", "limit": 3, "page_token": "", "from_account": ""}),
         ("read", {"message_id": "m1", "from_account": ""}),
         ("organize", {"message_id": "m1", "action": "trash", "from_account": ""}),
+        ("list_labels", {"from_account": ""}),
+        ("create_label", {"name": "DMARC", "from_account": ""}),
+        ("label", {"message_ids": ["m1"], "add": ["DMARC"], "remove": [], "from_account": ""}),
+        ("list_drafts", {"limit": 10, "page_token": "", "from_account": ""}),
+        ("get_attachment", {"message_id": "m1", "filename": "r.xml", "from_account": ""}),
     ]
 
 
@@ -520,3 +538,236 @@ def test_a_part_we_cannot_turn_into_text_yields_nothing_rather_than_raising(part
     from puffo_agent.portal.gmail_mailbox import _part_text
 
     assert _part_text(part) == ""
+
+
+# ── paging ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_search_pages_with_the_token_gmail_returned():
+    api = Api({"/messages": (200, {"messages": [], "nextPageToken": "p2"})})
+    first = await search(Wallet(), query="from:x", transport=api, api=API)
+    assert first["next_page_token"] == "p2"
+    await search(Wallet(), query="from:x", page_token="p2", transport=api, api=API)
+    assert "pageToken=p2" in api.calls[1][1] and "pageToken" not in api.calls[0][1]
+
+
+# ── labels ─────────────────────────────────────────────────────────
+
+LABELS = (200, {"labels": [
+    {"id": "INBOX", "name": "INBOX", "type": "system"},
+    {"id": "Label_7", "name": "DMARC", "type": "user"},
+]})
+
+
+@pytest.mark.asyncio
+async def test_create_label_returns_the_existing_one_rather_than_failing_a_retry():
+    api = Api({"/labels": [(409, {"error": {"message": "exists"}}), LABELS]})
+    out = await create_label(Wallet(), name="dmarc", transport=api, api=API)
+    assert out == {"status": "exists", "id": "Label_7", "name": "DMARC", "type": "user"}
+
+
+@pytest.mark.asyncio
+async def test_create_label_still_fails_a_conflict_it_cannot_explain():
+    api = Api({"/labels": [(409, {}), LABELS]})
+    with pytest.raises(GmailSendError) as exc:
+        await create_label(Wallet(), name="Elsewhere", transport=api, api=API)
+    assert exc.value.code == "gmail_409"
+
+
+@pytest.mark.asyncio
+async def test_create_label_posts_a_visible_label():
+    api = Api({"/labels": (200, {"id": "Label_9", "name": "Reports", "type": "user"})})
+    out = await create_label(Wallet(), name=" Reports ", transport=api, api=API)
+    assert out["status"] == "created" and out["id"] == "Label_9"
+    assert api.calls[0][2]["name"] == "Reports"
+
+
+@pytest.mark.asyncio
+async def test_label_resolves_names_and_ids_into_one_batch_modify():
+    api = Api({"/labels": LABELS, "/messages/batchModify": (204, {})})
+    out = await label(Wallet(), message_ids=["m1", "m2"], add=["dmarc"], remove=["INBOX"],
+                      transport=api, api=API)
+    method, url, body = api.calls[-1]
+    assert (method, url.endswith("/messages/batchModify")) == ("POST", True)
+    assert body == {"ids": ["m1", "m2"], "addLabelIds": ["Label_7"], "removeLabelIds": ["INBOX"]}
+    assert out == {"status": "done", "count": 2, "added": ["Label_7"], "removed": ["INBOX"]}
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_label_is_refused_before_anything_is_changed():
+    api = Api({"/labels": LABELS})
+    with pytest.raises(GmailSendError) as exc:
+        await label(Wallet(), message_ids=["m1"], add=["Typo"], transport=api, api=API)
+    assert exc.value.code == "unknown_label" and "gmail_create_label" in str(exc.value)
+    assert all("batchModify" not in url for _, url, _ in api.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kw", [
+    {"message_ids": []},
+    {"message_ids": ["m"] * 1001},
+    {"message_ids": ["m1"], "add": [], "remove": []},
+    {"message_ids": "m1"},
+    {"message_ids": ["m1"], "add": [3]},
+])
+async def test_label_refuses_a_malformed_request_without_calling_gmail(kw):
+    api = Api({})
+    kw = {"add": ["DMARC"], **kw}
+    with pytest.raises(GmailSendError) as exc:
+        await label(Wallet(), transport=api, api=API, **kw)
+    assert exc.value.code == "bad_request" and api.calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_labels_reports_ids_names_and_kind():
+    out = await list_labels(Wallet(), transport=Api({"/labels": LABELS}), api=API)
+    assert out["count"] == 2 and out["labels"][1] == {"id": "Label_7", "name": "DMARC", "type": "user"}
+
+
+# ── drafts ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_drafts_names_each_draft_and_pages():
+    api = Api({
+        "/drafts": (200, {"drafts": [{"id": "d1"}], "nextPageToken": "n"}),
+        "/drafts/d1": (200, {"id": "d1", "message": {
+            "id": "m1", "threadId": "t1",
+            "payload": {"headers": [{"name": "Subject", "value": "Weekly"}]}}}),
+    })
+    out = await list_drafts(Wallet(), transport=api, api=API)
+    assert out["next_page_token"] == "n"
+    assert out["drafts"][0]["draft_id"] == "d1" and out["drafts"][0]["subject"] == "Weekly"
+
+
+# ── attachments ────────────────────────────────────────────────────
+
+
+def _with_part(filename, body):
+    return (200, {"id": "m1", "payload": {"mimeType": "multipart/mixed", "parts": [
+        {"mimeType": "text/plain", "filename": "", "body": {"size": 3}},
+        {"mimeType": "application/xml", "filename": filename, "body": body},
+    ]}})
+
+
+@pytest.mark.asyncio
+async def test_an_attachment_is_saved_inside_the_workspace(tmp_path):
+    data = base64.urlsafe_b64encode(b"<feedback/>").decode().rstrip("=")
+    api = Api({"/messages/m1": _with_part("report.xml", {"attachmentId": "a1", "size": 11}),
+               "/messages/m1/attachments/a1": (200, {"data": data, "size": 11})})
+    out = await get_attachment(Wallet(), message_id="m1", filename="report.xml",
+                               workspace=tmp_path, transport=api, api=API)
+    assert out == {"status": "saved", "path": "gmail-attachments/m1/report.xml", "size": 11,
+                   "mime_type": "application/xml"}
+    assert (tmp_path / out["path"]).read_bytes() == b"<feedback/>"
+
+
+@pytest.mark.asyncio
+async def test_a_hostile_attachment_name_cannot_leave_the_folder(tmp_path):
+    data = base64.urlsafe_b64encode(b"x").decode()
+    api = Api({"/messages/m1": _with_part("../../.bashrc", {"data": data, "size": 1})})
+    out = await get_attachment(Wallet(), message_id="m1", filename="../../.bashrc",
+                               workspace=tmp_path, transport=api, api=API)
+    assert out["path"] == "gmail-attachments/m1/bashrc"
+    assert not (tmp_path.parent / ".bashrc").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_symlinked_attachment_folder_cannot_redirect_the_write(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "gmail-attachments").symlink_to(outside)
+    data = base64.urlsafe_b64encode(b"x").decode()
+    api = Api({"/messages/m1": _with_part("r.xml", {"data": data, "size": 1})})
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename="r.xml",
+                             workspace=workspace, transport=api, api=API)
+    assert exc.value.code == "bad_request"
+    assert not any(outside.rglob("r.xml"))
+
+
+@pytest.mark.asyncio
+async def test_a_missing_attachment_names_what_is_attached(tmp_path):
+    api = Api({"/messages/m1": _with_part("report.xml", {"attachmentId": "a1", "size": 1})})
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename="other.pdf",
+                             workspace=tmp_path, transport=api, api=API)
+    assert exc.value.code == "unknown_attachment" and "report.xml" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_attachment_is_refused_before_its_data_is_fetched(tmp_path):
+    api = Api({"/messages/m1": _with_part("big.zip", {"attachmentId": "a1",
+                                                       "size": 26 * 1024 * 1024})})
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename="big.zip",
+                             workspace=tmp_path, transport=api, api=API)
+    assert exc.value.code == "too_large" and len(api.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_without_a_workspace_nothing_is_fetched():
+    api = Api({})
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename="r.xml",
+                             workspace=None, transport=api, api=API)
+    assert exc.value.code == "no_workspace" and api.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_label_needs_a_name_and_passes_other_refusals_on():
+    with pytest.raises(GmailSendError) as exc:
+        await create_label(Wallet(), name="  ", transport=Api({}), api=API)
+    assert exc.value.code == "bad_request"
+    with pytest.raises(GmailSendError) as exc:
+        await create_label(Wallet(), name="X", transport=Api({"/labels": (400, {})}), api=API)
+    assert exc.value.code == "gmail_400"
+
+
+@pytest.mark.asyncio
+async def test_list_drafts_passes_the_page_token_and_skips_malformed_entries():
+    api = Api({"/drafts": (200, {"drafts": [{"no": "id"}, "junk"]})})
+    out = await list_drafts(Wallet(), page_token="p3", transport=api, api=API)
+    assert out["drafts"] == [] and "pageToken=p3" in api.calls[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routes", [
+    {"/messages/m1": _with_part("r.xml", {"attachmentId": "a1", "size": 1}),
+     "/messages/m1/attachments/a1": (200, {"size": 1})},
+    {"/messages/m1": _with_part("r.xml", {"size": 1})},
+])
+async def test_an_attachment_gmail_returns_without_data_is_a_bad_reply(tmp_path, routes):
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename="r.xml",
+                             workspace=tmp_path, transport=Api(routes), api=API)
+    assert exc.value.code == "bad_reply"
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_needs_both_ids_and_tolerates_odd_parts(tmp_path):
+    with pytest.raises(GmailSendError) as exc:
+        await get_attachment(Wallet(), message_id="m1", filename=" ",
+                             workspace=tmp_path, transport=Api({}), api=API)
+    assert exc.value.code == "bad_request"
+    data = base64.urlsafe_b64encode(b"x").decode()
+    nested = (200, {"id": "m1", "payload": {"parts": ["junk", {"parts": [
+        {"filename": "deep.txt", "mimeType": "text/plain", "body": {"data": data, "size": 1}}]}]}})
+    out = await get_attachment(Wallet(), message_id="m1", filename="deep.txt",
+                               workspace=tmp_path, transport=Api({"/messages/m1": nested}), api=API)
+    assert out["path"] == "gmail-attachments/m1/deep.txt"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_leaves_no_temp_file_behind(tmp_path):
+    (tmp_path / "gmail-attachments" / "m1" / "r.xml").mkdir(parents=True)
+    data = base64.urlsafe_b64encode(b"x").decode()
+    api = Api({"/messages/m1": _with_part("r.xml", {"data": data, "size": 1})})
+    with pytest.raises(OSError):
+        await get_attachment(Wallet(), message_id="m1", filename="r.xml",
+                             workspace=tmp_path, transport=api, api=API)
+    assert not list((tmp_path / "gmail-attachments" / "m1").glob(".part-*"))
+

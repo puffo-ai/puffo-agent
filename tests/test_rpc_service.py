@@ -85,6 +85,15 @@ async def test_rpc_service_rejects_request_without_agent_token():
 
 
 @pytest.mark.asyncio
+async def test_the_gmail_draft_route_is_mounted(app_client_factory):
+    # Mounted, the body check answers 400; unmounted it would be a 404.
+    rpc_service.set_rpc_resolver(lambda _aid: None)
+    app_client = await app_client_factory()
+    resp = await app_client.post("/v1/rpc/agent_test/gmail-draft", json={"op": "nope"})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
 async def test_install_503_when_resolver_unset(app_client_factory):
     rpc_service.set_rpc_resolver(None)
     app_client = await app_client_factory()

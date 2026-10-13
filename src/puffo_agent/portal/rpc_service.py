@@ -565,14 +565,9 @@ async def gmail_send_route(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "body must be JSON"}, status=400)
-    fields = ("to", "subject", "body", "from_account")
-    if not isinstance(body, dict) or not set(body) <= set(fields) or not all(
-        isinstance(body.get(k, ""), str) for k in fields
-    ):
-        return web.json_response(
-            {"error": "gmail_send accepts only string to, subject, body, from_account"},
-            status=400,
-        )
+    problem = _compose_problem(body)
+    if problem:
+        return web.json_response({"error": f"gmail_send {problem}"}, status=400)
     ctx = _warm_context(request.match_info["agent_id"])
     if ctx is None:
         # 409, not 503: a 5xx reads as "unknown" one hop up.
@@ -583,8 +578,46 @@ async def gmail_send_route(request: web.Request) -> web.Response:
     try:
         result = await host_mcp_handler.gmail_send(
             ctx, to=body.get("to", ""), subject=body.get("subject", ""),
-            body=body.get("body", ""), from_account=body.get("from_account", ""),
+            body=body.get("body", ""),
+            **{k: v for k, v in body.items() if k not in ("to", "subject", "body")},
         )
+    except GmailSendError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+    return web.json_response(result)
+
+
+async def gmail_draft_route(request: web.Request) -> web.Response:
+    """``{"op": "create", <compose fields>}`` or ``{"op": "send", "draft_id"}``.
+    Same outcomes as gmail-send: 4xx definitely did nothing, 200 may say
+    ``unknown``."""
+    from .gmail_send import GmailSendError
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    op = body.get("op") if isinstance(body, dict) else None
+    fields = {k: v for k, v in body.items() if k != "op"} if isinstance(body, dict) else None
+    if op == "create":
+        problem = _compose_problem(fields)
+    elif op == "send":
+        ok = (set(fields) <= {"draft_id", "from_account"} and "draft_id" in fields
+              and all(isinstance(v, str) for v in fields.values()))
+        problem = None if ok else "send takes a string draft_id and optionally from_account"
+    else:
+        problem = "op must be create or send"
+    if problem:
+        return web.json_response({"error": f"gmail_draft {problem}"}, status=400)
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response(
+            {"error": "the agent is not running yet; nothing was done", "code": "no_worker"},
+            status=409,
+        )
+    if op == "create":
+        fields = {"to": "", "subject": "", "body": "", **fields}
+    try:
+        result = await host_mcp_handler.gmail_draft(ctx, op=op, **fields)
     except GmailSendError as exc:
         return web.json_response({"error": str(exc), "code": exc.code}, status=400)
     return web.json_response(result)
@@ -606,10 +639,31 @@ def _check_op_body(body, ops: dict) -> str | None:
 
 # op -> (required string fields, optional fields with their type)
 _MAILBOX_OPS = {
-    "search": (set(), {"query": str, "limit": int, "from_account": str}),
+    "search": (set(), {"query": str, "limit": int, "page_token": str, "from_account": str}),
     "read": ({"message_id"}, {"from_account": str}),
     "organize": ({"message_id", "action"}, {"from_account": str}),
+    "list_labels": (set(), {"from_account": str}),
+    "create_label": ({"name"}, {"from_account": str}),
+    "label": ({"message_ids"}, {"message_ids": list, "add": list, "remove": list,
+                                "from_account": str}),
+    "list_drafts": (set(), {"limit": int, "page_token": str, "from_account": str}),
+    "get_attachment": ({"message_id", "filename"}, {"from_account": str}),
 }
+
+# Everything a composed message may carry, for gmail-send and gmail-draft.
+_COMPOSE_STR = ("to", "subject", "body", "cc", "bcc", "html_body",
+                "reply_to_message_id", "forward_message_id", "from_account")
+
+
+def _compose_problem(body) -> str | None:
+    if not isinstance(body, dict) or not set(body) <= set(_COMPOSE_STR) | {"attachments"}:
+        return "accepts only " + ", ".join(_COMPOSE_STR) + ", attachments"
+    if not all(isinstance(body.get(k, ""), str) for k in _COMPOSE_STR):
+        return "every field but attachments is a string"
+    paths = body.get("attachments", [])
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return "attachments is a list of workspace paths"
+    return None
 
 
 async def gmail_mailbox_route(request: web.Request) -> web.Response:
@@ -987,6 +1041,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/gmail-mailbox",
         gmail_mailbox_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/gmail-draft",
+        gmail_draft_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/slack-send",

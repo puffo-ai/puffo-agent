@@ -10,6 +10,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **More of Gmail for agents with a shared mailbox.** Labels:
+  `gmail_list_labels`, `gmail_create_label` (an existing label is returned,
+  so a retry never duplicates one) and `gmail_label`, which adds and removes
+  labels on up to 1000 messages at once and refuses a name that does not
+  exist rather than creating it. Replies and forwards: `gmail_send` takes
+  `reply_to_message_id` or `forward_message_id` and keeps the email in that
+  conversation (a reply answers the sender by default and threads
+  `In-Reply-To`/`References`; a forward carries the original, attachments
+  included), plus `cc`, `bcc` and `html_body`. Drafts: `gmail_create_draft`
+  takes everything `gmail_send` does and saves it for the user to review;
+  `gmail_list_drafts` and `gmail_send_draft` follow. Attachments:
+  `gmail_get_attachment` saves one into the agent's workspace, and
+  `gmail_send`/`gmail_create_draft` attach workspace files (at most 10,
+  25 MiB in all). Only paths inside the workspace are read or written;
+  attachment names are reduced to a bare file name. `gmail_search` pages with
+  `page_token`/`next_page_token`. All of this works with the `gmail.modify`
+  scope connections already have; no reconnect is needed.
+
 - **Scheduled tasks.** Five tools — `create_schedule`, `list_schedules`,
   `get_schedule`, `update_schedule` and `delete_schedule` — let an agent
   manage one-off and recurring prompt tasks that the server owns and fires.

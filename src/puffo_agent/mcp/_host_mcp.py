@@ -16,6 +16,11 @@ from ..portal.local_service_auth import local_service_headers
 logger = logging.getLogger(__name__)
 
 
+
+def _present(fields: dict[str, Any]) -> dict[str, Any]:
+    """Drop empty optionals, so the route sees only what the agent gave."""
+    return {k: v for k, v in fields.items() if v not in ("", None, [])}
+
 class PuffoRpcClient:
     """Async client for the daemon's loopback RPC service.
     Transport failures + non-2xx responses raise ``RuntimeError``."""
@@ -139,7 +144,7 @@ class PuffoRpcClient:
             raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
 
     async def gmail_send(
-        self, *, to: str, subject: str, body: str, from_account: str = "",
+        self, *, to: str, subject: str, body: str, **optional: Any,
     ) -> dict[str, Any]:
         """Send through the daemon.
 
@@ -147,13 +152,24 @@ class PuffoRpcClient:
         already have sent it, so a hang-up, timeout or 5xx is "unknown" and
         must never be retried.
         """
-        payload = {"to": to, "subject": subject, "body": body}
-        if from_account:
-            payload["from_account"] = from_account
+        payload = {"to": to, "subject": subject, "body": body, **_present(optional)}
         return await self._post_may_have_sent(
             "gmail-send", payload, what="gmail_send",
             unknown="the answer from the daemon was lost. The message may have been "
                     "sent; do not send it again without checking the Sent folder.",
+        )
+
+    async def gmail_draft(self, op: str, **fields: Any) -> dict[str, Any]:
+        """Create or send a draft; a lost answer is "unknown", as for send."""
+        unknown = (
+            "the answer from the daemon was lost. A draft may have been created; "
+            "check gmail_list_drafts before creating it again."
+            if op == "create" else
+            "the answer from the daemon was lost. The draft may have been sent; do "
+            "not send it again without checking the Sent folder."
+        )
+        return await self._post_may_have_sent(
+            "gmail-draft", {"op": op, **_present(fields)}, what="gmail_draft", unknown=unknown,
         )
 
     async def slack_send(
