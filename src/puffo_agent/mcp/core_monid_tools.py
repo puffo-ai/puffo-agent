@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -409,7 +410,8 @@ def _known_charge(exc: HttpError) -> int | None:
 def _charge_note(charged: int) -> str:
     if charged == 0:
         return "Nothing was charged for this call."
-    return f"This call was charged {charged} micro-dollars."
+    dollars = (Decimal(charged) / 1_000_000).normalize()
+    return f"This call was charged ${dollars:f}."
 
 
 def _spend_failure(exc: HttpError, wire_key: str) -> RuntimeError:

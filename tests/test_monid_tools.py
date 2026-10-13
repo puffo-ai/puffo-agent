@@ -498,7 +498,7 @@ async def test_spend_provider_rate_limit_says_wait_without_promising_no_charge()
     ("charged", "note"),
     [
         (0, "Nothing was charged for this call."),
-        (2000, "This call was charged 2000 micro-dollars."),
+        (2000, "This call was charged $0.002."),
     ],
 )
 async def test_spend_provider_rate_limit_states_billing_reported_charge(charged, note):
@@ -531,7 +531,8 @@ async def test_spend_provider_rate_limit_states_billing_reported_charge(charged,
     ("charged", "note"),
     [
         (0, "Nothing was charged for this call."),
-        (2000, "This call was charged 2000 micro-dollars."),
+        (2000, "This call was charged $0.002."),
+        (1_500_000, "This call was charged $1.5."),
     ],
 )
 async def test_spend_failure_with_billing_reported_charge_is_not_ambiguous(

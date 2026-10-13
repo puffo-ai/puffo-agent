@@ -53,7 +53,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   might have been charged, its immediate retry was refused as a duplicate,
   and it switched to a similar endpoint that shares the same limit. The error
   now says to wait a few minutes and not to switch endpoints. It states the
-  exact charge when billing reports one, and otherwise says the charge is
+  exact charge in dollars when billing reports one, and otherwise says it is
   not confirmed. The primer adds two rules: on a rate limit, tell
   the user the source is busy and when the retry is. Before a pull of many
   pages, state the rough call count and cost and get an OK first.
