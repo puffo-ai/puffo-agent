@@ -380,6 +380,20 @@ def _spend_retry_guidance(wire_key: str) -> str:
     )
 
 
+def _is_provider_rate_limit(exc: HttpError) -> bool:
+    """Billing reports a provider's 429 as a 502 whose message names that status."""
+    if exc.status != 502:
+        return False
+    try:
+        parsed = json.loads(exc.body)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("message") == "provider returned status 429"
+    )
+
+
 def _spend_failure(exc: HttpError, wire_key: str) -> RuntimeError:
     """Map a billing spend ``HttpError`` to the tool's error.
 
@@ -396,6 +410,22 @@ def _spend_failure(exc: HttpError, wire_key: str) -> RuntimeError:
             f"already attempted under idempotency key {wire_key}, and billing "
             "will not run it again, so no new charge was made. To buy fresh "
             "data, change the request or pass a new explicit idempotency_key.\n"
+            f"{_LABEL_NON_MONID}"
+        )
+    if _is_provider_rate_limit(exc):
+        # The data source refused on request rate. This key's hold is already terminal, so
+        # an immediate same-key retry only hits the 409 above, and sibling endpoints usually
+        # share the limit. Billing sends this same 502 whether or not monid billed the
+        # refusal, so the charge is unknown here.
+        return RuntimeError(
+            "monid spend failed: the data source is rate-limiting requests "
+            "(provider returned status 429). Wait a few minutes before trying "
+            "again, and don't switch to a similar endpoint meanwhile: they "
+            "usually share the limit. The same arguments in this turn will be "
+            "rejected as a duplicate, so retry in a later turn or with a new "
+            "explicit idempotency_key. A refused call is normally not charged, "
+            "but this error can't confirm it: tell the user the charge is not "
+            "confirmed, and don't quote or estimate a cost.\n"
             f"{_LABEL_NON_MONID}"
         )
     # A charge may have settled before an ambiguous (non-4xx) failure surfaced;
