@@ -26,7 +26,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   25 MiB in all). Only paths inside the workspace are read or written;
   attachment names are reduced to a bare file name. `gmail_search` pages with
   `page_token`/`next_page_token`. All of this works with the `gmail.modify`
-  scope connections already have; no reconnect is needed.
+  scope connections already have; no reconnect is needed. (#469)
 
 - **Scheduled tasks.** Five tools — `create_schedule`, `list_schedules`,
   `get_schedule`, `update_schedule` and `delete_schedule` — let an agent
