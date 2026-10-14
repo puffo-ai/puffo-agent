@@ -16,10 +16,10 @@ from ..portal.local_service_auth import local_service_headers
 logger = logging.getLogger(__name__)
 
 
-
 def _present(fields: dict[str, Any]) -> dict[str, Any]:
-    """Drop empty optionals, so the route sees only what the agent gave."""
+    """Drop empty optionals."""
     return {k: v for k, v in fields.items() if v not in ("", None, [])}
+
 
 class PuffoRpcClient:
     """Async client for the daemon's loopback RPC service.
@@ -160,7 +160,7 @@ class PuffoRpcClient:
         )
 
     async def gmail_draft(self, op: str, **fields: Any) -> dict[str, Any]:
-        """Create or send a draft; a lost answer is "unknown", as for send."""
+        """Draft create/send; lost answer -> "unknown", as send."""
         unknown = (
             "the answer from the daemon was lost. A draft may have been created; "
             "check gmail_list_drafts before creating it again."

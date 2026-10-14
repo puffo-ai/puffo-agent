@@ -686,7 +686,7 @@ async def test_a_symlinked_attachment_folder_cannot_redirect_the_write(tmp_path)
         await get_attachment(Wallet(), message_id="m1", filename="r.xml",
                              workspace=workspace, transport=api, api=API)
     assert exc.value.code == "bad_request"
-    assert not any(outside.rglob("r.xml"))
+    assert not any(outside.iterdir())
 
 
 @pytest.mark.asyncio

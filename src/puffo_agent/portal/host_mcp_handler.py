@@ -53,7 +53,7 @@ class HostMcpContext:
     send_coordinator: Any = None
     # The worker's AgentCredentials (design v2); None when it holds none.
     credentials: Any = None
-    # The agent's workspace, for tools that read or write files in it.
+    # Gmail attachment I/O root.
     workspace: Path | None = None
 
 

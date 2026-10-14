@@ -33,9 +33,9 @@ API = "https://gmail.googleapis.com/gmail/v1/users/me"
 # Past this the body would bury the agent's own context; the cut is flagged.
 MAX_BODY_CHARS = 20_000
 MAX_RESULTS = 50
-# Gmail's own per-message attachment ceiling.
+# Gmail per-message cap.
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
-# messages.batchModify takes at most this many ids per call.
+# batchModify id cap.
 MAX_BATCH_IDS = 1000
 ATTACHMENT_DIR = "gmail-attachments"
 
@@ -65,8 +65,7 @@ async def search(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Messages matching a Gmail search, newest first, with a summary line.
-    ``next_page_token`` is set while more remain."""
+    """Messages matching a Gmail search, newest first, with a summary line."""
     account = await _account(credentials, from_account)
     limit = max(1, min(int(limit or 10), MAX_RESULTS))
     params = {"maxResults": str(limit)}
@@ -200,7 +199,6 @@ async def list_labels(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Every label, system and user, with the id the other tools accept."""
     account = await _account(credentials, from_account)
     labels = await _labels(account, transport, api)
     return {"labels": labels, "count": len(labels)}
@@ -214,7 +212,7 @@ async def create_label(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Idempotent: a label that already exists is returned, not duplicated."""
+    """Idempotent: an existing label is returned."""
     name = name.strip()
     if not name:
         raise GmailSendError("bad_request", "name is required")
@@ -249,9 +247,7 @@ async def label(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Add and remove labels on up to ``MAX_BATCH_IDS`` messages in one call.
-    Labels are named or given by id; a name that does not exist is refused,
-    so a typo never creates a label."""
+    """Names or ids; an unknown name is refused, never created."""
     ids = _strings(message_ids, "message_ids")
     add_names, remove_names = _strings(add or [], "add"), _strings(remove or [], "remove")
     if not ids:
@@ -282,7 +278,7 @@ async def _labels(account, transport, api: str) -> list[dict]:
 
 
 def _find_label(labels: list[dict], wanted: str) -> dict | None:
-    """By id first, then by name ignoring case, as Gmail itself does."""
+    """Id first, then case-insensitive name (as Gmail)."""
     for item in labels:
         if item["id"] == wanted:
             return item
@@ -328,7 +324,6 @@ async def list_drafts(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Drafts, newest first, each with the ``draft_id`` that sends it."""
     account = await _account(credentials, from_account)
     params = {"maxResults": str(max(1, min(int(limit or 10), MAX_RESULTS)))}
     if page_token:
@@ -364,8 +359,7 @@ async def get_attachment(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Save one attachment into the workspace and return its relative path.
-    Saving again overwrites, so a retry is safe."""
+    """Save into the workspace; overwrites, so retry-safe."""
     message_id, filename = message_id.strip(), filename.strip()
     if not message_id or not filename:
         raise GmailSendError("bad_request", "message_id and filename are required")
@@ -414,23 +408,21 @@ def _parts(payload: dict):
 
 
 def _safe_name(name: str, fallback: str) -> str:
-    """A bare file name: no directories, no control characters, no leading dots."""
+    """Bare file name: no dirs, control chars or leading dots."""
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip().lstrip(".")
     return name[:200] or fallback
 
 
 def _save(workspace: Path, message_id: str, filename: str, data: bytes) -> str:
-    """Write under ``<workspace>/gmail-attachments/<message>/``, refusing any
-    path that resolves outside the workspace, a symlinked directory included."""
+    """Write under ``gmail-attachments/<message>/``; refuse workspace escapes."""
     root = workspace.resolve()
     folder = root / ATTACHMENT_DIR / _safe_name(message_id, "message")
-    folder.mkdir(parents=True, exist_ok=True)
     if not folder.resolve().is_relative_to(root):
         raise GmailSendError("bad_request", "the attachment folder escapes the workspace")
+    folder.mkdir(parents=True, exist_ok=True)
     target = folder / _safe_name(filename, "attachment")
-    # A temp file then a rename: the rename replaces a symlink at the target
-    # rather than writing through it.
+    # temp + rename: replaces a symlink at target, never writes through it
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".part-")
     try:
         with os.fdopen(fd, "wb") as out:

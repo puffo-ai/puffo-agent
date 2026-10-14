@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 API = "https://gmail.googleapis.com/gmail/v1/users/me"
 SEND_URL = f"{API}/messages/send"
 MAX_ATTACHMENTS = 10
-# Gmail's ceiling for one message.
+# Gmail per-message cap.
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 RT_TYPE = "PUFFO_GOOGLE_OAUTH_v1"
 AT_TYPE = "PUFFO_GOOGLE_OAUTH_AT_v1"
@@ -61,8 +61,8 @@ def build_message(
     attachments: tuple = (),
 ) -> bytes:
     """RFC 5322 bytes; Gmail sets From. The email package refuses CR/LF in a
-    header, which is what blocks header injection. ``attachments`` holds
-    ``(filename, data)`` pairs or whole messages to forward."""
+    header, which is what blocks header injection. ``attachments``:
+    ``(filename, data)`` pairs or messages to forward."""
     if not to.strip():
         raise GmailSendError("bad_request", "to must name at least one recipient")
     msg = EmailMessage(policy=SMTP)
@@ -141,8 +141,7 @@ async def create_draft(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Same composition as ``send``, saved for review instead of sent.
-    ``"unknown"`` means a draft may exist; check the drafts before retrying."""
+    """As ``send``, saved as a draft. "unknown": a draft may exist."""
     index = await _require_account(credentials, from_account)
     message = await _compose(
         credentials, index, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
@@ -164,7 +163,7 @@ async def send_draft(
     transport: Transport | None = None,
     api: str = API,
 ) -> dict:
-    """Send a saved draft. Same three outcomes as ``send``."""
+    """Same outcomes as ``send``."""
     if not draft_id.strip():
         raise GmailSendError("bad_request", "draft_id is required")
     index = await _require_account(credentials, from_account)
@@ -183,8 +182,7 @@ async def _require_account(credentials: AgentCredentials | None, from_account: s
 
 
 async def _deliver(credentials, index: int, url: str, message: dict, transport, on_ok, on_lost):
-    """POST once, refreshing the token once on a 401. A lost answer is
-    ``on_lost``: the request may have taken effect."""
+    """POST once; one refresh on 401. Lost answer -> ``on_lost`` (may have applied)."""
     payload = json.dumps(message).encode()
     transport = transport or gmail_transport
     token = await _access_token(credentials, index, fresh=False)
@@ -211,8 +209,7 @@ async def _compose(
     credentials, index: int, *, to, subject, body, cc, bcc, html_body,
     reply_to_message_id, forward_message_id, attachments, workspace, transport, api,
 ) -> dict:
-    """The ``{"raw", "threadId"?}`` Gmail takes. Every failure here comes
-    before anything is sent, so it is definite."""
+    """``{"raw", "threadId"?}``. Fails only before sending, so definitely."""
     reply_to, forward = reply_to_message_id.strip(), forward_message_id.strip()
     if reply_to and forward:
         raise GmailSendError("bad_request", "reply_to_message_id and forward_message_id exclude each other")
@@ -243,6 +240,8 @@ async def _compose(
             )
         except Exception as exc:  # noqa: BLE001 - an unreadable original cannot be forwarded
             raise GmailSendError("bad_reply", "could not read the message to forward; nothing was sent") from exc
+        # Sent copy keeps Bcc; never forward it.
+        del forwarded["Bcc"]
         thread_id = original.get("threadId", "")
         subject = subject or _prefixed("Fwd:", str(forwarded.get("Subject", "")))
         extra.append(forwarded)
@@ -283,8 +282,7 @@ def _prefixed(prefix: str, subject: str) -> str:
 
 
 def _workspace_files(workspace: Path | None, paths) -> list[tuple[str, bytes]]:
-    """``(name, data)`` for each workspace-relative path. Same rule as chat
-    attachments: relative, resolving inside the workspace, a regular file."""
+    """``(name, data)`` per path: relative, inside the workspace, a regular file."""
     if isinstance(paths, str) or not all(isinstance(p, str) for p in paths):
         raise GmailSendError("bad_request", "attachments must be a list of workspace paths")
     paths = [p.strip() for p in paths if p.strip()]

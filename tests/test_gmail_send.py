@@ -655,6 +655,7 @@ async def test_a_reply_does_not_stack_re_prefixes():
 async def test_a_forward_carries_the_original_with_its_attachments():
     inner = email.message.EmailMessage()
     inner["Subject"] = "Q3 numbers"
+    inner["Bcc"] = "hidden@x"
     inner.set_content("see attached")
     inner.add_attachment(b"1,2,3", maintype="text", subtype="csv", filename="q3.csv")
     raw = base64.urlsafe_b64encode(inner.as_bytes()).decode()
@@ -666,6 +667,7 @@ async def test_a_forward_carries_the_original_with_its_attachments():
     assert message["threadId"] == "t-7" and msg["Subject"] == "Fwd: Q3 numbers"
     (forwarded,) = [p for p in msg.iter_attachments() if p.get_content_type() == "message/rfc822"]
     assert "q3.csv" in forwarded.as_string()
+    assert "hidden@x" not in forwarded.as_string()
 
 
 @pytest.mark.asyncio

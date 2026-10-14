@@ -587,9 +587,7 @@ async def gmail_send_route(request: web.Request) -> web.Response:
 
 
 async def gmail_draft_route(request: web.Request) -> web.Response:
-    """``{"op": "create", <compose fields>}`` or ``{"op": "send", "draft_id"}``.
-    Same outcomes as gmail-send: 4xx definitely did nothing, 200 may say
-    ``unknown``."""
+    """``{"op": "create", ...}`` | ``{"op": "send", "draft_id"}``; outcomes as gmail-send."""
     from .gmail_send import GmailSendError
 
     try:
@@ -650,7 +648,7 @@ _MAILBOX_OPS = {
     "get_attachment": ({"message_id", "filename"}, {"from_account": str}),
 }
 
-# Everything a composed message may carry, for gmail-send and gmail-draft.
+# gmail-send / gmail-draft compose fields.
 _COMPOSE_STR = ("to", "subject", "body", "cc", "bcc", "html_body",
                 "reply_to_message_id", "forward_message_id", "from_account")
 
