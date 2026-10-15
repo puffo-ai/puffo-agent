@@ -741,6 +741,12 @@ _CONNECTOR_OPS = {
         "guild_member": ({"guild_id"}, {"from_account": str}),
         "connections": (set(), {"from_account": str}),
     },
+    "notion": {
+        "search": (set(), {"query": str, "limit": int, "page_token": str, "from_account": str}),
+        "read_page": ({"page_id"}, {"from_account": str}),
+        "create_page": ({"parent_id", "title"}, {"content": str, "from_account": str}),
+        "update_page": ({"page_id"}, {"title": str, "append_content": str, "from_account": str}),
+    },
 }
 
 
@@ -1055,6 +1061,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/discord",
         connector_route("discord"),
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/notion",
+        connector_route("notion"),
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",

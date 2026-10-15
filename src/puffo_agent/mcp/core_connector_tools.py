@@ -10,7 +10,12 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
     if getattr(cfg, "rpc_client", None) is None:
         return
     rpc = cfg.rpc_client
+    _register_slack(mcp, rpc)
+    _register_discord(mcp, rpc)
+    _register_notion(mcp, rpc)
 
+
+def _register_slack(mcp: FastMCP, rpc: Any) -> None:
     @mcp.tool()
     async def slack_send(
         channel: str, text: str, thread_ts: str = "", from_account: str = "",
@@ -68,6 +73,8 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
             "slack", "list_channels", types=types, limit=limit, from_account=from_account,
         )
 
+
+def _register_discord(mcp: FastMCP, rpc: Any) -> None:
     @mcp.tool()
     async def discord_whoami(from_account: str = "") -> dict[str, Any]:
         """The connected Discord user: id, username, email.
@@ -95,3 +102,64 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
     async def discord_connections(from_account: str = "") -> dict[str, Any]:
         """Third-party accounts (GitHub, Steam, …) linked to the Discord user."""
         return await rpc.connector("discord", "connections", from_account=from_account)
+
+
+def _register_notion(mcp: FastMCP, rpc: Any) -> None:
+    @mcp.tool()
+    async def notion_search(
+        query: str = "", limit: int = 10, page_token: str = "", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Search Notion pages and databases the connected integration can see.
+
+        Empty ``query`` lists everything shared with the integration. ``limit``
+        1..100; ``page_token`` is a previous call's ``next_page_token``.
+        """
+        return await rpc.connector(
+            "notion", "search", query=query, limit=limit, page_token=page_token,
+            from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def notion_read_page(page_id: str, from_account: str = "") -> dict[str, Any]:
+        """A page's title, property summary, and text content (one level of blocks).
+
+        ``page_id`` is from ``notion_search``. Long content is cut and flagged
+        ``content_truncated``.
+        """
+        return await rpc.connector("notion", "read_page", page_id=page_id, from_account=from_account)
+
+    @mcp.tool()
+    async def notion_create_page(
+        parent_id: str, title: str, content: str = "", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Create a page under a parent page.
+
+        ``parent_id`` is a page id from ``notion_search`` (the integration must
+        be shared on it). ``content`` becomes paragraphs, one per line. A body
+        over Notion's one-request block ceiling is cut and flagged
+        ``content_truncated`` — the rest is not written.
+
+        **"unknown" means it may have been created: check before posting it
+        again.** An error means it was not.
+        """
+        return await rpc.connector(
+            "notion", "create_page", parent_id=parent_id, title=title, content=content,
+            from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def notion_update_page(
+        page_id: str, title: str = "", append_content: str = "", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Rename a page and/or append paragraphs to it.
+
+        Pass ``title`` to rename, ``append_content`` to add paragraphs (one per
+        line), or both. Appended text over Notion's one-request block ceiling is
+        cut and flagged ``content_truncated`` — the rest is not written.
+
+        **"unknown" means it may have been applied: check before trying again.**
+        """
+        return await rpc.connector(
+            "notion", "update_page", page_id=page_id, title=title,
+            append_content=append_content, from_account=from_account,
+        )

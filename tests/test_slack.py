@@ -408,9 +408,10 @@ async def test_the_mcp_tools_register_only_with_a_link_and_forward_verbatim():
         return {"count": 0}
 
     register_connector_tools(FakeMcp(), NS(rpc_client=NS(slack_send=slack_send, connector=connector)))
-    assert set(registered) == {"slack_send", "slack_search", "slack_read", "slack_list_channels",
-                               "discord_whoami", "discord_guilds", "discord_guild_member",
-                               "discord_connections"}
+    # subset, not equality: other connectors (discord, notion, …) share this registry.
+    assert {"slack_send", "slack_search", "slack_read", "slack_list_channels",
+            "discord_whoami", "discord_guilds", "discord_guild_member",
+            "discord_connections"} <= set(registered)
     await registered["slack_send"](channel="C1", text="t", thread_ts="1", from_account="a")
     await registered["slack_search"](query="q")
     await registered["slack_read"](channel="C1", thread_ts="2")

@@ -868,12 +868,14 @@ async def slack_send(
 async def connector(
     ctx: HostMcpContext, *, provider: str, op: str, **kw,
 ) -> dict[str, object]:
-    from . import discord, slack
+    from . import discord, notion, slack
 
     handler = {
         "slack": {"search": slack.search, "read": slack.read, "list_channels": slack.list_channels},
         "discord": {"whoami": discord.whoami, "guilds": discord.guilds,
                     "guild_member": discord.guild_member, "connections": discord.connections},
+        "notion": {"search": notion.search, "read_page": notion.read_page,
+                   "create_page": notion.create_page, "update_page": notion.update_page},
     }[provider][op]
     return await handler(ctx.credentials, **kw)
 
