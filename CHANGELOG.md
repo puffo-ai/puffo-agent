@@ -6,6 +6,35 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Notion for agents.** Four native tools over a connected Notion workspace:
+  `notion_search` (pages and databases the integration can see, paged with
+  `page_token`/`next_page_token`), `notion_read_page` (title, a property
+  summary, and one level of block text, cut and flagged `content_truncated`
+  when long), `notion_create_page` (a child page under a parent page, with the
+  body as one paragraph per line) and `notion_update_page` (rename and/or
+  append paragraphs). Writes are as honest as reads: a body past Notion's
+  one-request block ceiling is cut and flagged `content_truncated` rather than
+  dropped silently. A missing source field projects empty, never a fabricated
+  default; a lost answer to a write is reported `unknown` — it may have been
+  applied — and never retried. Credentials never leave the daemon, and 403/404
+  carry their own reasons (`insufficient_capability` vs `not_shared_or_missing`)
+  without a pointless token refresh. (#470)
+- **Google Calendar for agents.** Five native tools over a connected calendar:
+  `calendar_list_events` (upcoming events, recurring ones expanded, paged),
+  `calendar_list_calendars` (the calendars the account can see), and the
+  writes `calendar_create_event` / `calendar_update_event` /
+  `calendar_delete_event`. Every write is silent — fixed `sendUpdates=none`,
+  no attendees — so an agent never sends an invite or notification (that is
+  `gmail_send`'s job); opening attendees is a separate v2. A deleted event that
+  is already gone still reports success (idempotent). A lost answer to a write
+  is reported `unknown` and never retried. `all_day` reads as a plain bool but
+  crosses the daemon boundary string-encoded, parsed strictly on the far side.
+  A 403 keeps its reason apart: `insufficient_scope` (reconnect and grant
+  access) vs `api_not_enabled` (enable the Calendar API in the Google console),
+  never conflated, and neither triggers a pointless token refresh.
+
 ## [2.1.0] - 2026-10-13
 
 ### Added
