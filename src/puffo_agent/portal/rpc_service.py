@@ -741,6 +741,31 @@ _CONNECTOR_OPS = {
         "guild_member": ({"guild_id"}, {"from_account": str}),
         "connections": (set(), {"from_account": str}),
     },
+    "notion": {
+        "search": (set(), {"query": str, "limit": int, "page_token": str, "from_account": str}),
+        "read_page": ({"page_id"}, {"from_account": str}),
+        "create_page": ({"parent_id", "title"}, {"content": str, "from_account": str}),
+        "update_page": ({"page_id"}, {"title": str, "append_content": str, "from_account": str}),
+    },
+    "googlecalendar": {
+        "list_events": (set(), {"time_min": str, "time_max": str, "query": str, "limit": int,
+                                "calendar_id": str, "from_account": str}),
+        "list_calendars": (set(), {"from_account": str}),
+        # all_day is str, not bool: _check_op_body rejects every bool value, so
+        # the tool shell encodes the bool as "true"/"false" (googlecalendar._as_bool).
+        "create_event": ({"summary", "start", "end"},
+                         {"description": str, "all_day": str, "calendar_id": str, "from_account": str}),
+        "update_event": ({"event_id"}, {"summary": str, "start": str, "end": str,
+                                        "description": str, "calendar_id": str, "from_account": str}),
+        "delete_event": ({"event_id"}, {"calendar_id": str, "from_account": str}),
+    },
+    "zoom": {
+        "whoami": (set(), {"from_account": str}),
+        "get_meeting": ({"meeting_id"}, {"from_account": str}),
+        "list_recordings": ({"from_date", "to_date"},
+                            {"page_token": str, "from_account": str}),
+        "get_meeting_recordings": ({"meeting_id"}, {"from_account": str}),
+    },
 }
 
 
@@ -1056,6 +1081,15 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
         "/v1/rpc/{agent_id}/discord",
         connector_route("discord"),
     )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/notion",
+        connector_route("notion"),
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/googlecalendar",
+        connector_route("googlecalendar"),
+    )
+    app.router.add_post("/v1/rpc/{agent_id}/zoom", connector_route("zoom"))
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",
         mark_covered_route,
