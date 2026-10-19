@@ -762,6 +762,38 @@ def test_beacon_silence_recycles(registered_manager, pinned_clock):
     assert worker._mcp_probe_strikes == 1
 
 
+def test_a_dead_rpc_listener_is_not_blamed_on_the_mcp_subprocess(
+    registered_manager, pinned_clock, monkeypatch,
+):
+    """Windows WinError 64 kills the daemon's listener, so no hello can
+    land. Recycling then only spent the strike and the agent went
+    mcp_unreachable; the probe must wait for the listener to return and
+    give the subprocess one beacon interval to reach it again."""
+    now = pinned_clock
+    mgr = registered_manager(_FakeManager("g1", now - 400))
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (now - 400, 60.0)}
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+    listening_since: list[float | None] = [None]
+
+    async def _since():
+        return listening_since[0]
+
+    monkeypatch.setattr(rpc_service, "listener_accepting_since", _since)
+
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+
+    listening_since[0] = now - 30
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == []
+
+    listening_since[0] = now - 120
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == [False]
+
+
 def test_startup_only_hello_never_goes_stale(registered_manager, pinned_clock):
     """No declared cadence (older package, e.g. a lagging Docker image)
     keeps handshake semantics: an aged hello stays valid and the probe

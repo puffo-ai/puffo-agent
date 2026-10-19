@@ -62,7 +62,7 @@ async def test_cli_drivers_request_windowless_child_processes(monkeypatch, provi
     module = claude_code_driver if provider == "claude" else codex_driver
     monkeypatch.setattr(
         module,
-        "no_window_kwargs" if provider == "claude" else "process_group_spawn_kwargs",
+        "process_group_spawn_kwargs",
         lambda: {"creationflags": _CREATE_NO_WINDOW},
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)

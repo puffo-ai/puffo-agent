@@ -133,6 +133,11 @@ _MCP_PROBE_GRACE_SECONDS = 30.0
 # of a live transport.
 _MCP_BEACON_STALE_FACTOR = 3.0
 
+# After the daemon's RPC listener comes back, hellos missed during the
+# outage are not the subprocess's fault: wait out one 60 s beacon
+# interval plus slack before counting a miss.
+_MCP_LISTENER_RECOVERY_GRACE_SECONDS = 90.0
+
 # Consecutive failed adapter reloads tolerated before the pending
 # refresh flags are abandoned and the failure becomes a health state.
 _REFRESH_RELOAD_FAILURE_CAP = 3
@@ -576,6 +581,17 @@ class Worker:
             return
         if self._turn_active:
             # A reload would raise mid-turn; check again next beat.
+            return
+        listening_since = await rpc_service.listener_accepting_since()
+        if listening_since is None:
+            # A recycle cannot fix the daemon's own listener and would
+            # only burn the one strike before mcp_unreachable.
+            logger.warning(
+                "agent %s: no puffo MCP hello, but the daemon RPC "
+                "listener is down; not recycling", agent_id,
+            )
+            return
+        if now - listening_since < _MCP_LISTENER_RECOVERY_GRACE_SECONDS:
             return
         self._mcp_probe_strikes += 1
         if self._mcp_probe_strikes == 1:

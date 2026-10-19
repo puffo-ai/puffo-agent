@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 from aiohttp import web
 
 from ..agent.message_store import DataNotFound, MessageStore
-from ._port import bind_tcp_with_fallback
+from ._port import ListenerRunner, bind_tcp_with_fallback
 from .local_service_auth import require_local_service_auth
 from .state import agent_dir
 
@@ -564,7 +564,7 @@ async def start_data_service(
         return None
     app = build_app(cfg)
     access_logger = logging.getLogger("puffo_agent.portal.data_service.access")
-    runner = web.AppRunner(
+    runner = ListenerRunner(
         app,
         access_log=access_logger,
         access_log_format='%r -> %s (%Tf s)',
@@ -590,6 +590,7 @@ async def start_data_service(
             requested_port, bound_port,
         )
         cfg.port = bound_port
+    runner.keep_listening(host=cfg.bind_host, port=cfg.port, name="data-service")
     logger.info("data-service: listening on http://%s:%d", cfg.bind_host, cfg.port)
     return runner
 
