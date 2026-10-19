@@ -22,7 +22,7 @@ from ..agent.message_store import (
 from ..agent.message_store_models import LifecycleConflict
 from ..agent.reminder_scheduler import normalize_reminder_timestamp
 from . import host_mcp_handler
-from ._port import bind_tcp_with_fallback
+from ._port import ListenerRunner, bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
 from .local_service_auth import require_local_service_auth
 from .state import RpcServiceConfig
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # MCP wrapper retries on the next agent turn.
 RpcResolver = Callable[[str], Optional[HostMcpContext]]
 _RPC_RESOLVER: Optional[RpcResolver] = None
+_LISTENER: ListenerRunner | None = None
 
 
 def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
@@ -1087,12 +1088,13 @@ async def start_rpc_service(
     """``None`` on disabled / bind-window-exhausted. On fallback,
     mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
     sees the resolved port."""
+    global _LISTENER
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
     app = build_app(cfg)
     access_logger = logging.getLogger("puffo_agent.portal.rpc_service.access")
-    runner = web.AppRunner(app, access_log=access_logger)
+    runner = ListenerRunner(app, access_log=access_logger)
     requested_port = cfg.port
     try:
         await runner.setup()
@@ -1117,13 +1119,25 @@ async def start_rpc_service(
             requested_port, bound_port,
         )
         cfg.port = bound_port
+    runner.keep_listening(host=cfg.bind_host, port=cfg.port, name="rpc-service")
+    _LISTENER = runner
     logger.info("rpc-service: listening on %s:%d", cfg.bind_host, cfg.port)
     return runner
 
 
+async def listener_accepting_since() -> float | None:
+    """When the MCP subprocesses' hello target last came up; ``None``
+    while it is down, ``-inf`` when no listener is tracked."""
+    if _LISTENER is None:
+        return -math.inf
+    return await _LISTENER.accepting_since()
+
+
 async def stop_rpc_service(runner: web.AppRunner | None) -> None:
+    global _LISTENER
     if runner is None:
         return
+    _LISTENER = None
     try:
         await runner.cleanup()
     except Exception:

@@ -3,16 +3,19 @@ Real socket binds (no mocking) — exercises the real OSError shape."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
 import sys
+import time
 
 import pytest
 from aiohttp import web
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from puffo_agent.portal import _port
 from puffo_agent.portal._port import bind_tcp_with_fallback
 from puffo_agent.portal import data_service as ds
 from puffo_agent.portal import rpc_service as rs
@@ -285,3 +288,68 @@ async def test_rpc_service_leaves_cfg_port_alone_when_default_works():
     finally:
         if runner is not None:
             await rs.stop_rpc_service(runner)
+
+
+def _accepts(port: int) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+    except OSError:
+        return False
+    return True
+
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_rpc_service_rebinds_its_exact_port_after_listener_death(
+    monkeypatch, caplog,
+):
+    """Windows' proactor closes the listen socket after one failed
+    AcceptEx; agents pin the port, so the same port must come back."""
+    monkeypatch.setattr(_port, "_LISTENER_PROBE_INTERVAL_SECONDS", 0.01)
+    port = _free_port()
+    cfg = RpcServiceConfig(enabled=True, bind_host="127.0.0.1", port=port)
+    runner = await rs.start_rpc_service(cfg)
+    assert runner is not None
+    try:
+        # What asyncio's accept loop does after the failed AcceptEx.
+        (site,) = runner.sites
+        site._server.close()
+        died_at = time.monotonic()
+        # A bound, non-listening socket refuses connects and blocks the
+        # rebind, so the first rebind attempt must fail and be retried.
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", port))
+        # Read live: the MCP probe must not trust the guard's last tick.
+        assert await rs.listener_accepting_since() is None
+        with caplog.at_level(logging.WARNING, logger="puffo_agent.portal._port"):
+            await _until(lambda: any(
+                "rebind" in rec.message and "failed" in rec.message
+                for rec in caplog.records
+            ))
+            blocker.close()
+            await _until(lambda: _accepts(port))
+        assert cfg.port == port
+        assert await rs.listener_accepting_since() > died_at
+        # More guard ticks on the healthy listener must not rebind it.
+        records = len(caplog.records)
+        await asyncio.sleep(0.1)
+        assert len(caplog.records) == records
+        assert any("listener rebound" in rec.message for rec in caplog.records)
+    finally:
+        await rs.stop_rpc_service(runner)
+    await asyncio.sleep(0.05)
+    assert not _accepts(port)
+
+
+@pytest.mark.asyncio
+async def test_a_runner_that_never_listened_still_cleans_up():
+    """start_*_service cleans up the runner when every bind fails,
+    before any guard exists; that must not raise."""
+    runner = _port.ListenerRunner(web.Application())
+    await runner.setup()
+    await runner.cleanup()

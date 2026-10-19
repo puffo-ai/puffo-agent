@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: the daemon's local RPC and data services no longer go deaf
+  after one dropped connection.** Windows' event loop permanently closed the
+  listening socket when a connecting client vanished mid-handshake
+  (WinError 64), after which every agent's MCP tool calls failed until the
+  daemon was restarted. The listeners now notice within seconds and rebind
+  the same port. While the RPC listener is down, the MCP health probe no
+  longer recycles agents or marks them `mcp_unreachable` for hellos that
+  could not have landed.
+- **Windows: closing a Claude Code runtime stops its whole process tree.**
+  Only the npm `cmd.exe` shim was terminated, leaving `node` and its MCP
+  server running; the orphan kept answering with the previous MCP
+  generation and the restarted agent was flagged `mcp_unreachable`.
+- Closing a Claude Code runtime while it is still printing output no longer
+  crashes its reader with `'NoneType' object has no attribute 'stdout'`.
+
 ## [2.1.0] - 2026-10-13
 
 ### Added

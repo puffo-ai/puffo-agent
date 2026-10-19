@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
+import puffo_agent.agent.harness.drivers.claude_code as claude_code
 from puffo_agent.agent.harness.drivers.claude_code import ClaudeCodeCliDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec, SessionRef, TurnRef
+from puffo_agent.agent.harness.support.subprocess_io import (
+    ProcessTreeShutdownError,
+)
 from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
@@ -124,3 +129,66 @@ async def test_completed_assistant_replay_cannot_arm_watchdog(monkeypatch, tmp_p
         assert manager.active_turn_ref is None
     finally:
         await manager.close()
+
+
+class _ShutdownProcess:
+    """CLI whose buffered output is still unread when close() stops it."""
+
+    def __init__(self) -> None:
+        self.stdin = SimpleNamespace(write=lambda _value: None)
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode = None
+
+    def terminate(self) -> None:
+        self.stdout.feed_data(b'{"type":"keep_alive"}\n')
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self.returncode = 0
+
+    kill = terminate
+
+    async def wait(self) -> int:
+        # A real exit is observed only after the reader drained the pipe.
+        while not self.stdout.at_eof():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_close_stops_the_whole_cli_tree_and_retries_after_failure(
+    monkeypatch,
+):
+    """On Windows only cmd.exe dies with terminate(); the orphaned CLI and
+    its MCP server keep beaconing a retired MCP generation."""
+    proc = _ShutdownProcess()
+    stopped = []
+
+    async def shutdown(target, **_kwargs):
+        stopped.append(target)
+        if len(stopped) == 1:
+            raise ProcessTreeShutdownError("tree still alive")
+
+    monkeypatch.setattr(claude_code, "shutdown_process_tree", shutdown)
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    with pytest.raises(ProcessTreeShutdownError):
+        await driver.close()
+    await driver.close()
+
+    assert stopped == [proc, proc]
+    assert driver._proc is None
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_crash_the_reader_draining_final_output():
+    proc = _ShutdownProcess()
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    reader = driver._reader
+
+    await driver.close()
+
+    assert reader.cancelled() or reader.exception() is None
